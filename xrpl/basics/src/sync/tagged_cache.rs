@@ -471,13 +471,6 @@ where
         self.target_size.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Change the retention target at runtime (e.g. from a measured
-    /// miss-ratio curve). Takes effect at the next sweep.
-    pub fn set_target_size(&self, size: usize) {
-        self.target_size
-            .store(size, std::sync::atomic::Ordering::Relaxed);
-    }
-
     pub const fn target_age(&self) -> Duration {
         self.target_age
     }

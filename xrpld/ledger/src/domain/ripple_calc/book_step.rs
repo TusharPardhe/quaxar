@@ -594,30 +594,30 @@ pub fn execute_book_step_with_options<V: ApplyView>(
 
     // Iterate offers in the book directory
     // We use get_book_offers which reads from the offer directory.
-    let raw_offers = match get_book_offers(view, book, MAX_OFFERS_TO_CONSUME) {
-        Ok(offers) => offers,
-        Err(_) => {
-            return BookStepResult {
-                amount_in: total_in,
-                amount_out: total_out,
-                offers_consumed,
-                ter: Ter::TEF_BAD_LEDGER,
-            };
-        }
-    };
+    // FlowOfferStream reads the book lazily: one quality directory and page
+    // at a time, only as far as the step actually advances.
+    let mut cursor = BookOfferCursor::new(book, MAX_OFFERS_TO_CONSUME);
 
     // FlowOfferStream removes malformed, unauthorized-domain and unfunded
     // entries before exposing tip(). Do the same discovery cleanup before
     // asking AMMLiquidity to compete with that tip. Stop discovery at the
     // first valid offer: later entries must not be cleaned if AMM execution
     // ends this step before FlowOfferStream advances to them.
-    let mut offers = Vec::with_capacity(raw_offers.len());
+    let mut offers = Vec::with_capacity(1);
     let mut found_tip = false;
-    for entry in raw_offers {
-        if found_tip {
-            offers.push(entry);
-            continue;
-        }
+    while !found_tip {
+        let entry = match cursor.next(view) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(_) => {
+                return BookStepResult {
+                    amount_in: total_in,
+                    amount_out: total_out,
+                    offers_consumed,
+                    ter: Ter::TEF_BAD_LEDGER,
+                };
+            }
+        };
         let traversed = match entry {
             TraversedBookEntry::Offer(offer) => offer,
             TraversedBookEntry::Missing {
@@ -969,7 +969,23 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     }
 
     if !stop_before_clob {
-        for entry in offers {
+        let mut tip = offers.into_iter();
+        loop {
+            let entry = match tip.next() {
+                Some(entry) => entry,
+                None => match cursor.next(view) {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(_) => {
+                        return BookStepResult {
+                            amount_in: total_in,
+                            amount_out: total_out,
+                            offers_consumed,
+                            ter: Ter::TEF_BAD_LEDGER,
+                        };
+                    }
+                },
+            };
             // rippled's FlowOfferStream counter (StepCounter) bounds every
             // stepped entry. The "nothing left to fill" stop is NOT here: it
             // lives at the top of the revImp/fwdImp callback, i.e. AFTER the
@@ -2586,97 +2602,142 @@ fn book_asset_identity(asset: Asset) -> (String, String) {
     }
 }
 
+/// rippled `BookTip`/`FlowOfferStream` traversal: one `succ` per quality
+/// directory and each directory page read only when the stream reaches it.
+///
+/// It yields exactly the entries an eager walk taken at the start of the step
+/// would, in the same order. Every mutation a BookStep makes while iterating
+/// (offer consumption, `offerDelete`, dangling-index erase) touches only
+/// entries already yielded: a page still holding unyielded keys is never
+/// deleted, its `sfIndexNext` is captured when the page is first read, and
+/// `succ` from the previous quality root is unaffected by that root being
+/// deleted.
+struct BookOfferCursor {
+    book_end: basics::base_uint::Uint256,
+    current_key: basics::base_uint::Uint256,
+    quality: Option<(protocol::Keylet, Quality)>,
+    page_keylet: Option<protocol::Keylet>,
+    page_keys: std::collections::VecDeque<basics::base_uint::Uint256>,
+    next_page: u64,
+    yielded: usize,
+    max: usize,
+    exhausted: bool,
+}
+
+impl BookOfferCursor {
+    fn new(book: &Book, max: u32) -> Self {
+        let proto_book = protocol::Book {
+            r#in: book.r#in,
+            out: book.out,
+            domain: book.domain,
+        };
+        let consistent = protocol::is_consistent_book(proto_book);
+        if !consistent {
+            // Diagnostics only: retain the protocol-owned assertion and do not
+            // normalize, reject, or otherwise change offer selection/state here.
+            let (input_currency, input_issuer) = book_asset_identity(book.r#in);
+            let (output_currency, output_issuer) = book_asset_identity(book.out);
+            tracing::warn!(
+                target: "ledger",
+                book_input_currency = %input_currency,
+                book_input_issuer = %input_issuer,
+                book_output_currency = %output_currency,
+                book_output_issuer = %output_issuer,
+                consistent,
+                "[book_step] inconsistent book passed to get_book_offers"
+            );
+        }
+        let book_base = protocol::get_book_base(proto_book);
+        Self {
+            book_end: protocol::get_quality_next(book_base),
+            current_key: book_base,
+            quality: None,
+            page_keylet: None,
+            page_keys: std::collections::VecDeque::new(),
+            next_page: 0,
+            yielded: 0,
+            max: max as usize,
+            exhausted: false,
+        }
+    }
+
+    fn next<V: ApplyView>(&mut self, view: &mut V) -> Result<Option<TraversedBookEntry>, ViewError> {
+        loop {
+            if self.exhausted || self.yielded >= self.max {
+                return Ok(None);
+            }
+            if let (Some((_, quality)), Some(page_keylet)) = (self.quality, self.page_keylet)
+                && let Some(offer_key) = self.page_keys.pop_front()
+            {
+                self.yielded += 1;
+                let offer_keylet =
+                    protocol::Keylet::new(protocol::LedgerEntryType::Offer, offer_key);
+                return Ok(Some(match view.peek(offer_keylet)? {
+                    Some(offer_sle) => TraversedBookEntry::Offer(TraversedOffer {
+                        sle: offer_sle.as_ref().clone(),
+                        quality,
+                    }),
+                    None => TraversedBookEntry::Missing {
+                        directory_page: page_keylet,
+                        offer_key,
+                        quality,
+                    },
+                }));
+            }
+            // Current page drained: follow sfIndexNext, or move to the next
+            // quality directory through `succ`.
+            let page = match (self.quality, self.page_keylet) {
+                (Some(_), Some(_)) if self.next_page != 0 => Some(self.next_page),
+                (Some(_), None) => Some(0),
+                _ => None,
+            };
+            if let (Some(page), Some((root, _))) = (page, self.quality) {
+                let page_keylet = protocol::page_keylet(root, page);
+                // `peek` preserves staged erases; `read` would resurrect a page
+                // removed earlier in this flow pass.
+                if let Some(dir) = view.peek(page_keylet)? {
+                    self.page_keys = if dir.is_field_present(sf("sfIndexes")) {
+                        dir.get_field_v256(sf("sfIndexes")).value().iter().copied().collect()
+                    } else {
+                        std::collections::VecDeque::new()
+                    };
+                    self.next_page = dir.get_field_u64(sf("sfIndexNext"));
+                    self.page_keylet = Some(page_keylet);
+                    continue;
+                }
+            }
+            // Next quality directory.
+            match view.succ(self.current_key, Some(self.book_end))? {
+                Some(quality_root_key) => {
+                    let root = protocol::Keylet::new(
+                        protocol::LedgerEntryType::DirectoryNode,
+                        quality_root_key,
+                    );
+                    let quality = Quality::from_value(protocol::quality_from_key(quality_root_key));
+                    self.quality = Some((root, quality));
+                    self.page_keylet = None;
+                    self.page_keys.clear();
+                    self.next_page = 0;
+                    self.current_key = quality_root_key;
+                }
+                None => {
+                    self.exhausted = true;
+                }
+            }
+        }
+    }
+}
+
 fn get_book_offers<V: ApplyView>(
     view: &mut V,
     book: &Book,
     max: u32,
 ) -> Result<Vec<TraversedBookEntry>, ViewError> {
+    let mut cursor = BookOfferCursor::new(book, max);
     let mut offers = Vec::new();
-
-    // Offers are stored under their executable TakerPays -> TakerGets book,
-    // the same orientation a BookStep receives as `book.in -> book.out`.
-    let proto_book = protocol::Book {
-        r#in: book.r#in,
-        out: book.out,
-        domain: book.domain,
-    };
-    let consistent = protocol::is_consistent_book(proto_book);
-    if !consistent {
-        // Diagnostics only: retain the protocol-owned assertion and do not
-        // normalize, reject, or otherwise change offer selection/state here.
-        let (input_currency, input_issuer) = book_asset_identity(book.r#in);
-        let (output_currency, output_issuer) = book_asset_identity(book.out);
-        tracing::warn!(
-            target: "ledger",
-            book_input_currency = %input_currency,
-            book_input_issuer = %input_issuer,
-            book_output_currency = %output_currency,
-            book_output_issuer = %output_issuer,
-            consistent,
-            "[book_step] inconsistent book passed to get_book_offers"
-        );
+    while let Some(entry) = cursor.next(view)? {
+        offers.push(entry);
     }
-    let book_base = protocol::get_book_base(proto_book);
-    let book_end = protocol::get_quality_next(book_base);
-
-    let mut current_key = book_base;
-
-    // `succ` finds only the quality root. Continuation pages are hashed
-    // directory-page keys outside the book's quality range and must be
-    // followed through sfIndexNext from that root.
-    while offers.len() < max as usize {
-        let quality_root_key = match view.succ(current_key, Some(book_end))? {
-            Some(key) => key,
-            None => break,
-        };
-        let quality_root =
-            protocol::Keylet::new(protocol::LedgerEntryType::DirectoryNode, quality_root_key);
-        let quality = Quality::from_value(protocol::quality_from_key(quality_root_key));
-        let mut page = 0_u64;
-
-        loop {
-            let page_keylet = protocol::page_keylet(quality_root, page);
-            // `peek` preserves staged erases; `read` would resurrect a page
-            // removed earlier in this flow pass.
-            let Some(dir) = view.peek(page_keylet)? else {
-                break;
-            };
-
-            if dir.is_field_present(sf("sfIndexes")) {
-                for &offer_key in dir.get_field_v256(sf("sfIndexes")).value() {
-                    if offers.len() >= max as usize {
-                        break;
-                    }
-                    let offer_keylet =
-                        protocol::Keylet::new(protocol::LedgerEntryType::Offer, offer_key);
-                    if let Some(offer_sle) = view.peek(offer_keylet)? {
-                        offers.push(TraversedBookEntry::Offer(TraversedOffer {
-                            sle: offer_sle.as_ref().clone(),
-                            quality,
-                        }));
-                    } else {
-                        offers.push(TraversedBookEntry::Missing {
-                            directory_page: page_keylet,
-                            offer_key,
-                            quality,
-                        });
-                    }
-                }
-            }
-
-            if offers.len() >= max as usize {
-                break;
-            }
-            let next = dir.get_field_u64(sf("sfIndexNext"));
-            if next == 0 {
-                break;
-            }
-            page = next;
-        }
-
-        current_key = quality_root_key;
-    }
-
     Ok(offers)
 }
 
@@ -3559,6 +3620,59 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![offer_one_key.key, offer_two_key.key]
         );
+    }
+
+    #[test]
+    fn book_offer_cursor_reads_later_qualities_only_when_reached() {
+        // rippled BookTip calls `succ` for the next quality only when the
+        // stream steps past the current one. The previous eager walk read up
+        // to 1000 offers across every quality on each BookStep call.
+        let issuer = AccountID::from_array([0x71; 20]);
+        let owner = AccountID::from_array([0x72; 20]);
+        let usd = Issue::new(protocol::currency_from_string("USD"), issuer);
+        let book = Book {
+            r#in: Asset::Issue(protocol::xrp_issue()),
+            out: Asset::Issue(usd),
+            domain: None,
+        };
+        let proto_book = protocol::Book::new(book.r#in, book.out, None);
+        let mut entries = Vec::new();
+        let mut keys = Vec::new();
+        for (seq, quality) in [(1u32, 70u64), (2, 80)] {
+            let root_keylet = protocol::quality_keylet(protocol::book_keylet(proto_book), quality);
+            let offer_key = protocol::offer_keylet(Uint160::from_void(owner.data()), seq);
+            let mut root = STLedgerEntry::new(root_keylet);
+            root.set_field_v256(
+                sf("sfIndexes"),
+                protocol::STVector256::from_values(sf("sfIndexes"), vec![offer_key.key]),
+            );
+            root.set_field_u64(sf("sfIndexNext"), 0);
+            root.set_field_u64(sf("sfIndexPrevious"), 0);
+            let mut offer = STLedgerEntry::new(offer_key);
+            offer.set_account_id(sf("sfAccount"), owner);
+            offer.set_field_h256(sf("sfBookDirectory"), root_keylet.key);
+            entries.push(root);
+            entries.push(offer);
+            keys.push((root_keylet, offer_key.key));
+        }
+        let mut view = test_apply_view(&[]);
+        for entry in entries {
+            view.insert(Arc::new(entry)).expect("insert book fixture");
+        }
+        let key_of = |entry: Option<TraversedBookEntry>| match entry {
+            Some(TraversedBookEntry::Offer(offer)) => Some(*offer.sle.key()),
+            _ => None,
+        };
+        let mut cursor = BookOfferCursor::new(&book, MAX_OFFERS_TO_CONSUME);
+        assert_eq!(key_of(cursor.next(&mut view).expect("first")), Some(keys[0].1));
+        // The second quality was not read yet: erasing it now must be seen.
+        let second_root = view.peek(keys[1].0).expect("peek").expect("root");
+        view.erase(second_root).expect("erase second quality");
+        assert_eq!(key_of(cursor.next(&mut view).expect("second")), None);
+
+        // An untouched book still yields every offer in quality order.
+        let offers = get_book_offers(&mut view, &book, MAX_OFFERS_TO_CONSUME).expect("walk");
+        assert_eq!(offers.len(), 1);
     }
 
     #[test]

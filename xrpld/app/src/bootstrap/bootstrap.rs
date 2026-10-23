@@ -73,67 +73,6 @@ fn trim_after_application_sweep() -> MallocTrimReport {
     trim_after_application_sweep_with(|tag| malloc_trim(tag, &SweepMallocTrimLogger))
 }
 
-/// Miss-ratio tolerance for the cache knee: a cache doubling is kept only if it
-/// cuts the miss ratio by at least this much (3 points of hit ratio).
-const MRC_TOLERANCE: f64 = 0.03;
-/// Never size the TreeNodeCache below this many entries.
-const TREE_CACHE_MRC_MIN: usize = 65_536;
-/// Sampled references needed before a curve is trusted. SHARDS reports mean
-/// absolute MRC error around 0.01 at a few thousand samples; a few hundred
-/// bound the error near 0.05, enough to pick a knee on a curve this flat.
-const MRC_MIN_SAMPLES: u64 = 400;
-
-/// Size the TreeNodeCache from its measured
-/// miss-ratio curve (SHARDS, Waldspurger et al., FAST 2015) instead of fixed
-/// `node_size` constants. Sampling runs only while the node is full, so the
-/// one-off sync workload neither pays for it nor shapes the steady-state
-/// curve. The target becomes the curve's knee, capped by the configured size.
-/// There is no NodeObject cache: store reads are served by the OS page cache.
-/// `QUAXAR_MRC_CACHE=0` keeps the configured sizes (curves are still logged).
-fn size_tree_cache_from_mrc(root: &ApplicationRoot) {
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    static SWEEPS: AtomicU64 = AtomicU64::new(0);
-    static CONFIGURED: AtomicUsize = AtomicUsize::new(0);
-    let full = root.network_ops_operating_mode() == crate::NetworkOpsOperatingMode::Full;
-    shamap::access_mrc::set_enabled(full);
-    let enabled = !std::env::var("QUAXAR_MRC_CACHE").is_ok_and(|value| value == "0");
-
-    if let Some(cache) = root.shared_tree_cache() {
-        let _ = CONFIGURED.compare_exchange(
-            0,
-            cache.target_size(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
-        let configured = CONFIGURED.load(Ordering::Relaxed);
-        let (curve, samples, knee) = shamap::access_mrc::snapshot(MRC_TOLERANCE);
-        let target = match knee {
-            Some(knee) if enabled && full && samples >= MRC_MIN_SAMPLES => {
-                (knee as usize).clamp(TREE_CACHE_MRC_MIN, configured.max(TREE_CACHE_MRC_MIN))
-            }
-            _ => configured,
-        };
-        if target != cache.target_size() {
-            cache.set_target_size(target);
-        }
-        tracing::info!(
-            target: "app",
-            event = "tree_cache_mrc",
-            samples,
-            knee = knee.unwrap_or(0),
-            target,
-            configured,
-            cache_size = cache.size(),
-            curve = %basics::sync::shards::format_curve(&curve),
-            "TreeNodeCache miss-ratio curve"
-        );
-    }
-
-    if SWEEPS.fetch_add(1, Ordering::Relaxed) % 10 == 9 {
-        shamap::access_mrc::decay();
-    }
-}
-
 /// Sweep rippled's application-owned NodeCache as part of `Application::doSweep`.
 fn sweep_temp_node_cache<C>(cache: &TaggedCache<Uint256, Blob, C>)
 where
@@ -182,7 +121,6 @@ impl ApplicationSweepActions for ProductionApplicationSweep<'_> {
     }
 
     fn sweep_node_family(&self) {
-        size_tree_cache_from_mrc(self.root);
         let before_size = self
             .root
             .shared_tree_cache()
@@ -908,6 +846,7 @@ pub fn build_bootstrap_root(
         ..ApplicationRootOptions::default()
     })
     .map_err(|error| error.to_string())?;
+    crate::state::application_root::register_preflight_hash_router(root.shared_hash_router());
     root.configure_manifest_limits(manifest_limits);
 
     root.set_path_search_levels(path_search_old, path_search, path_search_fast);

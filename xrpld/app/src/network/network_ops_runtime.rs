@@ -317,19 +317,7 @@ impl AppNetworkOpsRuntime {
     }
 
     pub fn check_validity(&self, transaction: &STTx, rules: &Rules) -> CheckValidityResult {
-        let txid = transaction.get_transaction_id();
-        run_check_validity_with_flag_cache(
-            validity_facts(transaction),
-            rules,
-            || self.hash_router.get_flags(txid),
-            |flags| {
-                if flags != HashRouterFlags::UNDEFINED {
-                    let _ = self.hash_router.set_flags(txid, flags);
-                }
-            },
-            || transaction.check_sign(rules),
-            || passes_local_checks(transaction),
-        )
+        check_validity_with_router(&self.hash_router, transaction, rules)
     }
 
     pub fn preprocess_transaction(
@@ -1042,6 +1030,30 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 fn shared_transaction(transaction: Arc<STTx>) -> SharedTransaction {
     Arc::new(Mutex::new(Transaction::new(transaction)))
+}
+
+/// rippled `apply.cpp::checkValidity`: signature and local-check verdicts are
+/// cached in the application HashRouter, so a transaction is verified once
+/// whether it arrives from a peer, is applied to the open ledger, re-applied
+/// after a close, or applied while building the consensus ledger.
+pub(crate) fn check_validity_with_router(
+    hash_router: &HashRouter,
+    transaction: &STTx,
+    rules: &Rules,
+) -> CheckValidityResult {
+    let txid = transaction.get_transaction_id();
+    run_check_validity_with_flag_cache(
+        validity_facts(transaction),
+        rules,
+        || hash_router.get_flags(txid),
+        |flags| {
+            if flags != HashRouterFlags::UNDEFINED {
+                let _ = hash_router.set_flags(txid, flags);
+            }
+        },
+        || transaction.check_sign(rules),
+        || passes_local_checks(transaction),
+    )
 }
 
 fn validity_facts(transaction: &STTx) -> CheckValidityFacts {
