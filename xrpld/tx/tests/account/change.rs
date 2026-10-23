@@ -139,7 +139,8 @@ fn change_preclaim_validates_fee_field_shapes() {
     assert_eq!(xrp_missing, Ter::TEM_MALFORMED);
     assert_eq!(xrp_forbids_legacy, Ter::TEM_MALFORMED);
     assert_eq!(legacy_missing, Ter::TEM_MALFORMED);
-    assert_eq!(legacy_forbids_xrp, Ter::TEM_DISABLED);
+    // rippled #7349: XRPFees retired, so a legacy field is always malformed.
+    assert_eq!(legacy_forbids_xrp, Ter::TEM_MALFORMED);
 }
 
 #[test]

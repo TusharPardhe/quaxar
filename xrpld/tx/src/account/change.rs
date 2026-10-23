@@ -495,9 +495,10 @@ mod tests {
         assert_eq!(xrp_missing, Ter::TEM_MALFORMED);
         assert_eq!(xrp_forbids_legacy, Ter::TEM_MALFORMED);
         assert_eq!(legacy_missing, Ter::TEM_MALFORMED);
-        assert_eq!(legacy_forbids_xrp, Ter::TEM_DISABLED);
+        // rippled #7349: with XRPFees retired the legacy shape is malformed.
+        assert_eq!(legacy_forbids_xrp, Ter::TEM_MALFORMED);
         assert_eq!(xrp_valid, Ter::TES_SUCCESS);
-        assert_eq!(legacy_valid, Ter::TES_SUCCESS);
+        assert_eq!(legacy_valid, Ter::TEM_MALFORMED);
     }
 
     #[test]

@@ -268,32 +268,6 @@ fn ledger_setup_with_entries_rejects_mixed_old_and_new_fee_formats() {
 }
 
 #[test]
-fn ledger_setup_with_entries_rejects_new_fee_fields_before_xrp_fees_amendment() {
-    let mut ledger = Ledger::new(LedgerHeader::default(), true);
-    ledger.apply_default_fees(Fees {
-        base: 1,
-        reserve: 2,
-        increment: 3,
-    });
-
-    let ok = ledger.setup_with_entries(
-        &LedgerSetupEntries {
-            amendments: SetupLookup::MissingObject,
-            fees: SetupLookup::Present(FeeSettingsFields {
-                base_fee_drops: Some(AmountField {
-                    drops: 44,
-                    native: true,
-                    negative: false,
-                }),
-                ..FeeSettingsFields::default()
-            }),
-        },
-    );
-
-    assert!(!ok);
-}
-
-#[test]
 fn ledger_setup_with_entries_rejects_non_native_xrp_amount_fields() {
     let mut ledger = Ledger::new(LedgerHeader::default(), true);
     ledger.apply_default_fees(Fees {

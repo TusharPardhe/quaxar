@@ -86,26 +86,6 @@ fn encode_u64_field(field_name: u8, value: u64) -> Vec<u8> {
 }
 
 #[test]
-fn build_genesis_setup_items_uses_legacy_fee_object_without_xrp_fees_amendment() {
-    let amendment = sample_uint256(0xD1);
-    let config = sample_ledger_config([sample_uint256(0xD2)]);
-    let mut expected_fee_bytes = Vec::new();
-    expected_fee_bytes.extend_from_slice(&encode_u16_field(1, 0x0073));
-    expected_fee_bytes.extend_from_slice(&encode_u32_field(2, 0)); // Flags
-    expected_fee_bytes.extend_from_slice(&encode_u32_field(30, 10));
-    expected_fee_bytes.extend_from_slice(&encode_u32_field(31, 20));
-    expected_fee_bytes.extend_from_slice(&encode_u32_field(32, 30));
-    expected_fee_bytes.extend_from_slice(&encode_u64_field(5, 10));
-
-    let items = build_genesis_setup_items(&config, [amendment]);
-
-    assert_eq!(items.len(), 2);
-    assert_eq!(items[0].0, amendments_key());
-    assert_eq!(items[0].1, protocol::encode_amendments_entry(&[amendment]));
-    assert_eq!(items[1], (fees_key(), expected_fee_bytes));
-}
-
-#[test]
 fn build_genesis_setup_items_uses_xrp_fee_object_when_amendment_enables_it() {
     let config = sample_ledger_config([sample_uint256(0xD3)]);
 
@@ -141,15 +121,10 @@ fn build_genesis_setup_items_omits_amendments_entry_when_list_is_empty() {
     assert_eq!(
         decode_constructor_fee_settings_entry(&items[0].1)
             .expect("genesis setup fees entry should decode"),
-        ConstructorFeeSettingsEntry::Legacy {
-            base_fee: config.fees.base,
-            reference_fee_units: 10,
-            reserve_base: Some(
-                u32::try_from(config.fees.reserve).expect("fee reserve should fit in u32"),
-            ),
-            reserve_increment: Some(
-                u32::try_from(config.fees.increment).expect("fee increment should fit in u32"),
-            ),
+        ConstructorFeeSettingsEntry::XrpDrops {
+            base_fee_drops: config.fees.base,
+            reserve_base_drops: config.fees.reserve,
+            reserve_increment_drops: config.fees.increment,
         }
     );
 }
@@ -259,52 +234,10 @@ fn create_genesis_setup_only_omits_amendments_entry_when_none_are_supplied() {
     assert_eq!(
         decode_constructor_fee_settings_entry(fees.data())
             .expect("genesis setup-only constructor should keep fees decodable"),
-        ConstructorFeeSettingsEntry::Legacy {
-            base_fee: config.fees.base,
-            reference_fee_units: 10,
-            reserve_base: Some(
-                u32::try_from(config.fees.reserve).expect("fee reserve should fit in u32"),
-            ),
-            reserve_increment: Some(
-                u32::try_from(config.fees.increment).expect("fee increment should fit in u32"),
-            ),
-        }
-    );
-}
-
-#[test]
-fn create_genesis_setup_only_uses_legacy_fee_shape_without_xrp_fees_amendment() {
-    let amendment = sample_uint256(0xDA);
-    let config = sample_ledger_config([sample_uint256(0xDB)]);
-    let ledger = Ledger::create_genesis_setup_only(false, &config, [amendment])
-        .expect("setup-only genesis constructor should insert singleton state entries");
-
-    let (amendments, _amendments_hash) = ledger
-        .state_map()
-        .peek_item_with_hash(amendments_key(), &mut |_| None)
-        .expect("legacy genesis setup-only constructor should keep state map readable")
-        .expect("legacy genesis setup-only constructor should insert amendments entry");
-    assert_eq!(
-        decode_constructor_amendments_entry(amendments.data())
-            .expect("legacy genesis setup-only constructor should keep amendments decodable"),
-        ConstructorAmendmentsEntry {
-            amendments: vec![amendment],
-        }
-    );
-
-    let (fees, _fees_hash) = ledger
-        .state_map()
-        .peek_item_with_hash(fees_key(), &mut |_| None)
-        .expect("legacy genesis setup-only constructor should keep state map readable")
-        .expect("legacy genesis setup-only constructor should insert fees entry");
-    assert_eq!(
-        decode_constructor_fee_settings_entry(fees.data())
-            .expect("legacy genesis setup-only constructor should keep fees decodable"),
-        ConstructorFeeSettingsEntry::Legacy {
-            base_fee: config.fees.base,
-            reference_fee_units: 10,
-            reserve_base: Some(20),
-            reserve_increment: Some(30),
+        ConstructorFeeSettingsEntry::XrpDrops {
+            base_fee_drops: config.fees.base,
+            reserve_base_drops: config.fees.reserve,
+            reserve_increment_drops: config.fees.increment,
         }
     );
 }
@@ -447,15 +380,10 @@ fn create_genesis_omits_amendments_entry_when_none_are_supplied() {
     assert_eq!(
         decode_constructor_fee_settings_entry(fees.data())
             .expect("genesis constructor should keep fees decodable"),
-        ConstructorFeeSettingsEntry::Legacy {
-            base_fee: config.fees.base,
-            reference_fee_units: 10,
-            reserve_base: Some(
-                u32::try_from(config.fees.reserve).expect("fee reserve should fit in u32"),
-            ),
-            reserve_increment: Some(
-                u32::try_from(config.fees.increment).expect("fee increment should fit in u32"),
-            ),
+        ConstructorFeeSettingsEntry::XrpDrops {
+            base_fee_drops: config.fees.base,
+            reserve_base_drops: config.fees.reserve,
+            reserve_increment_drops: config.fees.increment,
         }
     );
 }

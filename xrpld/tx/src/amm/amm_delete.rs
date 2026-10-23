@@ -116,9 +116,9 @@ mod tests {
 
     #[test]
     fn extra_feature_gate_matches_mptokens_v2_edges() {
+        assert!(amm_delete_check_extra_features(false, false));
         assert!(!amm_delete_check_extra_features(false, true));
         assert!(amm_delete_check_extra_features(true, false));
-        assert!(!amm_delete_check_extra_features(true, false));
         assert!(amm_delete_check_extra_features(true, true));
     }
 }

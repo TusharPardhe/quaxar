@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use app::{FeeSetup, FeeVote, FeeVoteJournal, FeeVoteLedgerView, ShamapVoteTxSet};
 use basics::tagged_cache::MonotonicClock;
-use ledger::{Fees, INITIAL_XRP_DROPS};
+use ledger::Fees;
 use protocol::{
     KeyType, STAmount, STTx, STValidation, SecretKey, SerialIter, TxType,
     VF_FULL_VALIDATION, calc_node_id, derive_public_key, get_field_by_symbol,
@@ -208,7 +208,15 @@ fn fee_vote_ignores_invalid_or_untrusted_votes_() {
             validation.set_field_amount(get_field_by_symbol("sfReserveIncrementDrops"), STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(30)));
         }),
         validation_with_fill(6, 512, true, |validation| {
-            validation.set_field_amount(get_field_by_symbol("sfBaseFeeDrops"), STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(INITIAL_XRP_DROPS as i64 + 1)));
+            // A non-native amount is not a usable fee vote (rippled doVote: noVote).
+            validation.set_field_amount(
+                get_field_by_symbol("sfBaseFeeDrops"),
+                STAmount::from_iou_amount(
+                    get_field_by_symbol("sfBaseFeeDrops"),
+                    protocol::IOUAmount::from_parts(99, 0).expect("iou"),
+                    protocol::Issue::new(protocol::currency_from_string("USD"), protocol::AccountID::from_array([9; 20])),
+                ),
+            );
         }),
         validation_with_fill(7, 512, false, |validation| {
             validation.set_field_amount(get_field_by_symbol("sfBaseFeeDrops"), STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(99)));

@@ -448,31 +448,6 @@ mod tests {
     }
 
     #[test]
-    fn fee_settings_encoder_round_trips_legacy_fields() {
-        let payload = encode_fee_settings_entry(
-            Fees {
-                base: 10,
-                reserve: 20,
-                increment: 30,
-            },
-        );
-
-        let decoded = decode_fee_settings_fields(&payload)
-            .expect("encoded legacy fee settings entry should decode");
-
-        assert_eq!(decoded.base_fee, Some(10));
-        assert_eq!(
-            decoded.reference_fee_units,
-            Some(protocol::REFERENCE_FEE_UNITS_DEPRECATED),
-        );
-        assert_eq!(decoded.reserve_base, Some(20));
-        assert_eq!(decoded.reserve_increment, Some(30));
-        assert_eq!(decoded.base_fee_drops, None);
-        assert_eq!(decoded.reserve_base_drops, None);
-        assert_eq!(decoded.reserve_increment_drops, None);
-    }
-
-    #[test]
     fn fee_settings_encoder_round_trips_xrp_fee_fields() {
         let payload = encode_fee_settings_entry(
             Fees {
