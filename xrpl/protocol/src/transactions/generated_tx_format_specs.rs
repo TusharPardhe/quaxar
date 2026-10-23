@@ -873,7 +873,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         value: 35,
         name: "AMMCreate",
         delegable: "Delegation::delegable",
-        amendment: "featureAMM",
+        amendment: "uint256{}",
         privileges: "createPseudoAcct | mayCreateMPT",
         field_specs: &[
             FormatFieldSpec {
@@ -898,7 +898,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         value: 36,
         name: "AMMDeposit",
         delegable: "Delegation::delegable",
-        amendment: "featureAMM",
+        amendment: "uint256{}",
         privileges: "noPriv",
         field_specs: &[
             FormatFieldSpec {
@@ -943,7 +943,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         value: 37,
         name: "AMMWithdraw",
         delegable: "Delegation::delegable",
-        amendment: "featureAMM",
+        amendment: "uint256{}",
         privileges: "mayDeleteAcct | mayAuthorizeMPT",
         field_specs: &[
             FormatFieldSpec {
@@ -983,7 +983,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         value: 38,
         name: "AMMVote",
         delegable: "Delegation::delegable",
-        amendment: "featureAMM",
+        amendment: "uint256{}",
         privileges: "noPriv",
         field_specs: &[
             FormatFieldSpec {
@@ -1008,7 +1008,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         value: 39,
         name: "AMMBid",
         delegable: "Delegation::delegable",
-        amendment: "featureAMM",
+        amendment: "uint256{}",
         privileges: "noPriv",
         field_specs: &[
             FormatFieldSpec {
@@ -1043,7 +1043,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         value: 40,
         name: "AMMDelete",
         delegable: "Delegation::delegable",
-        amendment: "featureAMM",
+        amendment: "uint256{}",
         privileges: "mustDeleteAcct | mayDeleteMPT",
         field_specs: &[
             FormatFieldSpec {

@@ -169,7 +169,7 @@ fn invalid_state_entry_type_is_rejected_without_unwinding() {
     );
 
     let setup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ledger.setup_from_state_map(&feature_xrp_fees())
+        ledger.setup_from_state_map()
     }));
     assert!(setup.is_ok(), "invalid singleton must not unwind setup");
     assert!(
@@ -251,7 +251,7 @@ fn setup_from_state_map_returns_false_for_mixed_legacy_and_xrp_fee_fields() {
     *ledger.state_map_mut() = build_state_map_with_items(&items);
 
     let loaded = ledger
-        .setup_from_state_map_with_default_fees(config.fees, &feature_xrp_fees())
+        .setup_from_state_map_with_default_fees(config.fees)
         .expect("mixed fee entry should decode through current narrowed port");
 
     assert!(!loaded);
@@ -270,14 +270,14 @@ fn setup_from_state_map_returns_false_for_xrp_fees_without_amendment_enabled() {
     let config = sample_ledger_config([sample_uint256(0xB1)]);
     let items = vec![(
         fees_key(),
-        protocol::encode_fee_settings_entry(10, 20, 30, true),
+        protocol::encode_fee_settings_entry(10, 20, 30),
     )];
     let mut ledger = Ledger::new(Default::default(), false);
     *ledger.state_map_mut() = build_state_map_with_items(&items);
     ledger.set_rules(protocol::Rules::new([sample_uint256(0xB1)]));
 
     let loaded = ledger
-        .setup_from_state_map_with_default_fees(config.fees, &feature_xrp_fees())
+        .setup_from_state_map_with_default_fees(config.fees)
         .expect("xrp fee entry should decode through current narrowed port");
 
     assert!(!loaded);
@@ -290,7 +290,7 @@ fn setup_from_state_map_with_config_keeps_presets_when_amendments_object_is_miss
     let config = sample_ledger_config([sample_uint256(0xC1)]);
     let items = vec![(
         fees_key(),
-        protocol::encode_fee_settings_entry(10, 20, 30, false),
+        protocol::encode_fee_settings_entry(10, 20, 30),
     )];
     let mut ledger = Ledger::new(Default::default(), false);
     *ledger.state_map_mut() = build_state_map_with_items(&items);

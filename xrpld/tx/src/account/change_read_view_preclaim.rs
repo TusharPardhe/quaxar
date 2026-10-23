@@ -5,7 +5,7 @@
 //! field-presence facts; it never invokes apply code or opens a sandbox.
 
 use ledger::ReadView;
-use protocol::{STTx, Ter, TxType, feature_xrp_fees, get_field_by_symbol};
+use protocol::{STTx, Ter, TxType, get_field_by_symbol};
 
 use crate::{ChangePreclaimFacts, run_change_preclaim};
 
@@ -37,7 +37,6 @@ pub fn run_change_read_view_preclaim<V: ReadView>(
             TxType::FEE,
             ChangePreclaimFacts {
                 ledger_is_open: false,
-                xrp_fees_enabled: view.rules().enabled(&feature_xrp_fees()),
                 base_fee_present: tx.is_field_present(sf("sfBaseFee")),
                 reference_fee_units_present: tx.is_field_present(sf("sfReferenceFeeUnits")),
                 reserve_base_present: tx.is_field_present(sf("sfReserveBase")),

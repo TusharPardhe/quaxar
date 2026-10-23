@@ -4,7 +4,7 @@ use basics::number::{NumberParts as RuntimeNumber, current_number_one, get_manti
 use sha2::{Digest, Sha512};
 
 use crate::{
-    AccountID, Asset, Currency, Issue, NotTec, Rules, STAmount, Ter, bad_currency, feature_amm,
+    AccountID, Asset, Currency, Issue, NotTec, STAmount, Ter, bad_currency,
     is_xrp_currency,
 };
 
@@ -143,13 +143,6 @@ pub fn amm_auction_time_slot(current: u64, auction_slot: &crate::STObject) -> Op
     None
 }
 
-pub fn amm_enabled(rules: &Rules) -> bool {
-    // rippled's AMMCore::ammEnabled is gated only by featureAMM.  The
-    // fixUniversalNumber amendment selects Number/STNumber behavior; it is
-    // not an additional transaction-family feature gate.
-    rules.enabled(&feature_amm())
-}
-
 pub fn get_fee(tfee: u16) -> RuntimeNumber {
     RuntimeNumber::try_from_external_parts(i64::from(tfee), 0, get_mantissa_scale())
         .expect("trading fee should stay representable in Number")
@@ -198,12 +191,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn amm_family_gate_does_not_depend_on_fix_universal_number() {
-        assert!(!amm_enabled(&Rules::new(std::iter::empty())));
-        assert!(amm_enabled(&Rules::new([feature_amm()])));
-        assert!(!amm_enabled(&Rules::new([
-            crate::feature_universal_number(),
-        ])));
-    }
 }

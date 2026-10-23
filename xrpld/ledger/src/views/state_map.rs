@@ -166,8 +166,8 @@ pub fn encode_amendments_entry(amendments: &[Uint256]) -> Vec<u8> {
     protocol_encode_amendments_entry(amendments)
 }
 
-pub fn encode_fee_settings_entry(fees: Fees, xrp_fees_enabled: bool) -> Vec<u8> {
-    protocol_encode_fee_settings_entry(fees.base, fees.reserve, fees.increment, xrp_fees_enabled)
+pub fn encode_fee_settings_entry(fees: Fees) -> Vec<u8> {
+    protocol_encode_fee_settings_entry(fees.base, fees.reserve, fees.increment)
 }
 
 /// Parse an untrusted singleton state entry. Invalid or unsupported entry
@@ -455,7 +455,6 @@ mod tests {
                 reserve: 20,
                 increment: 30,
             },
-            false,
         );
 
         let decoded = decode_fee_settings_fields(&payload)
@@ -481,7 +480,6 @@ mod tests {
                 reserve: 22,
                 increment: 33,
             },
-            true,
         );
 
         let decoded =

@@ -445,9 +445,6 @@ fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
             }
         }
         TxType::AMM_CREATE => {
-            if !protocol::amm_enabled(rules) {
-                return Ter::TEM_DISABLED;
-            }
             let amount = get_field_by_symbol("sfAmount");
             let amount2 = get_field_by_symbol("sfAmount2");
             if tx.is_field_present(amount)
@@ -466,7 +463,6 @@ fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
                 tx.is_field_present(field) && tx.get_field_amount(field).holds_mpt_issue()
             };
             if !crate::amm_withdraw_check_extra_features(
-                protocol::amm_enabled(rules),
                 rules.enabled(&protocol::feature_id("MPTokensV2")),
                 matches!(asset, Asset::MPTIssue(_)),
                 matches!(asset2, Asset::MPTIssue(_)),
@@ -479,7 +475,6 @@ fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
         TxType::AMM_VOTE => {
             let (asset, asset2) = amm_pair(tx);
             if !crate::amm_vote_check_extra_features(
-                protocol::amm_enabled(rules),
                 rules.enabled(&protocol::feature_id("MPTokensV2")),
                 matches!(asset, Asset::MPTIssue(_)),
                 matches!(asset2, Asset::MPTIssue(_)),
@@ -494,7 +489,6 @@ fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
                 tx.is_field_present(field) && tx.get_field_amount(field).holds_mpt_issue()
             };
             if !crate::amm_deposit_check_extra_features(
-                protocol::amm_enabled(rules),
                 rules.enabled(&protocol::feature_id("MPTokensV2")),
                 matches!(asset, Asset::MPTIssue(_)),
                 matches!(asset2, Asset::MPTIssue(_)),
@@ -507,7 +501,6 @@ fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
         TxType::AMM_BID => {
             let (asset, asset2) = amm_pair(tx);
             if !crate::amm_bid_check_extra_features(
-                protocol::amm_enabled(rules),
                 rules.enabled(&protocol::feature_id("MPTokensV2")),
                 matches!(asset, Asset::MPTIssue(_)) || matches!(asset2, Asset::MPTIssue(_)),
             ) {
@@ -517,7 +510,6 @@ fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
         TxType::AMM_DELETE => {
             let (asset, asset2) = amm_pair(tx);
             if !crate::amm_delete_check_extra_features(
-                protocol::amm_enabled(rules),
                 rules.enabled(&protocol::feature_id("MPTokensV2")),
                 matches!(asset, Asset::MPTIssue(_)) || matches!(asset2, Asset::MPTIssue(_)),
             ) {
@@ -2281,7 +2273,6 @@ fn validate_amm_vote_preflight(tx: &STTx, rules: &Rules) -> NotTec {
     }
     let (asset, asset2) = amm_pair(tx);
     if !crate::amm_vote_check_extra_features(
-        protocol::amm_enabled(rules),
         rules.enabled(&protocol::feature_id("MPTokensV2")),
         matches!(asset, Asset::MPTIssue(_)),
         matches!(asset2, Asset::MPTIssue(_)),
@@ -2310,7 +2301,6 @@ fn validate_amm_withdraw_preflight(tx: &STTx, rules: &Rules) -> NotTec {
     let e_price = optional_amount("sfEPrice");
     let lp_token_in = optional_amount("sfLPTokenIn");
     if !crate::amm_withdraw_check_extra_features(
-        protocol::amm_enabled(rules),
         rules.enabled(&protocol::feature_id("MPTokensV2")),
         matches!(asset, Asset::MPTIssue(_)),
         matches!(asset2, Asset::MPTIssue(_)),
@@ -2530,7 +2520,6 @@ fn validate_amm_create_preflight(tx: &STTx, rules: &Rules) -> NotTec {
     let amount = tx.get_field_amount(amount_field);
     let amount2 = tx.get_field_amount(amount2_field);
     if !crate::amm_create_check_extra_features(
-        protocol::amm_enabled(rules),
         rules.enabled(&protocol::feature_id("MPTokensV2")),
         amount.holds_mpt_issue(),
         amount2.holds_mpt_issue(),

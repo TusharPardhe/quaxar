@@ -78,9 +78,9 @@ use overlay::{Overlay, OverlayHandoff, OverlayImpl, PeerReservationSource};
 use perflog::PerfLogImp;
 use protocol::{
     AccountID, BatchTransactionFlags, JsonOptions, JsonValue, NodeID, NotTec, PublicKey,
-    REFERENCE_FEE_UNITS_DEPRECATED, Rules, STAmount, STLedgerEntry, STObject, STTx, SecretKey,
+    Rules, STAmount, STLedgerEntry, STObject, STTx, SecretKey,
     SeqProxy, Serializer, StBase, Ter, TxType, XRPAmount, account_keylet, calc_account_id,
-    calc_node_id, feature_xrp_fees, get_field_by_symbol, is_tec_claim, is_tef_failure,
+    calc_node_id, get_field_by_symbol, is_tec_claim, is_tef_failure,
     is_tem_malformed, is_tes_success, lsfDisableMaster, tfInnerBatchTxn,
 };
 use quaxar_core::DatabaseCon;
@@ -8690,7 +8690,7 @@ impl ApplicationRoot {
         {
             ledger_with_fetcher.set_node_batch_writer_result(writer);
         }
-        match ledger_with_fetcher.setup_from_state_map(&feature_xrp_fees()) {
+        match ledger_with_fetcher.setup_from_state_map() {
             Ok(true) => {
                 full_sync_debug!(
                     "[full_debug][ledger_fetcher] setup seq={} result=loaded fees_base={} fees_reserve={} fees_inc={}",
@@ -9074,12 +9074,6 @@ impl ApplicationRoot {
                 ),
             ),
         ]);
-        if !ledger.rules().enabled(&feature_xrp_fees()) {
-            notification.insert(
-                "fee_ref".to_owned(),
-                protocol::JsonValue::Unsigned(u64::from(REFERENCE_FEE_UNITS_DEPRECATED)),
-            );
-        }
         if self.network_ops_operating_mode() >= NetworkOpsOperatingMode::Syncing {
             if let Some(runtime) = self.ledger_master_runtime() {
                 notification.insert(

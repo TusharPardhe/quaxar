@@ -7,15 +7,10 @@ use crate::{
 use protocol::{NotTec, Ter, feature_batch, is_tes_success};
 
 pub const fn amm_vote_check_extra_features(
-    amm_enabled: bool,
     mptokens_v2_enabled: bool,
     asset_holds_mpt: bool,
     asset2_holds_mpt: bool,
 ) -> bool {
-    if !amm_enabled {
-        return false;
-    }
-
     if (asset_holds_mpt || asset2_holds_mpt) && !mptokens_v2_enabled {
         return false;
     }

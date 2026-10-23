@@ -307,7 +307,6 @@ fn ledger_from_ledger_seq_and_close_time_with_setup_applies_defaults_and_presets
             increment: 30,
         },
         [preset, feature_xrp_fees()],
-        &feature_xrp_fees(),
     )
     .expect("empty constructor setup path should not fail");
 

@@ -166,7 +166,7 @@ fn backed_fee_ledger_without_fetcher(
     node_store: &app::SHAMapStoreNodeStore,
 ) -> Ledger {
     let fee_keylet = fee_settings_keylet();
-    let fee_payload = encode_fee_settings_entry(fees, false);
+    let fee_payload = encode_fee_settings_entry(fees);
 
     let mut state_tree = MutableTree::new(seq);
     state_tree

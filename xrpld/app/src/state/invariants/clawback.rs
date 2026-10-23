@@ -131,7 +131,11 @@ pub(super) fn validates_clawback<V: ApplyView + ?Sized>(
             } else {
                 claw_amount
             };
-            if after > before || before - after != expected {
+            // rippled #8475: IOU balances keep 16 significant digits, so a
+            // clawback much smaller than the balance changes it by a rounded
+            // amount, possibly zero. Compare with the same rounded subtraction
+            // the balance update performs.
+            if after > before || after != before.clone() - expected {
                 return Ok(legacy_violation_allowed(mptokens_v2_enabled));
             }
             Ok(true)

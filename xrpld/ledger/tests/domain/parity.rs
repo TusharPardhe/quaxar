@@ -970,7 +970,7 @@ fn ledger_set_immutable_and_setup_from_state_map_runs_setup_after_finalization()
     });
 
     let ok = ledger
-        .set_immutable_and_setup_from_state_map(true, &feature_xrp_fees())
+        .set_immutable_and_setup_from_state_map(true)
         .expect("setup after finalization should decode");
 
     assert!(ok);
@@ -1205,7 +1205,7 @@ fn ledger_set_accepted_and_setup_from_state_map_preserves_bool_setup_outcome() {
     ledger.set_rules(original_rules.clone());
 
     let ok = ledger
-        .set_accepted_and_setup_from_state_map(321, 60, false, &feature_xrp_fees())
+        .set_accepted_and_setup_from_state_map(321, 60, false)
         .expect("setup after acceptance should preserve bool failure semantics");
 
     assert!(!ok);
@@ -1402,7 +1402,6 @@ fn ledger_from_ledger_seq_and_close_time_with_setup_applies_defaults_and_presets
             increment: 30,
         },
         [preset, feature_xrp_fees()],
-        &feature_xrp_fees(),
     )
     .expect("empty constructor setup path should not fail");
 
@@ -1674,7 +1673,6 @@ fn ledger_load_immutable_with_family_and_setup_decodes_loaded_state_entries_ctor
             reserve: 2,
             increment: 3,
         },
-        &feature_xrp_fees(),
         &family,
     )
     .expect("setup-aware immutable load should decode");
@@ -2662,7 +2660,6 @@ fn ledger_load_immutable_with_family_and_setup_marks_failed_setup_ctor() {
             reserve: 2,
             increment: 3,
         },
-        &feature_xrp_fees(),
         &family,
     )
     .expect("setup-aware immutable load should keep bool failure semantics");
@@ -2916,7 +2913,7 @@ fn ledger_setup_with_entries_resets_rules_to_presets_when_amendments_object_is_m
         [amendment],
     ));
 
-    let ok = ledger.setup_with_entries(&LedgerSetupEntries::default(), &feature_xrp_fees());
+    let ok = ledger.setup_with_entries(&LedgerSetupEntries::default());
 
     assert!(ok);
     assert!(ledger.rules().enabled(&preset));
@@ -2937,7 +2934,6 @@ fn ledger_setup_with_entries_preserves_prior_rules_when_amendment_lookup_hits_mi
             amendments: SetupLookup::MissingNode,
             fees: SetupLookup::MissingObject,
         },
-        &feature_xrp_fees(),
     );
 
     assert!(!ok);
@@ -2963,7 +2959,6 @@ fn ledger_setup_with_entries_accepts_legacy_fee_fields_when_xrp_fees_is_disabled
                 ..FeeSettingsFields::default()
             }),
         },
-        &feature_xrp_fees(),
     );
 
     assert!(ok);
@@ -3016,7 +3011,6 @@ fn ledger_setup_with_entries_accepts_xrp_amount_fee_fields_when_feature_is_enabl
                 ..FeeSettingsFields::default()
             }),
         },
-        &feature_xrp_fees(),
     );
 
     assert!(ok);
@@ -3062,7 +3056,6 @@ fn ledger_setup_with_entries_rejects_mixed_old_and_new_fee_formats() {
                 ..FeeSettingsFields::default()
             }),
         },
-        &feature_xrp_fees(),
     );
 
     assert!(!ok);
@@ -3089,7 +3082,6 @@ fn ledger_setup_with_entries_rejects_new_fee_fields_before_xrp_fees_amendment() 
                 ..FeeSettingsFields::default()
             }),
         },
-        &feature_xrp_fees(),
     );
 
     assert!(!ok);
@@ -3124,7 +3116,6 @@ fn ledger_setup_with_entries_rejects_non_native_xrp_amount_fields() {
                 ..FeeSettingsFields::default()
             }),
         },
-        &feature_xrp_fees(),
     );
 
     assert!(!ok);
@@ -3169,7 +3160,7 @@ fn ledger_setup_from_state_map_decodes_amendments_and_legacy_fee_fields() {
     ledger.set_rules(Rules::new([preset]));
 
     let ok = ledger
-        .setup_from_state_map(&feature_xrp_fees())
+        .setup_from_state_map()
         .expect("state-map setup should decode");
 
     assert!(ok);
@@ -3222,7 +3213,6 @@ fn ledger_setup_with_entries_rejects_mixed_legacy_and_xrp_fee_formats() {
                 ..FeeSettingsFields::default()
             }),
         },
-        &feature_xrp_fees(),
     );
 
     assert!(!ok);
@@ -3393,7 +3383,7 @@ fn ledger_setup_from_state_map_with_family_decodes_xrp_fee_fields() {
     });
 
     let ok = ledger
-        .setup_from_state_map_with_family(&feature_xrp_fees(), &family)
+        .setup_from_state_map_with_family(&family)
         .expect("family-backed state-map setup should decode");
 
     assert!(ok);
@@ -3465,7 +3455,7 @@ fn ledger_setup_from_state_map_with_family_returns_false_for_missing_amendment_n
     ledger.set_rules(original_rules.clone());
 
     let ok = ledger
-        .setup_from_state_map_with_family(&feature_xrp_fees(), &family)
+        .setup_from_state_map_with_family(&family)
         .expect("missing-node setup should still return a bool outcome");
 
     assert!(!ok);
@@ -3511,7 +3501,7 @@ fn ledger_setup_from_state_map_rejects_negative_native_xrp_fee_amounts_in_narrow
     });
 
     let ok = ledger
-        .setup_from_state_map(&feature_xrp_fees())
+        .setup_from_state_map()
         .expect("negative native amount should decode through the narrowed port");
 
     assert!(!ok);
@@ -3602,7 +3592,7 @@ fn build_genesis_setup_items_round_trip_through_setup_from_state_map() {
     ledger.apply_default_fees(config.fees);
 
     let loaded = ledger
-        .setup_from_state_map(&feature_xrp_fees())
+        .setup_from_state_map()
         .expect("genesis setup entries should decode through current ledger setup path");
 
     assert!(loaded);

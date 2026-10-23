@@ -9,7 +9,7 @@ use std::sync::Arc;
 use basics::base_uint::{Uint160, Uint192};
 use ledger::ReadView;
 use protocol::{
-    AccountID, Asset, STLedgerEntry, STTx, Ter, TxType, feature_amm, feature_deep_freeze,
+    AccountID, Asset, STLedgerEntry, STTx, Ter, TxType, feature_deep_freeze,
     feature_single_asset_vault, get_field_by_symbol, lsfAllowTrustLineClawback, lsfMPTCanClawback,
     lsfMPTCanLock, lsfMPTCanTransfer, lsfMPTLocked, lsfMPTRequireAuth, lsfNoFreeze, lsfRequireAuth,
     tfMPTUnauthorize,
@@ -115,7 +115,6 @@ fn preclaim_trust_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
             account_requires_auth: false,
             destination_is_source: false,
             destination_exists: false,
-            amm_or_single_asset_vault_enabled: false,
             destination_account_flags: 0,
             trustline_exists: false,
             destination_is_pseudo_account: false,
@@ -142,9 +141,8 @@ fn preclaim_trust_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         return Ok(Ter::TEM_DST_IS_SRC);
     }
     let destination_sle = account(view, destination)?;
-    let amm_or_single_asset_vault_enabled =
-        view.rules().enabled(&feature_amm()) || view.rules().enabled(&feature_single_asset_vault());
-    if amm_or_single_asset_vault_enabled && destination_sle.is_none() {
+    // rippled #7357 (AMM retired): a missing destination is always tecNO_DST.
+    if destination_sle.is_none() {
         return Ok(Ter::TEC_NO_DST);
     }
     let pseudo = destination_sle
@@ -213,7 +211,6 @@ fn preclaim_trust_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         account_requires_auth: source.is_flag(lsfRequireAuth),
         destination_is_source: account_id == destination,
         destination_exists: destination_sle.is_some(),
-        amm_or_single_asset_vault_enabled,
         destination_account_flags: destination_sle.as_ref().map_or(0, |sle| sle.get_flags()),
         trustline_exists: line.is_some(),
         destination_is_pseudo_account: pseudo,

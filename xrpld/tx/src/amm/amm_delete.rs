@@ -7,14 +7,9 @@ use crate::{
 use protocol::{NotTec, Ter, feature_batch, is_tes_success};
 
 pub const fn amm_delete_check_extra_features(
-    amm_enabled: bool,
     mptokens_v2_enabled: bool,
     asset_pair_holds_mpt: bool,
 ) -> bool {
-    if !amm_enabled {
-        return false;
-    }
-
     if asset_pair_holds_mpt && !mptokens_v2_enabled {
         return false;
     }
@@ -121,9 +116,9 @@ mod tests {
 
     #[test]
     fn extra_feature_gate_matches_mptokens_v2_edges() {
-        assert!(!amm_delete_check_extra_features(false, true, true));
-        assert!(amm_delete_check_extra_features(true, false, false));
-        assert!(!amm_delete_check_extra_features(true, false, true));
-        assert!(amm_delete_check_extra_features(true, true, true));
+        assert!(!amm_delete_check_extra_features(false, true));
+        assert!(amm_delete_check_extra_features(true, false));
+        assert!(!amm_delete_check_extra_features(true, false));
+        assert!(amm_delete_check_extra_features(true, true));
     }
 }

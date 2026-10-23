@@ -348,15 +348,6 @@ fn validation_format() -> &'static SOTemplate {
                     .expect("validation load fee field should be useful"),
                 SOElement::new(get_field_by_symbol("sfAmendments"), SOEStyle::Optional)
                     .expect("validation amendments field should be useful"),
-                SOElement::new(get_field_by_symbol("sfBaseFee"), SOEStyle::Optional)
-                    .expect("validation base fee field should be useful"),
-                SOElement::new(get_field_by_symbol("sfReserveBase"), SOEStyle::Optional)
-                    .expect("validation reserve base field should be useful"),
-                SOElement::new(
-                    get_field_by_symbol("sfReserveIncrement"),
-                    SOEStyle::Optional,
-                )
-                .expect("validation reserve increment field should be useful"),
                 SOElement::new(get_field_by_symbol("sfSigningTime"), SOEStyle::Required)
                     .expect("validation signing time field should be useful"),
                 SOElement::new(get_field_by_symbol("sfSigningPubKey"), SOEStyle::Required)

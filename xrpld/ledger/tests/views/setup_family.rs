@@ -119,7 +119,7 @@ fn ledger_setup_with_entries_resets_rules_to_presets_when_amendments_object_is_m
         [amendment],
     ));
 
-    let ok = ledger.setup_with_entries(&LedgerSetupEntries::default(), &feature_xrp_fees());
+    let ok = ledger.setup_with_entries(&LedgerSetupEntries::default());
 
     assert!(ok);
     assert!(ledger.rules().enabled(&preset));
@@ -140,7 +140,6 @@ fn ledger_setup_with_entries_preserves_prior_rules_when_amendment_lookup_hits_mi
             amendments: SetupLookup::MissingNode,
             fees: SetupLookup::MissingObject,
         },
-        &feature_xrp_fees(),
     );
 
     assert!(!ok);
@@ -166,7 +165,6 @@ fn ledger_setup_with_entries_accepts_legacy_fee_fields_when_xrp_fees_is_disabled
                 ..FeeSettingsFields::default()
             }),
         },
-        &feature_xrp_fees(),
     );
 
     assert!(ok);
@@ -219,7 +217,6 @@ fn ledger_setup_with_entries_accepts_xrp_amount_fee_fields_when_feature_is_enabl
                 ..FeeSettingsFields::default()
             }),
         },
-        &feature_xrp_fees(),
     );
 
     assert!(ok);
@@ -265,7 +262,6 @@ fn ledger_setup_with_entries_rejects_mixed_old_and_new_fee_formats() {
                 ..FeeSettingsFields::default()
             }),
         },
-        &feature_xrp_fees(),
     );
 
     assert!(!ok);
@@ -292,7 +288,6 @@ fn ledger_setup_with_entries_rejects_new_fee_fields_before_xrp_fees_amendment() 
                 ..FeeSettingsFields::default()
             }),
         },
-        &feature_xrp_fees(),
     );
 
     assert!(!ok);
@@ -327,7 +322,6 @@ fn ledger_setup_with_entries_rejects_non_native_xrp_amount_fields() {
                 ..FeeSettingsFields::default()
             }),
         },
-        &feature_xrp_fees(),
     );
 
     assert!(!ok);
@@ -353,7 +347,7 @@ fn ledger_setup_from_state_map_with_config_and_family_decodes_family_backed_xrp_
                 amendments_key(),
                 encode_amendments_entry(&[feature_xrp_fees(), sample_uint256(0xCD)]),
             ),
-            (fees_key(), encode_fee_settings_entry(44, 55, 66, true)),
+            (fees_key(), encode_fee_settings_entry(44, 55, 66)),
         ],
         true,
         1106,
@@ -406,7 +400,7 @@ fn ledger_setup_from_state_map_with_family_decodes_xrp_fee_fields() {
                 amendments_key(),
                 encode_amendments_entry(&[feature_xrp_fees()]),
             ),
-            (fees_key(), encode_fee_settings_entry(44, 55, 66, true)),
+            (fees_key(), encode_fee_settings_entry(44, 55, 66)),
         ],
         true,
         1102,
@@ -434,7 +428,7 @@ fn ledger_setup_from_state_map_with_family_decodes_xrp_fee_fields() {
     });
 
     let ok = ledger
-        .setup_from_state_map_with_family(&feature_xrp_fees(), &family)
+        .setup_from_state_map_with_family(&family)
         .expect("family-backed state-map setup should decode");
 
     assert!(ok);
@@ -455,7 +449,7 @@ fn ledger_setup_from_state_map_with_family_returns_false_for_missing_amendment_n
     let missing_amendments_hash = sample_hash(0xD8);
     let fee_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
-        SHAMapItem::new(fees_key(), encode_fee_settings_entry(10, 20, 30, false)),
+        SHAMapItem::new(fees_key(), encode_fee_settings_entry(10, 20, 30)),
         0,
     );
     let root = SHAMapTreeNode::new_inner(1);
@@ -502,7 +496,7 @@ fn ledger_setup_from_state_map_with_family_returns_false_for_missing_amendment_n
     ledger.set_rules(original_rules.clone());
 
     let ok = ledger
-        .setup_from_state_map_with_family(&feature_xrp_fees(), &family)
+        .setup_from_state_map_with_family(&family)
         .expect("missing-node setup should still return a bool outcome");
 
     assert!(!ok);
@@ -546,7 +540,7 @@ fn ledger_setup_from_state_map_rejects_negative_native_xrp_fee_amounts_in_narrow
     });
 
     let ok = ledger
-        .setup_from_state_map(&feature_xrp_fees())
+        .setup_from_state_map()
         .expect("negative native amount should decode through the narrowed port");
 
     assert!(!ok);

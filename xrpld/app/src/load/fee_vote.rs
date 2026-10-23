@@ -10,8 +10,7 @@ use std::collections::BTreeMap;
 
 use ledger::{Fees, INITIAL_XRP_DROPS, Ledger};
 use protocol::{
-    REFERENCE_FEE_UNITS_DEPRECATED, Rules, STAmount, STTx, STValidation, TxType, XRPAmount,
-    feature_xrp_fees, get_field_by_symbol,
+    STAmount, STTx, STValidation, TxType, XRPAmount, get_field_by_symbol,
 };
 
 use crate::tx_queue::vote_tx_set::VoteTxSet;
@@ -32,7 +31,6 @@ impl FeeVoteJournal for NullFeeVoteJournal {
 
 pub trait FeeVoteLedgerView {
     fn fees(&self) -> Fees;
-    fn rules(&self) -> &Rules;
     fn seq(&self) -> u32;
     fn is_flag_ledger(&self) -> bool;
 }
@@ -42,9 +40,6 @@ impl FeeVoteLedgerView for Ledger {
         Ledger::fees(self)
     }
 
-    fn rules(&self) -> &Rules {
-        Ledger::rules(self)
-    }
 
     fn seq(&self) -> u32 {
         self.header().seq
@@ -120,10 +115,6 @@ impl VotableValue {
         self.add_vote(self.current);
     }
 
-    fn current(&self) -> XRPAmount {
-        self.current
-    }
-
     fn get_votes(&self) -> (XRPAmount, bool) {
         let low = self.current.min(self.target);
         let high = self.current.max(self.target);
@@ -159,54 +150,29 @@ where
         self.target
     }
 
-    pub fn do_validation(&self, last_fees: Fees, rules: &Rules, validation: &mut STValidation) {
+    pub fn do_validation(&self, last_fees: Fees, validation: &mut STValidation) {
         let (current_base, current_reserve, current_increment) = current_fee_schedule(last_fees);
 
-        if rules.enabled(&feature_xrp_fees()) {
-            self.vote_xrp_field(
-                validation,
-                current_base,
-                self.target.reference_fee,
-                "base fee",
-                get_field_by_symbol("sfBaseFeeDrops"),
-            );
-            self.vote_xrp_field(
-                validation,
-                current_reserve,
-                self.target.account_reserve,
-                "base reserve",
-                get_field_by_symbol("sfReserveBaseDrops"),
-            );
-            self.vote_xrp_field(
-                validation,
-                current_increment,
-                self.target.owner_reserve,
-                "reserve increment",
-                get_field_by_symbol("sfReserveIncrementDrops"),
-            );
-            return;
-        }
-
-        self.vote_legacy_u64_field(
+        self.vote_xrp_field(
             validation,
             current_base,
             self.target.reference_fee,
             "base fee",
-            get_field_by_symbol("sfBaseFee"),
+            get_field_by_symbol("sfBaseFeeDrops"),
         );
-        self.vote_legacy_u32_field(
+        self.vote_xrp_field(
             validation,
             current_reserve,
             self.target.account_reserve,
             "base reserve",
-            get_field_by_symbol("sfReserveBase"),
+            get_field_by_symbol("sfReserveBaseDrops"),
         );
-        self.vote_legacy_u32_field(
+        self.vote_xrp_field(
             validation,
             current_increment,
             self.target.owner_reserve,
             "reserve increment",
-            get_field_by_symbol("sfReserveIncrement"),
+            get_field_by_symbol("sfReserveIncrementDrops"),
         );
     }
 
@@ -225,49 +191,25 @@ where
         let mut base_reserve_vote = VotableValue::new(current_reserve, self.target.account_reserve);
         let mut inc_reserve_vote = VotableValue::new(current_increment, self.target.owner_reserve);
 
-        let rules = last_closed_ledger.rules();
-        if rules.enabled(&feature_xrp_fees()) {
-            for validation in parent_validations
-                .iter()
-                .filter(|validation| validation.is_trusted())
-            {
-                apply_xrp_vote(
-                    validation,
-                    &mut base_fee_vote,
-                    get_field_by_symbol("sfBaseFeeDrops"),
-                );
-                apply_xrp_vote(
-                    validation,
-                    &mut base_reserve_vote,
-                    get_field_by_symbol("sfReserveBaseDrops"),
-                );
-                apply_xrp_vote(
-                    validation,
-                    &mut inc_reserve_vote,
-                    get_field_by_symbol("sfReserveIncrementDrops"),
-                );
-            }
-        } else {
-            for validation in parent_validations
-                .iter()
-                .filter(|validation| validation.is_trusted())
-            {
-                apply_legacy_u64_vote(
-                    validation,
-                    &mut base_fee_vote,
-                    get_field_by_symbol("sfBaseFee"),
-                );
-                apply_legacy_u32_vote(
-                    validation,
-                    &mut base_reserve_vote,
-                    get_field_by_symbol("sfReserveBase"),
-                );
-                apply_legacy_u32_vote(
-                    validation,
-                    &mut inc_reserve_vote,
-                    get_field_by_symbol("sfReserveIncrement"),
-                );
-            }
+        for validation in parent_validations
+            .iter()
+            .filter(|validation| validation.is_trusted())
+        {
+            apply_xrp_vote(
+                validation,
+                &mut base_fee_vote,
+                get_field_by_symbol("sfBaseFeeDrops"),
+            );
+            apply_xrp_vote(
+                validation,
+                &mut base_reserve_vote,
+                get_field_by_symbol("sfReserveBaseDrops"),
+            );
+            apply_xrp_vote(
+                validation,
+                &mut inc_reserve_vote,
+                get_field_by_symbol("sfReserveIncrementDrops"),
+            );
         }
 
         let base_fee = base_fee_vote.get_votes();
@@ -292,44 +234,18 @@ where
                 protocol::AccountID::default(),
             );
             tx.set_field_u32(get_field_by_symbol("sfLedgerSequence"), seq);
-            if rules.enabled(&feature_xrp_fees()) {
-                tx.set_field_amount(
-                    get_field_by_symbol("sfBaseFeeDrops"),
-                    STAmount::from_xrp_amount(base_fee.0),
-                );
-                tx.set_field_amount(
-                    get_field_by_symbol("sfReserveBaseDrops"),
-                    STAmount::from_xrp_amount(base_reserve.0),
-                );
-                tx.set_field_amount(
-                    get_field_by_symbol("sfReserveIncrementDrops"),
-                    STAmount::from_xrp_amount(inc_reserve.0),
-                );
-            } else {
-                tx.set_field_u64(
-                    get_field_by_symbol("sfBaseFee"),
-                    base_fee
-                        .0
-                        .drops_as()
-                        .unwrap_or_else(|| base_fee_vote.current().drops_as().unwrap_or_default()),
-                );
-                tx.set_field_u32(
-                    get_field_by_symbol("sfReserveBase"),
-                    base_reserve.0.drops_as().unwrap_or_else(|| {
-                        base_reserve_vote.current().drops_as().unwrap_or_default()
-                    }),
-                );
-                tx.set_field_u32(
-                    get_field_by_symbol("sfReserveIncrement"),
-                    inc_reserve.0.drops_as().unwrap_or_else(|| {
-                        inc_reserve_vote.current().drops_as().unwrap_or_default()
-                    }),
-                );
-                tx.set_field_u32(
-                    get_field_by_symbol("sfReferenceFeeUnits"),
-                    REFERENCE_FEE_UNITS_DEPRECATED,
-                );
-            }
+            tx.set_field_amount(
+                get_field_by_symbol("sfBaseFeeDrops"),
+                STAmount::from_xrp_amount(base_fee.0),
+            );
+            tx.set_field_amount(
+                get_field_by_symbol("sfReserveBaseDrops"),
+                STAmount::from_xrp_amount(base_reserve.0),
+            );
+            tx.set_field_amount(
+                get_field_by_symbol("sfReserveIncrementDrops"),
+                STAmount::from_xrp_amount(inc_reserve.0),
+            );
         });
 
         self.journal
@@ -356,43 +272,6 @@ where
         validation.set_field_amount(field, STAmount::from_xrp_amount(target));
     }
 
-    fn vote_legacy_u64_field(
-        &self,
-        validation: &mut STValidation,
-        current: XRPAmount,
-        target: XRPAmount,
-        name: &str,
-        field: &'static protocol::SField,
-    ) {
-        if current == target {
-            return;
-        }
-
-        self.journal
-            .info(&format!("Voting for {name} of {}", target.drops()));
-        if let Some(value) = target.drops_as() {
-            validation.set_field_u64(field, value);
-        }
-    }
-
-    fn vote_legacy_u32_field(
-        &self,
-        validation: &mut STValidation,
-        current: XRPAmount,
-        target: XRPAmount,
-        name: &str,
-        field: &'static protocol::SField,
-    ) {
-        if current == target {
-            return;
-        }
-
-        self.journal
-            .info(&format!("Voting for {name} of {}", target.drops()));
-        if let Some(value) = target.drops_as() {
-            validation.set_field_u32(field, value);
-        }
-    }
 }
 
 fn current_fee_schedule(last_fees: Fees) -> (XRPAmount, XRPAmount, XRPAmount) {
@@ -420,45 +299,6 @@ fn apply_xrp_vote(
     }
 
     let vote = amount.xrp();
-    if is_legal_amount_signed(vote) {
-        value.add_vote(vote);
-    } else {
-        value.no_vote();
-    }
-}
-
-fn apply_legacy_u64_vote(
-    validation: &STValidation,
-    value: &mut VotableValue,
-    field: &'static protocol::SField,
-) {
-    if !validation.is_field_present(field) {
-        value.no_vote();
-        return;
-    }
-
-    let raw_vote = validation.get_field_u64(field);
-    match i64::try_from(raw_vote)
-        .ok()
-        .map(XRPAmount::from_drops)
-        .filter(|vote| is_legal_amount_signed(*vote))
-    {
-        Some(vote) => value.add_vote(vote),
-        None => value.no_vote(),
-    }
-}
-
-fn apply_legacy_u32_vote(
-    validation: &STValidation,
-    value: &mut VotableValue,
-    field: &'static protocol::SField,
-) {
-    if !validation.is_field_present(field) {
-        value.no_vote();
-        return;
-    }
-
-    let vote = XRPAmount::from_drops(i64::from(validation.get_field_u32(field)));
     if is_legal_amount_signed(vote) {
         value.add_vote(vote);
     } else {

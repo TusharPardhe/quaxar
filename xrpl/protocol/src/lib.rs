@@ -15,7 +15,6 @@ pub mod transactions;
 
 pub use amounts::amount_conversions;
 pub use amounts::amount_support;
-pub use amounts::fees;
 pub use amounts::iou_amount;
 pub use amounts::mpt_amount;
 pub use amounts::mpt_issue;
@@ -134,7 +133,7 @@ pub use amm_core::{
     AUCTION_SLOT_DISCOUNTED_FEE_FRACTION, AUCTION_SLOT_FEE_SCALE_FACTOR,
     AUCTION_SLOT_INTERVAL_DURATION, AUCTION_SLOT_MAX_AUTH_ACCOUNTS, AUCTION_SLOT_MIN_FEE_FRACTION,
     AUCTION_SLOT_TIME_INTERVALS, TOTAL_TIME_SLOT_SECS, TRADING_FEE_THRESHOLD, VOTE_MAX_SLOTS,
-    VOTE_WEIGHT_SCALE_FACTOR, amm_auction_min_slot_price, amm_auction_time_slot, amm_enabled,
+    VOTE_WEIGHT_SCALE_FACTOR, amm_auction_min_slot_price, amm_auction_time_slot,
     amm_lpt_currency, amm_lpt_currency_from_assets, amm_lpt_issue, amm_lpt_issue_from_assets,
     fee_mult, fee_mult_half, get_fee, invalid_amm_amount, invalid_amm_asset,
     invalid_amm_asset_pair,
@@ -231,7 +230,6 @@ pub use feature::{
     fix_token_escrow_v1, registered_feature, registered_feature_supported,
     registered_feature_supported_with_confidential_crypto,
 };
-pub use fees::{calculate_base_fee, calculate_reserve};
 pub use genesis_identity::{
     GENESIS_PASSPHRASE, derive_secp256k1_account_id_from_passphrase,
     derive_secp256k1_public_key_from_passphrase, genesis_account_id, genesis_public_key,

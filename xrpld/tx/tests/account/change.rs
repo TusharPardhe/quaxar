@@ -100,7 +100,6 @@ fn change_preclaim_validates_fee_field_shapes() {
     let xrp_missing = run_change_preclaim(
         TxType::FEE,
         ChangePreclaimFacts {
-            xrp_fees_enabled: true,
             base_fee_drops_present: true,
             reserve_base_drops_present: true,
             ..ChangePreclaimFacts::default()
@@ -109,7 +108,6 @@ fn change_preclaim_validates_fee_field_shapes() {
     let xrp_forbids_legacy = run_change_preclaim(
         TxType::FEE,
         ChangePreclaimFacts {
-            xrp_fees_enabled: true,
             base_fee_drops_present: true,
             reserve_base_drops_present: true,
             reserve_increment_drops_present: true,

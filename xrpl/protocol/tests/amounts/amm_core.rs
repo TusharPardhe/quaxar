@@ -1,27 +1,13 @@
 use protocol::{
-    AccountID, Asset, Currency, Issue, MPTIssue, Rules, STAmount, STObject, Ter,
-    amm_auction_time_slot, amm_enabled, amm_lpt_currency, amm_lpt_currency_from_assets,
-    amm_lpt_issue, amm_lpt_issue_from_assets, bad_currency, currency_from_string, feature_amm,
-    feature_universal_number, get_field_by_symbol, invalid_amm_amount, invalid_amm_asset_pair,
+    AccountID, Asset, Currency, Issue, MPTIssue, STAmount, STObject, Ter,
+    amm_auction_time_slot, amm_lpt_currency, amm_lpt_currency_from_assets,
+    amm_lpt_issue, amm_lpt_issue_from_assets, bad_currency, currency_from_string,
+    get_field_by_symbol, invalid_amm_amount, invalid_amm_asset_pair,
     make_mpt_id,
 };
 
 fn sample_account(fill: u8) -> AccountID {
     AccountID::from_array([fill; 20])
-}
-
-#[test]
-fn amm_enabled_requires_both_amm_and_universal_number() {
-    // rippled HEAD ammEnabled (AMMCore.cpp:129-131) is gated only by
-    // featureAMM after the fixUniversalNumber amendment was retired
-    // (rippled 8a4bf2dee6). UniversalNumber is no longer an additional gate.
-    assert!(!amm_enabled(&Rules::new([])));
-    assert!(amm_enabled(&Rules::new([feature_amm()])));
-    assert!(!amm_enabled(&Rules::new([feature_universal_number()])));
-    assert!(amm_enabled(&Rules::new([
-        feature_amm(),
-        feature_universal_number(),
-    ])));
 }
 
 #[test]

@@ -26,11 +26,10 @@ fn mpt_asset(fill: u8) -> Asset {
 
 #[test]
 fn amm_create_check_extra_features_matches_cpp_mpt_gate() {
-    assert!(amm_create_check_extra_features(true, false, false, false));
-    assert!(amm_create_check_extra_features(true, true, true, false));
-    assert!(!amm_create_check_extra_features(true, false, true, false));
-    assert!(!amm_create_check_extra_features(true, false, false, true));
-    assert!(!amm_create_check_extra_features(false, true, false, false));
+    assert!(amm_create_check_extra_features(false, false, false));
+    assert!(amm_create_check_extra_features(true, true, false));
+    assert!(!amm_create_check_extra_features(false, true, false));
+    assert!(!amm_create_check_extra_features(false, false, true));
     assert!(matches!(mpt_asset(7), Asset::MPTIssue(_)));
 }
 

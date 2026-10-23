@@ -1845,7 +1845,7 @@ impl AppConsensus {
                     if let Some(fee_vote) = self.adaptor.fee_vote.as_ref()
                         && closed.is_voting_ledger()
                     {
-                        fee_vote.do_validation(closed.fees(), closed.rules(), v);
+                        fee_vote.do_validation(closed.fees(), v);
                     }
                     if closed.is_voting_ledger() {
                         if let Some(amendment_status) = self.adaptor.amendment_status.as_ref() {

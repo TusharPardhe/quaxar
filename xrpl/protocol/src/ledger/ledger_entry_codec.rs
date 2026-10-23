@@ -5,7 +5,6 @@
 //! genesis/setup and ledger-entry parity callers and exposes a shared typed
 //! enum over those entry shapes.
 
-use crate::feature_xrp_fees;
 use crate::keylet::{LedgerEntryType, account_keylet, amendments_keylet, fee_settings_keylet};
 use basics::base_uint::{Uint160, Uint256};
 
@@ -427,24 +426,12 @@ pub fn make_constructor_fee_settings_entry(
     base_drops: u64,
     reserve_drops: u64,
     increment_drops: u64,
-    amendments: &[Uint256],
 ) -> ConstructorFeeSettingsEntry {
-    if amendments
-        .iter()
-        .any(|amendment| amendment == &feature_xrp_fees())
-    {
-        return ConstructorFeeSettingsEntry::XrpDrops {
-            base_fee_drops: base_drops,
-            reserve_base_drops: reserve_drops,
-            reserve_increment_drops: increment_drops,
-        };
-    }
-
-    ConstructorFeeSettingsEntry::Legacy {
-        base_fee: base_drops,
-        reference_fee_units: REFERENCE_FEE_UNITS_DEPRECATED,
-        reserve_base: u32::try_from(reserve_drops).ok(),
-        reserve_increment: u32::try_from(increment_drops).ok(),
+    // rippled #7349 retired XRPFees: new ledgers always use the drops fields.
+    ConstructorFeeSettingsEntry::XrpDrops {
+        base_fee_drops: base_drops,
+        reserve_base_drops: reserve_drops,
+        reserve_increment_drops: increment_drops,
     }
 }
 
@@ -465,7 +452,7 @@ pub fn build_genesis_setup_constructor_entries(
     }
 
     entries.push(ConstructorLedgerEntry::FeeSettings(
-        make_constructor_fee_settings_entry(base_drops, reserve_drops, increment_drops, amendments),
+        make_constructor_fee_settings_entry(base_drops, reserve_drops, increment_drops),
     ));
 
     entries
@@ -495,26 +482,11 @@ pub fn build_genesis_state_constructor_entries(
     entries
 }
 
-pub fn encode_fee_settings_entry(
-    base_drops: u64,
-    reserve_drops: u64,
-    increment_drops: u64,
-    xrp_fees_enabled: bool,
-) -> Vec<u8> {
-    if xrp_fees_enabled {
-        return encode_constructor_fee_settings_entry(make_constructor_fee_settings_entry(
-            base_drops,
-            reserve_drops,
-            increment_drops,
-            &[feature_xrp_fees()],
-        ));
-    }
-
+pub fn encode_fee_settings_entry(base_drops: u64, reserve_drops: u64, increment_drops: u64) -> Vec<u8> {
     encode_constructor_fee_settings_entry(make_constructor_fee_settings_entry(
         base_drops,
         reserve_drops,
         increment_drops,
-        &[],
     ))
 }
 
@@ -1488,7 +1460,6 @@ mod tests {
         encode_constructor_amendments_entry, encode_constructor_fee_settings_entry,
         encode_fee_settings_entry, make_constructor_fee_settings_entry,
     };
-    use crate::feature_xrp_fees;
     use basics::base_uint::{Uint160, Uint256};
 
     fn bytes_to_hex(bytes: &[u8]) -> String {
@@ -1553,7 +1524,14 @@ mod tests {
         // rippled STLedgerEntry: required sfFlags, then canonical (type, field)
         // order, so UInt32 fields precede the UInt64 sfBaseFee.
         assert_eq!(
-            bytes_to_hex(&encode_fee_settings_entry(10, 20, 30, false)),
+            bytes_to_hex(&encode_constructor_fee_settings_entry(
+                ConstructorFeeSettingsEntry::Legacy {
+                    base_fee: 10,
+                    reference_fee_units: REFERENCE_FEE_UNITS_DEPRECATED,
+                    reserve_base: Some(20),
+                    reserve_increment: Some(30),
+                }
+            )),
             "1100732200000000201E0000000A201F0000001420200000001E35000000000000000A"
         );
     }
@@ -1561,7 +1539,7 @@ mod tests {
     #[test]
     fn xrp_fee_settings_entry_matches_current_field_layout() {
         assert_eq!(
-            bytes_to_hex(&encode_fee_settings_entry(11, 22, 33, true)),
+            bytes_to_hex(&encode_fee_settings_entry(11, 22, 33)),
             "11007322000000006016400000000000000B6017400000000000001660184000000000000021"
         );
     }
@@ -1695,7 +1673,7 @@ mod tests {
         assert_eq!(decoded_amendments.previous_txn_id, None);
         assert_eq!(decoded_amendments.previous_txn_lgr_seq, None);
 
-        let decoded_fees = decode_fee_settings_entry(&encode_fee_settings_entry(11, 22, 33, true))
+        let decoded_fees = decode_fee_settings_entry(&encode_fee_settings_entry(11, 22, 33))
             .expect("encoded fee settings entry should decode");
         assert_eq!(
             decoded_fees.base_fee_drops,
@@ -1963,22 +1941,14 @@ mod tests {
     }
 
     #[test]
-    fn constructor_fee_settings_shape_follows_xrp_fees_amendment() {
+    fn constructor_fee_settings_always_uses_drops_fields() {
+        // rippled #7349 retired XRPFees.
         assert_eq!(
-            make_constructor_fee_settings_entry(10, 20, 30, &[feature_xrp_fees()]),
+            make_constructor_fee_settings_entry(10, 20, 30),
             ConstructorFeeSettingsEntry::XrpDrops {
                 base_fee_drops: 10,
                 reserve_base_drops: 20,
                 reserve_increment_drops: 30,
-            }
-        );
-        assert_eq!(
-            make_constructor_fee_settings_entry(10, 20, 30, &[Uint256::from_array([0xAB; 32])]),
-            ConstructorFeeSettingsEntry::Legacy {
-                base_fee: 10,
-                reference_fee_units: REFERENCE_FEE_UNITS_DEPRECATED,
-                reserve_base: Some(20),
-                reserve_increment: Some(30),
             }
         );
     }

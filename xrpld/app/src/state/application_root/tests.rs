@@ -781,7 +781,6 @@ fn ledger_view(seq: u32, account: AccountID, account_sequence: u32, tx_ids: &[Ui
                         reserve: 1_000_000,
                         increment: 200_000,
                     },
-                    false,
                 ),
             ),
         )

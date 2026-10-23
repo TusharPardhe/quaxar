@@ -1,6 +1,5 @@
 pub mod amount_conversions;
 pub mod amount_support;
-pub mod fees;
 pub mod iou_amount;
 pub mod mpt_amount;
 pub mod mpt_issue;

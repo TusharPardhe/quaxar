@@ -50,7 +50,6 @@ pub fn execute_strands<V: ApplyView>(
     // previously passed no collector, so such offers stayed on the book
     // (mainnet 107803763, 107806372).
     let self_cross_cancellation = Some(self_cross_cancellation.unwrap_or_default());
-    let fill_or_kill_enabled = view.rules().enabled(&protocol::feature_id("fixFillOrKill"));
     if strands.is_empty() {
         return FlowResult {
             ter: Ter::TEC_PATH_DRY,
@@ -312,7 +311,6 @@ pub fn execute_strands<V: ApplyView>(
         partial_payment,
         offer_crossing,
         remaining_in.as_ref(),
-        fill_or_kill_enabled,
     ) {
         FlowResult {
             ter,
@@ -392,16 +390,16 @@ fn incomplete_offer_crossing_result(
     partial_payment: bool,
     offer_crossing: OfferCrossing,
     remaining_in: Option<&STAmount>,
-    fill_or_kill_enabled: bool,
 ) -> Option<Ter> {
     if total_out != deliver {
         if total_out > deliver {
             return Some(Ter::TEF_EXCEPTION);
         }
         if !partial_payment {
-            if offer_crossing == OfferCrossing::No
-                || (fill_or_kill_enabled && offer_crossing != OfferCrossing::Sell)
-            {
+            // rippled #7366 retired fixFillOrKill: without partial payment the
+            // caller requires the full output (payments and FillOrKill offers)
+            // unless it is a tfSell crossing, which is judged on input below.
+            if offer_crossing != OfferCrossing::Sell {
                 return Some(Ter::TEC_PATH_PARTIAL);
             }
         } else if total_out.signum() == 0 {
@@ -409,10 +407,7 @@ fn incomplete_offer_crossing_result(
         }
     }
 
-    if offer_crossing != OfferCrossing::No
-        && !partial_payment
-        && (!fill_or_kill_enabled || offer_crossing == OfferCrossing::Sell)
-    {
+    if !partial_payment && offer_crossing == OfferCrossing::Sell {
         return remaining_in
             .is_some_and(|amount| amount.signum() != 0)
             .then_some(Ter::TEC_PATH_PARTIAL);
@@ -1128,7 +1123,6 @@ mod tests {
                 false,
                 OfferCrossing::Sell,
                 Some(&zero_in),
-                true,
             ),
             None
         );
@@ -1139,7 +1133,6 @@ mod tests {
                 false,
                 OfferCrossing::Sell,
                 Some(&remaining_in),
-                true,
             ),
             Some(Ter::TEC_PATH_PARTIAL)
         );
@@ -1150,7 +1143,6 @@ mod tests {
                 false,
                 OfferCrossing::Sell,
                 Some(&negative_rounding_dust),
-                true,
             ),
             Some(Ter::TEC_PATH_PARTIAL),
             "StrandFlow.h requires remainingIn to equal zero exactly"
@@ -1158,7 +1150,9 @@ mod tests {
     }
 
     #[test]
-    fn buy_fill_or_kill_switches_from_input_to_output_completion_at_amendment() {
+    fn buy_fill_or_kill_requires_full_output() {
+        // rippled #7366 retired fixFillOrKill: a buy FillOrKill is judged on
+        // full output, never on input exhaustion.
         let delivered = STAmount::from_xrp_amount(XRPAmount::from_drops(50));
         let requested = STAmount::from_xrp_amount(XRPAmount::from_drops(100));
         let zero_in = STAmount::from_xrp_amount(XRPAmount::new());
@@ -1170,18 +1164,6 @@ mod tests {
                 false,
                 OfferCrossing::Yes,
                 Some(&zero_in),
-                false,
-            ),
-            None
-        );
-        assert_eq!(
-            incomplete_offer_crossing_result(
-                &delivered,
-                &requested,
-                false,
-                OfferCrossing::Yes,
-                Some(&zero_in),
-                true,
             ),
             Some(Ter::TEC_PATH_PARTIAL)
         );

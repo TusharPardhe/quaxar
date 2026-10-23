@@ -125,7 +125,6 @@ fn build_genesis_setup_items_uses_xrp_fee_object_when_amendment_enables_it() {
                 config.fees.base,
                 config.fees.reserve,
                 config.fees.increment,
-                true,
             ),
         )
     );
@@ -171,7 +170,7 @@ fn build_genesis_setup_items_round_trip_through_setup_from_state_map() {
     ledger.apply_default_fees(config.fees);
 
     let loaded = ledger
-        .setup_from_state_map(&feature_xrp_fees())
+        .setup_from_state_map()
         .expect("genesis setup entries should decode through current ledger setup path");
 
     assert!(loaded);
