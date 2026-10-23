@@ -737,6 +737,17 @@ struct FetchPackWakeState {
 type AcquisitionLedgerRevoker = Arc<dyn Fn(ProvisionalLedgerIdentity) + Send + Sync + 'static>;
 type AcquisitionAdvanceNotifier = Arc<dyn Fn() + Send + Sync + 'static>;
 
+/// Coordinator facts queued by threads that must not wait for the owner's
+/// drain (consensus heartbeat, validation and publication paths). The owner
+/// applies them in order before its next drain.
+#[derive(Debug, Clone)]
+enum DeferredCoordinatorFact {
+    Acquire(Uint256, u32, AcquireReason, bool),
+    PeerAvailability(Vec<overlay::PeerId>),
+    TransportAvailability(Vec<overlay::PeerId>),
+    ConsensusQuorum(bool),
+}
+
 pub struct InboundLedgers {
     inner: Arc<Mutex<RegistryInner>>,
     worker_pool: Arc<WorkerPool>,
@@ -775,7 +786,7 @@ pub struct InboundLedgers {
     /// Overlay ingress intentionally does not use this lock; it holds the
     /// separately published immutable [`CoordinatorIngress`] capability.
     coordinator: parking_lot::Mutex<Option<ProductionAdapter>>,
-    deferred_coordinator_acquires: Mutex<Vec<(Uint256, u32, AcquireReason, bool)>>,
+    deferred_coordinator_acquires: Mutex<Vec<DeferredCoordinatorFact>>,
     /// Lock-free published mirror of the coordinator's latest `RunnerSnapshot`
     /// and installed flag. Consensus/NetworkOps read coordinator phase/status
     /// every round via `coordinator_snapshot`/`coordinator_installed`; reading
@@ -1229,60 +1240,44 @@ impl InboundLedgers {
     /// false when the coordinator is not installed (the legacy strand writer
     /// remains authoritative).
     pub fn coordinator_report_peer_availability(&self, peers: &[overlay::PeerId]) -> bool {
-        let failures = {
-            let mut guard = self.coordinator.lock();
-            let Some(coordinator) = guard.as_mut() else {
-                return false;
-            };
-            coordinator.refresh_peers(self.coordinator_peer_snapshot());
-            coordinator.connectivity(peers);
-            coordinator.owner_wake().notify();
-            let __failures = coordinator.take_terminal_failures();
-            self.publish_coordinator_mirror(&guard);
-            __failures
-        };
-        self.record_coordinator_failures(failures);
+        // rippled's heartbeat runs on its own job; the consensus thread that
+        // calls this must never wait for the acquisition owner's drain.
+        if let Some(mut guard) = self.coordinator.try_lock() {
+            self.apply_deferred_coordinator_acquires(&mut guard);
+            return self.apply_peer_report_locked(&mut guard, peers, false);
+        }
+        if !self.coordinator_installed() {
+            return false;
+        }
+        self.defer_coordinator_fact(DeferredCoordinatorFact::PeerAvailability(peers.to_vec()));
         true
     }
 
     /// Feed acquisition transport membership without changing the coordinator
     /// operating phase (rippled start-valid zero-threshold behavior).
     pub fn coordinator_report_transport_availability(&self, peers: &[overlay::PeerId]) -> bool {
-        let failures = {
-            let mut guard = self.coordinator.lock();
-            let Some(coordinator) = guard.as_mut() else {
-                return false;
-            };
-            coordinator.refresh_peers(self.coordinator_peer_snapshot());
-            coordinator.transport_connectivity(peers);
-            coordinator.owner_wake().notify();
-            let __failures = coordinator.take_terminal_failures();
-            self.publish_coordinator_mirror(&guard);
-            __failures
-        };
-        self.record_coordinator_failures(failures);
+        if let Some(mut guard) = self.coordinator.try_lock() {
+            self.apply_deferred_coordinator_acquires(&mut guard);
+            return self.apply_peer_report_locked(&mut guard, peers, true);
+        }
+        if !self.coordinator_installed() {
+            return false;
+        }
+        self.defer_coordinator_fact(DeferredCoordinatorFact::TransportAvailability(peers.to_vec()));
         true
     }
 
     /// Report the configured consensus-peer threshold independently of ledger
     /// acquisition transport availability.
     pub fn coordinator_report_consensus_quorum(&self, available: bool) -> bool {
-        let failures = {
-            let mut guard = self.coordinator.lock();
-            let Some(coordinator) = guard.as_mut() else {
-                return false;
-            };
-            if available {
-                coordinator.consensus_quorum_available();
-            } else {
-                coordinator.consensus_quorum_lost();
-            }
-            coordinator.owner_wake().notify();
-            let __failures = coordinator.take_terminal_failures();
-            self.publish_coordinator_mirror(&guard);
-            __failures
-        };
-        self.record_coordinator_failures(failures);
+        if let Some(mut guard) = self.coordinator.try_lock() {
+            self.apply_deferred_coordinator_acquires(&mut guard);
+            return self.apply_consensus_quorum_locked(&mut guard, available);
+        }
+        if !self.coordinator_installed() {
+            return false;
+        }
+        self.defer_coordinator_fact(DeferredCoordinatorFact::ConsensusQuorum(available));
         true
     }
 
@@ -1768,13 +1763,14 @@ impl InboundLedgers {
             return;
         }
         if let Some(mut guard) = self.coordinator.try_lock() {
+            self.apply_deferred_coordinator_acquires(&mut guard);
             let _ = self.coordinator_acquire_locked(&mut guard, hash, seq, reason, validation_target);
             return;
         }
         self.deferred_coordinator_acquires
             .lock()
             .expect("deferred acquires lock")
-            .push((hash, seq, reason, validation_target));
+            .push(DeferredCoordinatorFact::Acquire(hash, seq, reason, validation_target));
         if let Some(wake) = self.coordinator_wake.read().expect("coordinator wake read").as_ref() {
             wake.notify();
         }
@@ -1791,12 +1787,89 @@ impl InboundLedgers {
                 .expect("deferred acquires lock"),
         );
         let count = deferred.len();
-        for (hash, seq, reason, validation_target) in deferred {
-            if self.coordinator_acquire_admitted(hash, seq, reason) {
-                let _ = self.coordinator_acquire_locked(guard, hash, seq, reason, validation_target);
+        for fact in deferred {
+            match fact {
+                DeferredCoordinatorFact::Acquire(hash, seq, reason, validation_target) => {
+                    if self.coordinator_acquire_admitted(hash, seq, reason) {
+                        let _ = self.coordinator_acquire_locked(
+                            guard,
+                            hash,
+                            seq,
+                            reason,
+                            validation_target,
+                        );
+                    }
+                }
+                DeferredCoordinatorFact::PeerAvailability(peers) => {
+                    self.apply_peer_report_locked(guard, &peers, false);
+                }
+                DeferredCoordinatorFact::TransportAvailability(peers) => {
+                    self.apply_peer_report_locked(guard, &peers, true);
+                }
+                DeferredCoordinatorFact::ConsensusQuorum(available) => {
+                    self.apply_consensus_quorum_locked(guard, available);
+                }
             }
         }
         count
+    }
+
+    fn defer_coordinator_fact(&self, fact: DeferredCoordinatorFact) {
+        self.deferred_coordinator_acquires
+            .lock()
+            .expect("deferred acquires lock")
+            .push(fact);
+        if let Some(wake) = self.coordinator_wake.read().expect("coordinator wake read").as_ref() {
+            wake.notify();
+        }
+    }
+
+    fn apply_peer_report_locked(
+        &self,
+        guard: &mut parking_lot::MutexGuard<'_, Option<ProductionAdapter>>,
+        peers: &[overlay::PeerId],
+        transport_only: bool,
+    ) -> bool {
+        let failures = {
+            let Some(coordinator) = guard.as_mut() else {
+                return false;
+            };
+            coordinator.refresh_peers(self.coordinator_peer_snapshot());
+            if transport_only {
+                coordinator.transport_connectivity(peers);
+            } else {
+                coordinator.connectivity(peers);
+            }
+            coordinator.owner_wake().notify();
+            let failures = coordinator.take_terminal_failures();
+            self.publish_coordinator_mirror(guard);
+            failures
+        };
+        self.record_coordinator_failures(failures);
+        true
+    }
+
+    fn apply_consensus_quorum_locked(
+        &self,
+        guard: &mut parking_lot::MutexGuard<'_, Option<ProductionAdapter>>,
+        available: bool,
+    ) -> bool {
+        let failures = {
+            let Some(coordinator) = guard.as_mut() else {
+                return false;
+            };
+            if available {
+                coordinator.consensus_quorum_available();
+            } else {
+                coordinator.consensus_quorum_lost();
+            }
+            coordinator.owner_wake().notify();
+            let failures = coordinator.take_terminal_failures();
+            self.publish_coordinator_mirror(guard);
+            failures
+        };
+        self.record_coordinator_failures(failures);
+        true
     }
 
     fn coordinator_acquire_locked(
@@ -4846,6 +4919,43 @@ mod tests {
                 .get(),
             5
         );
+        registry.stop();
+    }
+
+    #[test]
+    fn heartbeat_peer_report_never_waits_for_a_busy_owner_drain() {
+        use crate::network::network_ops::{NetworkOpsOperatingMode, SharedNetworkOpsState};
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(Arc::clone(&worker_pool));
+        registry.set_phase_state(Arc::new(SharedNetworkOpsState::new(
+            NetworkOpsOperatingMode::Disconnected,
+        )));
+        assert!(registry.install_coordinator());
+        assert!(registry.coordinator_startup(acquisition::SyncPhase::Connected));
+        assert!(registry.coordinator_report_peer_availability(&[1u32]));
+        let phase = |registry: &InboundLedgers| {
+            registry.coordinator_snapshot().expect("snapshot").phase().clone()
+        };
+        assert_eq!(phase(&registry), acquisition::SyncPhase::Connected);
+        let registry = Arc::new(registry);
+        let owner_guard = registry.coordinator.lock();
+        let caller = {
+            let registry = Arc::clone(&registry);
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                assert!(registry.coordinator_report_consensus_quorum(true));
+                assert!(registry.coordinator_report_peer_availability(&[]));
+                started.elapsed()
+            })
+        };
+        let waited = caller.join().expect("caller");
+        assert!(waited < std::time::Duration::from_millis(200), "heartbeat waited {waited:?}");
+        assert_eq!(registry.deferred_coordinator_acquires.lock().unwrap().len(), 2);
+        drop(owner_guard);
+        let _ = registry.coordinator_drain_with_status();
+        assert!(registry.deferred_coordinator_acquires.lock().unwrap().is_empty());
+        // The empty connectivity snapshot reached the coordinator.
+        assert_eq!(phase(&registry), acquisition::SyncPhase::Disconnected);
         registry.stop();
     }
 
