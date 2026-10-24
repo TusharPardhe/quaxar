@@ -104,10 +104,11 @@ fn basics_support_log_malloc_and_platform_flags_are_observable() {
     assert_eq!(sink.entries().len(), 1);
 
     let report = malloc_trim("support", &NullMallocTrimLogger);
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    assert!(report.supported);
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-    assert!(!report.supported);
+    // Mirrors malloc_trim's cfg: jemalloc (enabled by workspace feature
+    // unification, e.g. `cargo test --workspace`) or glibc can trim.
+    let expected = cfg!(all(feature = "jemalloc", not(target_env = "msvc")))
+        || cfg!(all(target_os = "linux", target_env = "gnu"));
+    assert_eq!(report.supported, expected);
 
     let _ = NO_SANITIZE_ADDRESS_SUPPORTED;
 }
