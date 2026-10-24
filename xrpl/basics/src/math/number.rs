@@ -58,10 +58,11 @@ impl MantissaScale {
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Small => "small",
-            Self::LargeLegacy => "largeLegacy",
-            Self::Large320 => "large320",
-            Self::Large330 => "large330",
+            // rippled Number.cpp to_string(MantissaScale).
+            Self::Small => "Small",
+            Self::LargeLegacy => "LargeLegacy",
+            Self::Large320 => "Large320",
+            Self::Large330 => "Large330",
         }
     }
 }
@@ -2353,22 +2354,22 @@ mod tests {
 
     #[test]
     fn scale_display_strings() {
-        assert_eq!(MantissaScale::Small.to_string(), "small");
-        assert_eq!(MantissaScale::Large320.to_string(), "large320");
-        assert_eq!(MantissaScale::Large330.to_string(), "large330");
-        assert_eq!(MantissaScale::LargeLegacy.to_string(), "largeLegacy");
-        assert_eq!(mantissa_scale_to_string(MantissaScale::Small), "small");
+        assert_eq!(MantissaScale::Small.to_string(), "Small");
+        assert_eq!(MantissaScale::Large320.to_string(), "Large320");
+        assert_eq!(MantissaScale::Large330.to_string(), "Large330");
+        assert_eq!(MantissaScale::LargeLegacy.to_string(), "LargeLegacy");
+        assert_eq!(mantissa_scale_to_string(MantissaScale::Small), "Small");
         assert_eq!(
             mantissa_scale_to_string(MantissaScale::Large320),
-            "large320"
+            "Large320"
         );
         assert_eq!(
             mantissa_scale_to_string(MantissaScale::Large330),
-            "large330"
+            "Large330"
         );
         assert_eq!(
             mantissa_scale_to_string(MantissaScale::LargeLegacy),
-            "largeLegacy"
+            "LargeLegacy"
         );
     }
 
