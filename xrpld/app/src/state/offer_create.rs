@@ -173,11 +173,17 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             );
         }
         let cancel_keylet = protocol::offer_keylet(Uint160::from_void(account.data()), cancel_seq);
+        // rippled OfferCreate::applyGuts cancels in a plain `Sandbox sb` and
+        // only then builds `PaymentSandbox psbFlow{&sb}` for crossing, so the
+        // crossing's xrpLiquid sees the post-cancel owner count. Cancelling in
+        // a child applied state-only keeps the cancel's owner-count change out
+        // of this view's deferred maximum (mainnet 107873839).
+        let mut cancel_view = ledger::FlowSandbox::new(view);
         // ApplyView::peek is the canonical overlay-aware lookup and already
         // resolves the parent view. A second `read` after Ok(None) bypasses the
         // transaction overlay and can revive an entry erased earlier in the
         // same sandbox; pinned psbCancel performs one `peek` only.
-        let old_offer = match view.peek(cancel_keylet) {
+        let old_offer = match ledger::ApplyView::peek(&mut cancel_view, cancel_keylet) {
             Ok(Some(offer)) => Some(offer),
             Ok(None) => None,
             Err(_) => return Ter::TEF_BAD_LEDGER,
@@ -192,12 +198,15 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                     old_offer.get_field_h256(sf("sfBookDirectory"))
                 );
             }
-            result = offer_delete(view, &account, old_offer);
+            result = offer_delete(&mut cancel_view, &account, old_offer);
             if trace_offer_sequence {
                 eprintln!("TRACE offer_sequence: offer_delete_result={:?}", result);
             }
         } else if trace_offer_sequence {
             eprintln!("TRACE offer_sequence: cancelled offer absent");
+        }
+        if cancel_view.apply_state_only().is_err() {
+            return Ter::TEF_BAD_LEDGER;
         }
     }
 

@@ -12345,3 +12345,66 @@ fn oe_sell_fill_or_kill_spends_a_sub_drop_remainder_on_the_next_offer() {
         "the sub-drop remainder is consumed, so FillOrKill is satisfied"
     );
 }
+
+/// Mainnet 107873839: an XRP-selling OfferCreate that cancels its own earlier
+/// offer (OfferSequence) and is limited by its XRP balance. rippled cancels in
+/// a plain Sandbox and crosses in a fresh PaymentSandbox, so xrpLiquid uses the
+/// post-cancel owner count. quaxar's transaction sandbox recorded the cancel's
+/// owner-count change as a deferred maximum and kept one extra reserve back.
+#[test]
+fn oe_cancel_then_cross_uses_post_cancel_owner_count_for_xrp_funds() {
+    let t = acct(0x41);
+    let m = acct(0x42);
+    let gw = acct(0x43);
+    let u = usd_currency();
+    let l = build_ledger_with_features(
+        vec![
+            account_root(t, 10_000_000, 1, 0),
+            account_root(m, 10_000_000_000, 1, 0),
+            account_root(gw, 10_000_000_000, 0, 0),
+            trust_line(t, gw, u, 0, 10_000, 0),
+            trust_line(m, gw, u, 5_000, 10_000, 0),
+        ],
+        vec!["fixReducedOffersV1", "fixReducedOffersV2", "Flow", "FlowCross", "fix1578"],
+    );
+    let mut base = new_view(l);
+    // Each transaction applies in its own transaction sandbox, as in
+    // production (ApplicationRoot's per-transaction FlowSandbox).
+    let mut apply = |tx: &STTx| {
+        let mut v = ledger::FlowSandbox::new(&mut base);
+        let ter = handle_real_dispatch(&mut v, tx, TxType::OFFER_CREATE, None);
+        v.apply_state_only().expect("apply transaction sandbox");
+        ter
+    };
+    let offer = |account, seq, pays: STAmount, gets: STAmount, cancel: Option<u32>, flags: u32| {
+        STTx::new(TxType::OFFER_CREATE, |tx| {
+            tx.set_account_id(sf("sfAccount"), account);
+            tx.set_field_u32(sf("sfFlags"), flags);
+            tx.set_field_amount(sf("sfTakerPays"), pays);
+            tx.set_field_amount(sf("sfTakerGets"), gets);
+            tx.set_field_amount(sf("sfFee"), xrp(10));
+            tx.set_field_u32(sf("sfSequence"), seq);
+            if let Some(cancel) = cancel {
+                tx.set_field_u32(sf("sfOfferSequence"), cancel);
+            }
+        })
+    };
+    // Maker sells 1000 USD at 1 XRP each.
+    let maker = offer(m, 1, xrp(1_000_000_000), iou(gw, u, 1000), None, 0);
+    assert_eq!(apply(&maker), Ter::TES_SUCCESS);
+    // Taker parks an offer that will be cancelled (owner count 1 -> 2).
+    // Passive, at a price that cannot cross, so it rests on the book.
+    let parked = offer(t, 1, iou(gw, u, 1_000), xrp(1_000_000), None, 0x0001_0000);
+    assert_eq!(apply(&parked), Ter::TES_SUCCESS);
+    // Cancel it and buy as much USD as the XRP balance allows.
+    let cross = offer(t, 2, iou(gw, u, 100), xrp(100_000_000), Some(1), 0);
+    assert_eq!(apply(&cross), Ter::TES_SUCCESS);
+
+    let root = base
+        .read(protocol::account_keylet(basics::base_uint::Uint160::from_void(t.data())))
+        .expect("read")
+        .expect("taker root");
+    assert_eq!(root.get_field_u32(sf("sfOwnerCount")), 1, "only the trust line remains");
+    // Reserve with one owner object: 200_000 + 50_000.
+    assert_eq!(root.get_field_amount(sf("sfBalance")), xrp(250_000));
+}
