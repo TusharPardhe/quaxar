@@ -168,18 +168,6 @@ fn ensure_object(value: &mut JsonValue) -> &mut BTreeMap<String, JsonValue> {
     object
 }
 
-fn json_value_as_string(value: &JsonValue) -> String {
-    match value {
-        JsonValue::String(text) => text.clone(),
-        JsonValue::Signed(value) => value.to_string(),
-        JsonValue::Unsigned(value) => value.to_string(),
-        JsonValue::Bool(value) => value.to_string(),
-        JsonValue::Null | JsonValue::Array(_) | JsonValue::Object(_) | JsonValue::Raw(_) => {
-            String::new()
-        }
-    }
-}
-
 fn parse_account(params: &JsonValue) -> Result<String, JsonValue> {
     let JsonValue::Object(object) = params else {
         return Err(missing_field_error("account"));

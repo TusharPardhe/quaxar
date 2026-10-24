@@ -330,6 +330,11 @@ pub fn do_account_offers<S: AccountOffersSource>(
     request: &AccountOffersRequest<'_>,
     source: &S,
 ) -> JsonValue {
+    if let Err(status) = crate::handlers::ledger_lookup::validate_ledger_selector(request.params) {
+        let mut error = JsonValue::Object(BTreeMap::new());
+        status.inject(&mut error);
+        return error;
+    }
     tracing::trace!(target: "rpc", method = "account_offers", "account_offers query");
     let account_text = match parse_account(request.params) {
         Ok(account) => account,

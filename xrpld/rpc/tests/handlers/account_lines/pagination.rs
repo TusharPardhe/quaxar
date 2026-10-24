@@ -526,3 +526,50 @@ fn account_lines_marker_may_land_on_a_credential() {
     }
     assert_eq!(iterations, 5);
 }
+
+/// rippled #8573: request validation (ledger selector, limit, marker format)
+/// precedes the ledger lookup and actNotFound.
+#[test]
+fn account_lines_request_errors_precede_account_not_found() {
+    let unfunded = sample_account(0x77);
+    let source = FakeSource {
+        ledger: Some(closed_ledger()),
+        ..Default::default()
+    };
+    let run = |params: JsonValue| {
+        let JsonValue::Object(result) = do_account_lines(
+            &AccountLinesRequest {
+                params: &params,
+                api_version: 1,
+                role: Role::Admin,
+            },
+            &source,
+        ) else {
+            panic!("result must be an object");
+        };
+        result.get("error_message").cloned()
+    };
+    let msg = |text: &str| Some(JsonValue::String(text.to_owned()));
+    assert_eq!(
+        run(object([("ledger_hash", JsonValue::Unsigned(1))])),
+        msg("Invalid field 'ledger_hash', not hex string.")
+    );
+    assert_eq!(
+        run(object([
+            ("account", JsonValue::String(to_base58(unfunded))),
+            ("limit", JsonValue::Signed(-1)),
+        ])),
+        msg("Invalid field 'limit', not unsigned integer.")
+    );
+    assert_eq!(
+        run(object([
+            ("account", JsonValue::String(to_base58(unfunded))),
+            ("marker", JsonValue::String("NOT_A_MARKER".to_owned())),
+        ])),
+        msg("Invalid parameters.")
+    );
+    assert_eq!(
+        run(object([("account", JsonValue::String(to_base58(unfunded)))])),
+        msg("Account not found.")
+    );
+}

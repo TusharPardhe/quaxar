@@ -330,10 +330,8 @@ fn parse_ident(params: &JsonValue) -> Result<String, RpcStatus> {
 }
 
 fn queue_requested(params: &JsonValue) -> bool {
-    matches!(
-        params,
-        JsonValue::Object(object) if matches!(object.get("queue"), Some(JsonValue::Bool(true)))
-    )
+    matches!(params, JsonValue::Object(object)
+        if object.get("queue").is_some_and(crate::commands::rpc_helpers::json_as_bool))
 }
 
 fn signer_lists_requested(params: &JsonValue, api_version: u32) -> Result<bool, RpcStatus> {
@@ -580,10 +578,42 @@ fn build_queue_data(queue_txs: Vec<AccountQueueTransaction>) -> JsonValue {
     JsonValue::Object(queue_data)
 }
 
+/// rippled `writeAccountRoot`: account_data, account_flags, pseudo_account.
+fn insert_account_root_fields<S: AccountInfoSource>(
+    source: &S,
+    ledger: &LedgerLookupLedger,
+    account_root: &AccountRoot,
+    object: &mut BTreeMap<String, JsonValue>,
+    signer_lists_v1: Option<JsonValue>,
+) {
+    object.insert(
+        "account_data".to_owned(),
+        inject_account_data(account_root, signer_lists_v1),
+    );
+    object.insert(
+        "account_flags".to_owned(),
+        build_account_flags(source, ledger, account_root),
+    );
+    if let Some(pseudo_type) = pseudo_account_type(account_root) {
+        object.insert(
+            "pseudo_account".to_owned(),
+            JsonValue::Object(BTreeMap::from([(
+                "type".to_owned(),
+                JsonValue::String(pseudo_type),
+            )])),
+        );
+    }
+}
+
 pub fn do_account_info<S: AccountInfoSource>(
     request: &AccountInfoRequest<'_>,
     source: &S,
 ) -> JsonValue {
+    if let Err(status) = crate::handlers::ledger_lookup::validate_ledger_selector(request.params) {
+        let mut error = JsonValue::Object(BTreeMap::new());
+        status.inject(&mut error);
+        return error;
+    }
     let ident = match parse_ident(request.params) {
         Ok(ident) => {
             tracing::trace!(target: "rpc", account = %ident, "account_info query");
@@ -617,20 +647,6 @@ pub fn do_account_info<S: AccountInfoSource>(
         return result;
     };
 
-    let queue = queue_requested(request.params);
-    if queue && !ledger.open {
-        inject_error(RpcErrorCode::InvalidParams, &mut result);
-        return result;
-    }
-
-    let signer_lists = match signer_lists_requested(request.params, request.api_version) {
-        Ok(signer_lists) => signer_lists,
-        Err(status) => {
-            status.inject(&mut result);
-            return result;
-        }
-    };
-
     let Some(account_root) = source.read_account_root(&ledger, account_id) else {
         ensure_object(&mut result).insert(
             "account".to_owned(),
@@ -639,8 +655,28 @@ pub fn do_account_info<S: AccountInfoSource>(
         inject_error(RpcErrorCode::ActNotFound, &mut result);
         return result;
     };
+
+    // rippled: the queue can't be requested from a closed ledger. Reported
+    // before the account root is attached, so no account_data.
+    let queue = queue_requested(request.params);
+    if queue && !ledger.open {
+        inject_error(RpcErrorCode::InvalidParams, &mut result);
+        return result;
+    }
+
     let account_root = AccountRoot::new(Arc::new(account_root))
         .expect("account root entry should match the AccountRoot wrapper");
+
+    // rippled sets the account root before validating `signer_lists`, so its
+    // invalidParams (API v2+) still carries account_data and account_flags.
+    let signer_lists = match signer_lists_requested(request.params, request.api_version) {
+        Ok(signer_lists) => signer_lists,
+        Err(status) => {
+            insert_account_root_fields(source, &ledger, &account_root, ensure_object(&mut result), None);
+            status.inject(&mut result);
+            return result;
+        }
+    };
 
     let signer_lists_value =
         signer_lists.then(|| match source.read_signer_list(&ledger, account_id) {
@@ -660,23 +696,7 @@ pub fn do_account_info<S: AccountInfoSource>(
     };
 
     let object = ensure_object(&mut result);
-    object.insert(
-        "account_data".to_owned(),
-        inject_account_data(&account_root, signer_lists_v1),
-    );
-    object.insert(
-        "account_flags".to_owned(),
-        build_account_flags(source, &ledger, &account_root),
-    );
-    if let Some(pseudo_type) = pseudo_account_type(&account_root) {
-        object.insert(
-            "pseudo_account".to_owned(),
-            JsonValue::Object(BTreeMap::from([(
-                "type".to_owned(),
-                JsonValue::String(pseudo_type),
-            )])),
-        );
-    }
+    insert_account_root_fields(source, &ledger, &account_root, object, signer_lists_v1);
 
     if let Some(signer_lists_value) = signer_lists_top {
         object.insert("signer_lists".to_owned(), signer_lists_value);

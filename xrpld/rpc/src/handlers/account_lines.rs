@@ -225,18 +225,6 @@ fn make_error(code: RpcErrorCode) -> JsonValue {
     json
 }
 
-fn json_value_as_string(value: &JsonValue) -> String {
-    match value {
-        JsonValue::String(text) => text.clone(),
-        JsonValue::Signed(value) => value.to_string(),
-        JsonValue::Unsigned(value) => value.to_string(),
-        JsonValue::Bool(value) => value.to_string(),
-        JsonValue::Null | JsonValue::Array(_) | JsonValue::Object(_) | JsonValue::Raw(_) => {
-            String::new()
-        }
-    }
-}
-
 fn parse_account(params: &JsonValue) -> Result<String, JsonValue> {
     let JsonValue::Object(object) = params else {
         return Err(crate::commands::rpc_helpers::missing_field_error("account"));
@@ -475,11 +463,32 @@ pub fn do_account_lines<S: AccountLinesSource>(
     request: &AccountLinesRequest<'_>,
     source: &S,
 ) -> JsonValue {
+    if let Err(status) = crate::handlers::ledger_lookup::validate_ledger_selector(request.params) {
+        let mut error = JsonValue::Object(BTreeMap::new());
+        status.inject(&mut error);
+        return error;
+    }
     tracing::trace!(target: "rpc", method = "account_lines", "account_lines query");
     let account_text = match parse_account(request.params) {
         Ok(account) => account,
         Err(error) => return error,
     };
+
+    // rippled rpc-spec: limit and marker format are request validation, so
+    // they precede the ledger lookup and actNotFound (#8573).
+    let limit = match read_limit_field(request.params, request.role, Tuning::ACCOUNT_LINES) {
+        Ok(limit) => limit,
+        Err(status) => {
+            let mut error = JsonValue::Object(BTreeMap::new());
+            status.inject(&mut error);
+            return error;
+        }
+    };
+    let parsed_marker =
+        match crate::handlers::owner_dir_marker::parse_account_marker_param(request.params) {
+            Ok(marker) => marker,
+            Err(error) => return error,
+        };
 
     let context = LedgerLookupContext {
         params: request.params,
@@ -518,64 +527,22 @@ pub fn do_account_lines<S: AccountLinesSource>(
         Err(error) => return error,
     };
 
-    let ignore_default = matches!(
-        request.params,
-        JsonValue::Object(object) if matches!(object.get("ignore_default"), Some(JsonValue::Bool(true)))
-    );
-
-    let limit = match read_limit_field(request.params, request.role, Tuning::ACCOUNT_LINES) {
-        Ok(limit) => limit,
-        Err(status) => {
-            let mut error = JsonValue::Object(BTreeMap::new());
-            status.inject(&mut error);
-            return error;
-        }
-    };
+    let ignore_default = matches!(request.params, JsonValue::Object(object)
+        if object.get("ignore_default").is_some_and(crate::commands::rpc_helpers::json_as_bool));
 
     let JsonValue::Object(result_object) = &mut result else {
         unreachable!("result should be an object");
     };
     result_object.insert("lines".to_owned(), JsonValue::Array(Vec::new()));
 
-    let mut start_after = Uint256::zero();
-    let mut start_hint = 0u64;
-    let marker_set =
-        matches!(request.params, JsonValue::Object(object) if object.contains_key("marker"));
-    if marker_set {
-        let JsonValue::Object(object) = request.params else {
-            unreachable!("marker parsing requires an object");
-        };
-
-        let Some(marker_value) = object.get("marker") else {
-            return rpc_error(RpcErrorCode::InvalidParams);
-        };
-
-        let JsonValue::String(marker_text) = marker_value else {
-            return expected_field_error("marker", "string");
-        };
-
-        let mut parts = marker_text.splitn(3, ',');
-        let Some(first) = parts.next() else {
-            return rpc_error(RpcErrorCode::InvalidParams);
-        };
-        if !start_after.parse_hex(first) {
-            return rpc_error(RpcErrorCode::InvalidParams);
-        }
-
-        let Some(second) = parts.next() else {
-            return rpc_error(RpcErrorCode::InvalidParams);
-        };
-        match second.parse::<u64>() {
-            Ok(hint) => start_hint = hint,
-            Err(_) => return rpc_error(RpcErrorCode::InvalidParams),
-        }
-
+    let (start_after, start_hint) = parsed_marker.unwrap_or((Uint256::zero(), 0));
+    if parsed_marker.is_some() {
         let Some(marker_sle) = source.read_child_entry(&ledger, start_after) else {
             return rpc_error(RpcErrorCode::InvalidParams);
         };
         if !is_related_to_account(&marker_sle, |page| {
-        source.read_owner_dir_page(&ledger, account_id, page)
-    }) {
+            source.read_owner_dir_page(&ledger, account_id, page)
+        }) {
             return rpc_error(RpcErrorCode::InvalidParams);
         }
     }

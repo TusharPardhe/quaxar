@@ -316,62 +316,32 @@ where
     }
 }
 
-fn parse_marker(
-    source: &impl AccountChannelsSource,
-    ledger: &LedgerLookupLedger,
-    account_id: AccountID,
-    params: &JsonValue,
-) -> Result<(Uint256, u64), JsonValue> {
-    let JsonValue::Object(object) = params else {
-        return Ok((Uint256::zero(), 0));
-    };
-
-    let Some(marker) = object.get("marker") else {
-        return Ok((Uint256::zero(), 0));
-    };
-
-    let JsonValue::String(marker) = marker else {
-        return Err(expected_field_error("marker", "string"));
-    };
-
-    let mut parts = marker.splitn(3, ',');
-    let Some(first) = parts.next() else {
-        return Err(rpc_error(RpcErrorCode::InvalidParams));
-    };
-    let Some(second) = parts.next() else {
-        return Err(rpc_error(RpcErrorCode::InvalidParams));
-    };
-
-    let Ok(after) = Uint256::from_hex(first) else {
-        return Err(rpc_error(RpcErrorCode::InvalidParams));
-    };
-
-    let Ok(hint) = second.parse::<u64>() else {
-        return Err(rpc_error(RpcErrorCode::InvalidParams));
-    };
-
-    let Some(marker_sle) = source.read_ledger_entry(ledger, after) else {
-        return Err(rpc_error(RpcErrorCode::InvalidParams));
-    };
-
-    if !is_related_to_account(&marker_sle, |page| {
-        source.read_owner_dir_page(ledger, account_id, page)
-    }) {
-        return Err(rpc_error(RpcErrorCode::InvalidParams));
-    }
-
-    Ok((after, hint))
-}
-
 pub fn do_account_channels<S: AccountChannelsSource>(
     request: &AccountChannelsRequest<'_>,
     source: &S,
 ) -> JsonValue {
+    if let Err(status) = crate::handlers::ledger_lookup::validate_ledger_selector(request.params) {
+        let mut error = JsonValue::Object(BTreeMap::new());
+        status.inject(&mut error);
+        return error;
+    }
     tracing::trace!(target: "rpc", method = "account_channels", "account_channels query");
     let account_text = match account_string(request.params) {
         Ok(account) => account,
         Err(error) => return error,
     };
+
+    // rippled rpc-spec: limit and marker format are request validation, so
+    // they precede the ledger lookup and actNotFound (#8573).
+    let limit = match read_limit_field(request.params, request.role, Tuning::ACCOUNT_CHANNELS) {
+        Ok(limit) => limit,
+        Err(status) => return json_to_error(status),
+    };
+    let parsed_marker =
+        match crate::handlers::owner_dir_marker::parse_account_marker_param(request.params) {
+            Ok(marker) => marker,
+            Err(error) => return error,
+        };
 
     let context = LedgerLookupContext {
         params: request.params,
@@ -403,16 +373,17 @@ pub fn do_account_channels<S: AccountChannelsSource>(
         },
     };
 
-    let limit = match read_limit_field(request.params, request.role, Tuning::ACCOUNT_CHANNELS) {
-        Ok(limit) => limit,
-        Err(status) => return json_to_error(status),
-    };
-
-    let (start_after, start_hint) = match parse_marker(source, &ledger, account_id, request.params)
-    {
-        Ok(marker) => marker,
-        Err(error) => return error,
-    };
+    let (start_after, start_hint) = parsed_marker.unwrap_or((Uint256::zero(), 0));
+    if parsed_marker.is_some() {
+        let Some(marker_sle) = source.read_ledger_entry(&ledger, start_after) else {
+            return rpc_error(RpcErrorCode::InvalidParams);
+        };
+        if !is_related_to_account(&marker_sle, |page| {
+            source.read_owner_dir_page(&ledger, account_id, page)
+        }) {
+            return rpc_error(RpcErrorCode::InvalidParams);
+        }
+    }
 
     let mut count = 0u32;
     let mut marker: Option<Uint256> = None;

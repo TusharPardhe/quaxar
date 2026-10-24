@@ -176,6 +176,11 @@ pub fn do_account_currencies<S: AccountCurrenciesSource>(
     request: &AccountCurrenciesRequest<'_>,
     source: &S,
 ) -> JsonValue {
+    if let Err(status) = crate::handlers::ledger_lookup::validate_ledger_selector(request.params) {
+        let mut error = JsonValue::Object(BTreeMap::new());
+        status.inject(&mut error);
+        return error;
+    }
     tracing::trace!(target: "rpc", method = "account_currencies", "account_currencies query");
     let account_text = match parse_account_text(request.params) {
         Ok(text) => text,

@@ -166,6 +166,83 @@ fn account_info_rejects_non_bool_signer_lists_in_v2() {
         result.get("error"),
         Some(&JsonValue::String("invalidParams".to_owned()))
     );
+    // rippled sets the account root before this check (#8573).
+    assert!(result.contains_key("account_data"));
+    assert!(result.contains_key("account_flags"));
+    assert!(!result.contains_key("signer_lists"));
+}
+
+/// rippled #8573: `queue` is read as a bool (a non-empty string is true), and
+/// the queue can't be requested from a closed ledger.
+#[test]
+fn account_info_queue_string_on_closed_ledger_is_invalid_params() {
+    let account = sample_account(0x56);
+    let mut source = FakeSource {
+        ledger: Some(closed_ledger()),
+        ..Default::default()
+    };
+    source
+        .account_roots
+        .insert(account, make_account_root(account, 0, None));
+    let JsonValue::Object(result) = do_account_info(
+        &AccountInfoRequest {
+            params: &object([
+                ("account", JsonValue::String(to_base58(account))),
+                ("queue", JsonValue::String("false".to_owned())),
+            ]),
+            api_version: 2,
+            role: Role::Admin,
+        },
+        &source,
+    ) else {
+        panic!("result must be an object");
+    };
+    assert_eq!(result.get("error"), Some(&JsonValue::String("invalidParams".to_owned())));
+    assert_eq!(
+        result.get("error_message"),
+        Some(&JsonValue::String("Invalid parameters.".to_owned()))
+    );
+    assert!(result.contains_key("ledger_index"));
+    assert!(!result.contains_key("account_data"));
+}
+
+/// rippled #8561/#8573: an invalid ledger selector is reported before a
+/// missing or malformed account.
+#[test]
+fn account_info_reports_invalid_ledger_before_account() {
+    let source = FakeSource {
+        ledger: Some(closed_ledger()),
+        ..Default::default()
+    };
+    for params in [
+        object([("ledger_hash", JsonValue::Unsigned(1))]),
+        object([
+            ("account", JsonValue::Unsigned(1)),
+            ("ledger_hash", JsonValue::Unsigned(1)),
+        ]),
+        object([
+            ("account", JsonValue::String("llIIOO".to_owned())),
+            ("ledger_hash", JsonValue::Unsigned(1)),
+        ]),
+    ] {
+        let JsonValue::Object(result) = do_account_info(
+            &AccountInfoRequest {
+                params: &params,
+                api_version: 2,
+                role: Role::Admin,
+            },
+            &source,
+        ) else {
+            panic!("result must be an object");
+        };
+        assert_eq!(
+            result.get("error_message"),
+            Some(&JsonValue::String(
+                "Invalid field 'ledger_hash', not hex string.".to_owned()
+            )),
+            "{params:?}"
+        );
+    }
 }
 
 #[test]
