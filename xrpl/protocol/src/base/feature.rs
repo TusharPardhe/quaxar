@@ -12,7 +12,6 @@ pub const FEATURE_XRP_FEES_NAME: &str = "XRPFees";
 pub const FEATURE_BATCH_NAME: &str = "Batch";
 pub const FEATURE_BATCH_V1_1_NAME: &str = "BatchV1_1";
 pub const FEATURE_AMM_NAME: &str = "AMM";
-pub const FEATURE_XCHAIN_BRIDGE_NAME: &str = "XChainBridge";
 pub const FEATURE_CLAWBACK_NAME: &str = "Clawback";
 pub const FEATURE_TOKEN_ESCROW_NAME: &str = "TokenEscrow";
 pub const FEATURE_CONFIDENTIAL_TRANSFER_NAME: &str = "ConfidentialTransfer";
@@ -395,10 +394,6 @@ pub fn feature_amm() -> Uint256 {
     feature_id(FEATURE_AMM_NAME)
 }
 
-pub fn feature_xchain_bridge() -> Uint256 {
-    feature_id(FEATURE_XCHAIN_BRIDGE_NAME)
-}
-
 pub fn feature_clawback() -> Uint256 {
     feature_id(FEATURE_CLAWBACK_NAME)
 }
@@ -578,13 +573,13 @@ mod tests {
         FEATURE_AMM_NAME, FEATURE_BATCH_V1_1_NAME, FEATURE_CLAWBACK_NAME,
         FEATURE_CONFIDENTIAL_TRANSFER_NAME, FEATURE_LENDING_PROTOCOL_NAME,
         FEATURE_SINGLE_ASSET_VAULT_NAME, FEATURE_SPONSOR_NAME, FEATURE_TOKEN_ESCROW_NAME,
-        FEATURE_UNIVERSAL_NUMBER_NAME, FEATURE_XCHAIN_BRIDGE_NAME, FEATURE_XRP_FEES_NAME,
+        FEATURE_UNIVERSAL_NUMBER_NAME, FEATURE_XRP_FEES_NAME,
         FIX_AMMV1_1_NAME, FIX_AMMV1_3_NAME, FIX_CLEANUP_3_4_0_NAME,
         FIX_INNER_OBJ_TEMPLATE_NAME, FIX_INNER_OBJ_TEMPLATE2_NAME, FIX_MPT_DELIVERED_AMOUNT_NAME,
         FIX_PREVIOUS_TXN_ID_NAME, FeatureSet, REGISTERED_FEATURES, RegisteredFeature,
         RegisteredFeatureVote, feature_amm, feature_batch, feature_clawback, feature_id,
         feature_lending_protocol, feature_name, feature_single_asset_vault, feature_token_escrow,
-        feature_universal_number, feature_xchain_bridge, feature_xrp_fees, fix_ammv1_1,
+        feature_universal_number, feature_xrp_fees, fix_ammv1_1,
         fix_ammv1_3, fix_inner_obj_template, fix_inner_obj_template2,
         fix_mpt_delivered_amount, fix_previous_txn_id,
         registered_feature_supported_with_confidential_crypto,
@@ -694,9 +689,6 @@ mod tests {
         let amm =
             Uint256::from_hex("8CC0774A3BF66D1D22E76BBDA8E8A232E6B6313834301B3B23E8601196AE6455")
                 .expect("expected amm hex should parse");
-        let xchain_bridge =
-            Uint256::from_hex("C98D98EE9616ACD36E81FDEB8D41D349BF5F1B41DD64A0ABC1FE9AA5EA267E9C")
-                .expect("expected xchain bridge hex should parse");
         let clawback =
             Uint256::from_hex("56B241D7A43D40354D02A9DC4C8DF5C7A1F930D92A9035C4E12291B3CA3E1C2B")
                 .expect("expected clawback hex should parse");
@@ -717,11 +709,6 @@ mod tests {
         assert_eq!(feature_name(&batch), Some(FEATURE_BATCH_V1_1_NAME));
         assert_eq!(feature_amm(), amm);
         assert_eq!(feature_name(&amm), Some(FEATURE_AMM_NAME));
-        assert_eq!(feature_xchain_bridge(), xchain_bridge);
-        assert_eq!(
-            feature_name(&xchain_bridge),
-            Some(FEATURE_XCHAIN_BRIDGE_NAME)
-        );
         assert_eq!(feature_clawback(), clawback);
         assert_eq!(feature_name(&clawback), Some(FEATURE_CLAWBACK_NAME));
         assert_eq!(feature_token_escrow(), token_escrow);

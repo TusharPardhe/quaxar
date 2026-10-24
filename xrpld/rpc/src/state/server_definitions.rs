@@ -202,7 +202,6 @@ fn translate_serialized_type_name(input: &str) -> String {
         "NOTPRESENT" => "NotPresent".to_owned(),
         "PATHSET" => "PathSet".to_owned(),
         "VL" => "Blob".to_owned(),
-        "XCHAIN_BRIDGE" => "XChainBridge".to_owned(),
         _ => input
             .split('_')
             .map(|token| {

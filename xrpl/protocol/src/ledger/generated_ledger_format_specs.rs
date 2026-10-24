@@ -504,54 +504,6 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
         ],
     },
     LedgerFormatSpecInit {
-        tag_name: "ltBRIDGE",
-        value: 0x0069,
-        name: "Bridge",
-        rpc_name: "bridge",
-        field_specs: &[
-            LedgerFormatFieldSpec {
-                field_symbol: "sfAccount",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfSignatureReward",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfMinAccountCreateAmount",
-                style: SOEStyle::Optional,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfXChainBridge",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfXChainClaimID",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfXChainAccountCreateCount",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfXChainAccountClaimCount",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfOwnerNode",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfPreviousTxnID",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfPreviousTxnLgrSeq",
-                style: SOEStyle::Required,
-            },
-        ],
-    },
-    LedgerFormatSpecInit {
         tag_name: "ltOFFER",
         value: 0x006f,
         name: "Offer",
@@ -636,50 +588,6 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
             LedgerFormatFieldSpec {
                 field_symbol: "sfAuthorizeCredentials",
                 style: SOEStyle::Optional,
-            },
-        ],
-    },
-    LedgerFormatSpecInit {
-        tag_name: "ltXCHAIN_OWNED_CLAIM_ID",
-        value: 0x0071,
-        name: "XChainOwnedClaimID",
-        rpc_name: "xchain_owned_claim_id",
-        field_specs: &[
-            LedgerFormatFieldSpec {
-                field_symbol: "sfAccount",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfXChainBridge",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfXChainClaimID",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfOtherChainSource",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfXChainClaimAttestations",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfSignatureReward",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfOwnerNode",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfPreviousTxnID",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfPreviousTxnLgrSeq",
-                style: SOEStyle::Required,
             },
         ],
     },
@@ -796,42 +704,6 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
             LedgerFormatFieldSpec {
                 field_symbol: "sfPreviousTxnLgrSeq",
                 style: SOEStyle::Optional,
-            },
-        ],
-    },
-    LedgerFormatSpecInit {
-        tag_name: "ltXCHAIN_OWNED_CREATE_ACCOUNT_CLAIM_ID",
-        value: 0x0074,
-        name: "XChainOwnedCreateAccountClaimID",
-        rpc_name: "xchain_owned_create_account_claim_id",
-        field_specs: &[
-            LedgerFormatFieldSpec {
-                field_symbol: "sfAccount",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfXChainBridge",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfXChainAccountCreateCount",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfXChainCreateAccountAttestations",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfOwnerNode",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfPreviousTxnID",
-                style: SOEStyle::Required,
-            },
-            LedgerFormatFieldSpec {
-                field_symbol: "sfPreviousTxnLgrSeq",
-                style: SOEStyle::Required,
             },
         ],
     },

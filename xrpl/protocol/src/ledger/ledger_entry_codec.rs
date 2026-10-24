@@ -30,7 +30,6 @@ const STI_UINT192: u8 = 21;
 const STI_UINT384: u8 = 22;
 const STI_UINT512: u8 = 23;
 const STI_ISSUE: u8 = 24;
-const STI_XCHAIN_BRIDGE: u8 = 25;
 const STI_CURRENCY: u8 = 26;
 
 const SF_LEDGER_ENTRY_TYPE: u8 = 1;
@@ -1296,7 +1295,7 @@ fn skip_field_value(field_type: u8, cursor: &mut Cursor<'_>) -> Result<(), Ledge
         STI_UINT192 => cursor.skip(24),
         STI_UINT256 => cursor.skip(32),
         STI_ISSUE => cursor.skip(40),
-        STI_UINT384 | STI_XCHAIN_BRIDGE => cursor.skip(48),
+        STI_UINT384 => cursor.skip(48),
         STI_UINT512 => cursor.skip(64),
         STI_AMOUNT => {
             let _ = read_amount_field(cursor)?;

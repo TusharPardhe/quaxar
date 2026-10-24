@@ -1,7 +1,6 @@
 pub mod account_root;
 pub mod amendments;
 pub mod amm;
-pub mod bridge;
 pub mod check;
 pub mod credential;
 pub mod delegate;
@@ -27,13 +26,10 @@ pub mod signer_list;
 pub mod sponsorship;
 pub mod ticket;
 pub mod vault;
-pub mod x_chain_owned_claim_id;
-pub mod x_chain_owned_create_account_claim_id;
 
 pub use account_root::{AccountRoot, AccountRootBuilder};
 pub use amendments::{Amendments, AmendmentsBuilder};
 pub use amm::{AMM, AMMBuilder};
-pub use bridge::{Bridge, BridgeBuilder};
 pub use check::{Check, CheckBuilder};
 pub use credential::{Credential, CredentialBuilder};
 pub use delegate::{Delegate, DelegateBuilder};
@@ -62,7 +58,3 @@ pub use sponsorship::{
 };
 pub use ticket::{Ticket, TicketBuilder};
 pub use vault::{Vault, VaultBuilder};
-pub use x_chain_owned_claim_id::{XChainOwnedClaimID, XChainOwnedClaimIDBuilder};
-pub use x_chain_owned_create_account_claim_id::{
-    XChainOwnedCreateAccountClaimID, XChainOwnedCreateAccountClaimIDBuilder,
-};

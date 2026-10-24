@@ -7,7 +7,7 @@ use basics::{
 
 use crate::{
     AccountID, SField, STAmount, STArray, STCurrency, STIssue, STNumber, STObject, STPathSet,
-    STVector256, STXChainBridge,
+    STVector256,
 };
 
 pub trait StExchangeValue: Sized {
@@ -83,11 +83,6 @@ impl_clone_exchange_value!(STObject, get_field_object, set_field_object);
 impl_clone_exchange_value!(STArray, get_field_array, set_field_array);
 impl_clone_exchange_value!(STCurrency, get_field_currency, set_field_currency);
 impl_clone_exchange_value!(STIssue, get_field_issue, set_field_issue);
-impl_clone_exchange_value!(
-    STXChainBridge,
-    get_field_xchain_bridge,
-    set_field_xchain_bridge
-);
 
 pub fn get<T: StExchangeValue>(st: &STObject, field: &'static SField) -> Option<T> {
     T::get(st, field)

@@ -46,14 +46,7 @@ impl TxType {
     pub const AMM_VOTE: Self = Self(38);
     pub const AMM_BID: Self = Self(39);
     pub const AMM_DELETE: Self = Self(40);
-    pub const XCHAIN_CREATE_CLAIM_ID: Self = Self(41);
-    pub const XCHAIN_COMMIT: Self = Self(42);
-    pub const XCHAIN_CLAIM: Self = Self(43);
-    pub const XCHAIN_ACCOUNT_CREATE_COMMIT: Self = Self(44);
-    pub const XCHAIN_ADD_CLAIM_ATTESTATION: Self = Self(45);
-    pub const XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION: Self = Self(46);
-    pub const XCHAIN_MODIFY_BRIDGE: Self = Self(47);
-    pub const XCHAIN_CREATE_BRIDGE: Self = Self(48);
+    // 41..=48 are reserved (XChainBridge transactions, removed with rippled #8255).
     pub const DID_SET: Self = Self(49);
     pub const DID_DELETE: Self = Self(50);
     pub const ORACLE_SET: Self = Self(51);
@@ -214,26 +207,6 @@ const DISPATCHABLE_TX_TYPES: &[(u16, &str, &str)] = &[
     (38, "ttAMM_VOTE", "AMMVote"),
     (39, "ttAMM_BID", "AMMBid"),
     (40, "ttAMM_DELETE", "AMMDelete"),
-    (41, "ttXCHAIN_CREATE_CLAIM_ID", "XChainCreateClaimID"),
-    (42, "ttXCHAIN_COMMIT", "XChainCommit"),
-    (43, "ttXCHAIN_CLAIM", "XChainClaim"),
-    (
-        44,
-        "ttXCHAIN_ACCOUNT_CREATE_COMMIT",
-        "XChainAccountCreateCommit",
-    ),
-    (
-        45,
-        "ttXCHAIN_ADD_CLAIM_ATTESTATION",
-        "XChainAddClaimAttestation",
-    ),
-    (
-        46,
-        "ttXCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION",
-        "XChainAddAccountCreateAttestation",
-    ),
-    (47, "ttXCHAIN_MODIFY_BRIDGE", "XChainModifyBridge"),
-    (48, "ttXCHAIN_CREATE_BRIDGE", "XChainCreateBridge"),
     (49, "ttDID_SET", "DIDSet"),
     (50, "ttDID_DELETE", "DIDDelete"),
     (51, "ttORACLE_SET", "OracleSet"),
@@ -353,26 +326,6 @@ const TX_TYPE_TAGS: &[(u16, &str, Option<&str>)] = &[
     (38, "ttAMM_VOTE", Some("AMMVote")),
     (39, "ttAMM_BID", Some("AMMBid")),
     (40, "ttAMM_DELETE", Some("AMMDelete")),
-    (41, "ttXCHAIN_CREATE_CLAIM_ID", Some("XChainCreateClaimID")),
-    (42, "ttXCHAIN_COMMIT", Some("XChainCommit")),
-    (43, "ttXCHAIN_CLAIM", Some("XChainClaim")),
-    (
-        44,
-        "ttXCHAIN_ACCOUNT_CREATE_COMMIT",
-        Some("XChainAccountCreateCommit"),
-    ),
-    (
-        45,
-        "ttXCHAIN_ADD_CLAIM_ATTESTATION",
-        Some("XChainAddClaimAttestation"),
-    ),
-    (
-        46,
-        "ttXCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION",
-        Some("XChainAddAccountCreateAttestation"),
-    ),
-    (47, "ttXCHAIN_MODIFY_BRIDGE", Some("XChainModifyBridge")),
-    (48, "ttXCHAIN_CREATE_BRIDGE", Some("XChainCreateBridge")),
     (49, "ttDID_SET", Some("DIDSet")),
     (50, "ttDID_DELETE", Some("DIDDelete")),
     (51, "ttORACLE_SET", Some("OracleSet")),
@@ -488,10 +441,7 @@ mod tests {
     fn tx_type_names_match_current_cpp_tags_and_format_names() {
         assert_eq!(TxType::PAYMENT.tag_name(), Some("ttPAYMENT"));
         assert_eq!(TxType::PAYMENT.format_name(), Some("Payment"));
-        assert_eq!(
-            TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION.format_name(),
-            Some("XChainAddAccountCreateAttestation")
-        );
+        assert_eq!(TxType::from_u16(46).format_name(), None, "reserved by rippled #8255");
         assert_eq!(TxType::HOOK_SET.tag_name(), Some("ttHOOK_SET"));
         assert_eq!(TxType::HOOK_SET.format_name(), None);
     }
@@ -500,10 +450,7 @@ mod tests {
     fn tx_type_lookup_helpers_round_trip_current_cpp_names() {
         assert_eq!(TxType::from_tag_name("ttPAYMENT"), Some(TxType::PAYMENT));
         assert_eq!(TxType::from_format_name("Payment"), Some(TxType::PAYMENT));
-        assert_eq!(
-            TxType::from_format_name("XChainAddAccountCreateAttestation"),
-            Some(TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION)
-        );
+        assert_eq!(TxType::from_format_name("XChainAddAccountCreateAttestation"), None);
         assert_eq!(TxType::from_tag_name("ttHOOK_SET"), Some(TxType::HOOK_SET));
         assert_eq!(TxType::from_format_name("HookSet"), None);
         assert_eq!(TxType::from_tag_name("ttUNKNOWN"), None);

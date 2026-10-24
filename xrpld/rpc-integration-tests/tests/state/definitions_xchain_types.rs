@@ -57,3 +57,36 @@ fn xchain_type_5() {
     assert!(t.contains_key("MPTokenIssuance"));
     assert!(t.contains_key("MPToken"));
 }
+
+/// rippled #8255: server_definitions no longer lists the XChainBridge
+/// serialized type, its fields, ledger entry types or transaction types.
+#[test]
+fn xchain_bridge_is_absent_from_definitions() {
+    let JsonValue::Object(r) = rpc::do_server_definitions(&obj()) else {
+        panic!("definitions must be an object")
+    };
+    let section = |name: &str| match r.get(name) {
+        Some(JsonValue::Object(map)) => map.clone(),
+        other => panic!("{name}: {other:?}"),
+    };
+    assert!(!section("TYPES").contains_key("XChainBridge"));
+    assert!(!section("TRANSACTION_TYPES").contains_key("XChainCommit"));
+    assert!(!section("LEDGER_ENTRY_TYPES").contains_key("Bridge"));
+    let JsonValue::Array(fields) = r.get("FIELDS").expect("FIELDS") else {
+        panic!("FIELDS must be an array")
+    };
+    let names: Vec<String> = fields
+        .iter()
+        .filter_map(|entry| match entry {
+            JsonValue::Array(pair) => match pair.first() {
+                Some(JsonValue::String(name)) => Some(name.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert!(!names.is_empty());
+    for removed in ["XChainBridge", "SignatureReward", "XChainClaimID", "LockingChainDoor"] {
+        assert!(!names.iter().any(|name| name == removed), "{removed}");
+    }
+}

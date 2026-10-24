@@ -123,4 +123,3 @@ pub mod vault_withdraw_do_apply_vault_update;
 pub mod vault_withdraw_preclaim;
 pub mod vault_withdraw_preclaim_front;
 pub mod vault_withdraw_preclaim_tail;
-pub mod x_chain_bridge;

@@ -84,62 +84,6 @@ impl InnerObjectFormats {
         );
         add(
             &mut inner,
-            "sfXChainClaimAttestationCollectionElement",
-            &[
-                ("sfAttestationSignerAccount", SOEStyle::Required),
-                ("sfPublicKey", SOEStyle::Required),
-                ("sfSignature", SOEStyle::Required),
-                ("sfAmount", SOEStyle::Required),
-                ("sfAccount", SOEStyle::Required),
-                ("sfAttestationRewardAccount", SOEStyle::Required),
-                ("sfWasLockingChainSend", SOEStyle::Required),
-                ("sfXChainClaimID", SOEStyle::Required),
-                ("sfDestination", SOEStyle::Optional),
-            ],
-        );
-        add(
-            &mut inner,
-            "sfXChainCreateAccountAttestationCollectionElement",
-            &[
-                ("sfAttestationSignerAccount", SOEStyle::Required),
-                ("sfPublicKey", SOEStyle::Required),
-                ("sfSignature", SOEStyle::Required),
-                ("sfAmount", SOEStyle::Required),
-                ("sfAccount", SOEStyle::Required),
-                ("sfAttestationRewardAccount", SOEStyle::Required),
-                ("sfWasLockingChainSend", SOEStyle::Required),
-                ("sfXChainAccountCreateCount", SOEStyle::Required),
-                ("sfDestination", SOEStyle::Required),
-                ("sfSignatureReward", SOEStyle::Required),
-            ],
-        );
-        add(
-            &mut inner,
-            "sfXChainClaimProofSig",
-            &[
-                ("sfAttestationSignerAccount", SOEStyle::Required),
-                ("sfPublicKey", SOEStyle::Required),
-                ("sfAmount", SOEStyle::Required),
-                ("sfAttestationRewardAccount", SOEStyle::Required),
-                ("sfWasLockingChainSend", SOEStyle::Required),
-                ("sfDestination", SOEStyle::Optional),
-            ],
-        );
-        add(
-            &mut inner,
-            "sfXChainCreateAccountProofSig",
-            &[
-                ("sfAttestationSignerAccount", SOEStyle::Required),
-                ("sfPublicKey", SOEStyle::Required),
-                ("sfAmount", SOEStyle::Required),
-                ("sfSignatureReward", SOEStyle::Required),
-                ("sfAttestationRewardAccount", SOEStyle::Required),
-                ("sfWasLockingChainSend", SOEStyle::Required),
-                ("sfDestination", SOEStyle::Required),
-            ],
-        );
-        add(
-            &mut inner,
             "sfAuthAccount",
             &[("sfAccount", SOEStyle::Required)],
         );

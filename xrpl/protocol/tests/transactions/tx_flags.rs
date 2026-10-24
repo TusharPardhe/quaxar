@@ -12,8 +12,7 @@ use protocol::{
     getLoanManageFlags, getLoanPayFlags, getLoanSetFlags, getMPTokenAuthorizeFlags,
     getMPTokenIssuanceCreateFlags, getMPTokenIssuanceSetFlags, getNFTokenCreateOfferFlags,
     getNFTokenMintFlags, getOfferCreateFlags, getPaymentChannelClaimFlags, getPaymentFlags,
-    getTrustSetFlags, getUniversalFlags, getVaultCreateFlags, getXChainModifyBridgeFlags,
-    tfAMMDepositMask, tfAccountSetMask, tfBatchMask, tfInnerBatchTxn, tfLoanPayMask,
+    getTrustSetFlags, getUniversalFlags, getVaultCreateFlags, tfAMMDepositMask, tfAccountSetMask, tfBatchMask, tfInnerBatchTxn, tfLoanPayMask,
     tfMPTPaymentMask, tfPaymentMask, tfTrustLine, tfTrustSetPermissionMask, tfUniversal,
     tfUniversalMask, transaction_flags_mask,
 };
@@ -101,9 +100,9 @@ fn tx_flag_catalog_map_getters_match_cpp_shape() {
     );
 
     let all = getAllTxFlags();
-    assert_eq!(all.len(), 22);
+    assert_eq!(all.len(), 23);
     assert_eq!(all.first().expect("universal entry").0, "universal");
-    assert_eq!(all.last().expect("loan broker set entry").0, "LoanBrokerSet");
+    assert_eq!(all.last().expect("sponsorship transfer entry").0, "SponsorshipTransfer");
     assert_eq!(
         all[1].1.get("tfRequireDestTag"),
         Some(&(ACCOUNT_SET_FLAGS & 0x0001_0000))
@@ -113,7 +112,7 @@ fn tx_flag_catalog_map_getters_match_cpp_shape() {
         Some(&PAYMENT_PARTIAL_PAYMENT_FLAG)
     );
     assert_eq!(
-        all[17].1.get("tfAllOrNothing"),
+        all[16].1.get("tfAllOrNothing"),
         Some(&BatchTransactionFlags::ALL_OR_NOTHING.bits())
     );
 }
@@ -213,10 +212,6 @@ fn tx_flag_catalog_getters_cover_remaining_cpp_maps() {
     );
     assert_eq!(map_keys(getAMMClawbackFlags()), vec!["tfClawTwoAssets"]);
     assert_eq!(
-        map_keys(getXChainModifyBridgeFlags()),
-        vec!["tfClearAccountCreateAmount"]
-    );
-    assert_eq!(
         map_keys(getVaultCreateFlags()),
         vec!["tfVaultPrivate", "tfVaultShareNonTransferable"]
     );
@@ -284,5 +279,32 @@ fn tx_flag_catalog_keeps_current_mpt_and_batch_masks() {
     );
     assert_eq!(getBatchFlags().get("tfIndependent"), Some(&0x0008_0000));
     assert_eq!(getAllTxFlags()[11].0, "NFTokenCreateOffer");
-    assert_eq!(getAllTxFlags()[16].0, "VaultCreate");
+    assert_eq!(getAllTxFlags()[15].0, "VaultCreate");
+}
+
+/// rippled TxFlags.h SponsorshipSet / SponsorshipTransfer flag maps, which
+/// quaxar's catalog (and so server_definitions TRANSACTION_FLAGS) lacked.
+#[test]
+fn sponsorship_flag_maps_match_rippled() {
+    let all = getAllTxFlags();
+    let map = |name: &str| {
+        all.iter()
+            .find(|(tx, _)| tx == name)
+            .unwrap_or_else(|| panic!("{name} flag map"))
+            .1
+            .clone()
+    };
+    let set = map("SponsorshipSet");
+    assert_eq!(set.get("tfSponsorshipSetRequireSignForFee"), Some(&0x0001_0000));
+    assert_eq!(set.get("tfSponsorshipClearRequireSignForFee"), Some(&0x0002_0000));
+    assert_eq!(set.get("tfSponsorshipSetRequireSignForReserve"), Some(&0x0004_0000));
+    assert_eq!(set.get("tfSponsorshipClearRequireSignForReserve"), Some(&0x0008_0000));
+    assert_eq!(set.get("tfDeleteObject"), Some(&0x0010_0000));
+    assert_eq!(set.len(), 5);
+    let transfer = map("SponsorshipTransfer");
+    assert_eq!(transfer.get("tfSponsorshipEnd"), Some(&0x0001_0000));
+    assert_eq!(transfer.get("tfSponsorshipCreate"), Some(&0x0002_0000));
+    assert_eq!(transfer.get("tfSponsorshipReassign"), Some(&0x0004_0000));
+    assert_eq!(transfer.len(), 3);
+    assert!(all.iter().all(|(tx, _)| tx != "XChainModifyBridge"));
 }

@@ -7,9 +7,7 @@ use basics::{
     str_hex::str_hex,
 };
 use protocol::{
-    AccountID, BridgeBuilder, Currency, Issue, JsonOptions, JsonValue, LedgerEntryType, MPTID,
-    STArray, STLedgerEntry, Serializer, StBase, XChainOwnedClaimIDBuilder,
-    XChainOwnedCreateAccountClaimIDBuilder, account_keylet, amendments_key,
+    AccountID, Currency, JsonValue, LedgerEntryType, MPTID, STLedgerEntry, Serializer, StBase, account_keylet, amendments_key,
     deposit_preauth_credentials_keylet, get_field_by_symbol, line, offer_keylet, owner_dir_keylet,
     page_keylet, parse_base58_account_id, to_base58,
 };
@@ -143,64 +141,6 @@ pub(super) fn index_hash_with_slices(namespace: u16, slices: &[&[u8]]) -> Uint25
     Uint256::from_slice(&digest[..32]).expect("SHA-512 half output must contain 32 bytes")
 }
 
-pub(super) fn bridge_key(
-    locking_chain_door: AccountID,
-    locking_chain_currency: Currency,
-    issuing_chain_door: AccountID,
-    issuing_chain_currency: Currency,
-    locking_chain_send: bool,
-) -> Uint256 {
-    let (door, currency) = if locking_chain_send {
-        (locking_chain_door, locking_chain_currency)
-    } else {
-        (issuing_chain_door, issuing_chain_currency)
-    };
-
-    index_hash_with_slices(b'H' as u16, &[door.data(), currency.data()])
-}
-
-pub(super) fn xchain_claim_id_key(
-    locking_chain_door: AccountID,
-    locking_chain_issue: Issue,
-    issuing_chain_door: AccountID,
-    issuing_chain_issue: Issue,
-    seq: u32,
-) -> Uint256 {
-    index_hash_with_slices(
-        b'Q' as u16,
-        &[
-            locking_chain_door.data(),
-            locking_chain_issue.account.data(),
-            locking_chain_issue.currency.data(),
-            issuing_chain_door.data(),
-            issuing_chain_issue.account.data(),
-            issuing_chain_issue.currency.data(),
-            &u64::from(seq).to_be_bytes(),
-        ],
-    )
-}
-
-pub(super) fn xchain_create_account_claim_id_key(
-    locking_chain_door: AccountID,
-    locking_chain_issue: Issue,
-    issuing_chain_door: AccountID,
-    issuing_chain_issue: Issue,
-    seq: u32,
-) -> Uint256 {
-    index_hash_with_slices(
-        b'K' as u16,
-        &[
-            locking_chain_door.data(),
-            locking_chain_issue.account.data(),
-            locking_chain_issue.currency.data(),
-            issuing_chain_door.data(),
-            issuing_chain_issue.account.data(),
-            issuing_chain_issue.currency.data(),
-            &u64::from(seq).to_be_bytes(),
-        ],
-    )
-}
-
 pub(super) fn mpt_issuance_key(mpt_id: MPTID) -> Uint256 {
     index_hash_with_slices(b'~' as u16, &[mpt_id.data()])
 }
@@ -266,6 +206,5 @@ pub(super) fn assert_error(result: &JsonValue, expected: &str) {
     );
 }
 
-mod bridge;
 mod individual;
 mod selectors;

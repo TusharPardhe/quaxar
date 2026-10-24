@@ -37,9 +37,6 @@ const LEDGER_NAMESPACE_MPTOKEN: u16 = b't' as u16;
 const LEDGER_NAMESPACE_CREDENTIAL: u16 = b'D' as u16;
 const LEDGER_NAMESPACE_PERMISSIONED_DOMAIN: u16 = b'm' as u16;
 const LEDGER_NAMESPACE_DELEGATE: u16 = b'E' as u16;
-const LEDGER_NAMESPACE_BRIDGE: u16 = b'H' as u16;
-const LEDGER_NAMESPACE_XCHAIN_CLAIM_ID: u16 = b'Q' as u16;
-const LEDGER_NAMESPACE_XCHAIN_CREATE_ACCOUNT_CLAIM_ID: u16 = b'K' as u16;
 const LEDGER_NAMESPACE_VAULT: u16 = b'V' as u16;
 const LEDGER_NAMESPACE_LOAN_BROKER: u16 = b'l' as u16;
 const LEDGER_NAMESPACE_LOAN: u16 = b'L' as u16;
@@ -62,14 +59,11 @@ pub enum LedgerEntryType {
     Amendments = 0x0066,
     GeneratorMap = 0x0067,
     LedgerHashes = 0x0068,
-    Bridge = 0x0069,
     Nickname = 0x006E,
     Offer = 0x006F,
     DepositPreauth = 0x0070,
-    XChainOwnedClaimId = 0x0071,
     RippleState = 0x0072,
     FeeSettings = 0x0073,
-    XChainOwnedCreateAccountClaimId = 0x0074,
     Escrow = 0x0075,
     PayChannel = 0x0078,
     AMM = 0x0079,
@@ -156,14 +150,11 @@ impl LedgerEntryType {
             LedgerEntryType::Amendments => "Amendments",
             LedgerEntryType::GeneratorMap => "GeneratorMap",
             LedgerEntryType::LedgerHashes => "LedgerHashes",
-            LedgerEntryType::Bridge => "Bridge",
             LedgerEntryType::Nickname => "Nickname",
             LedgerEntryType::Offer => "Offer",
             LedgerEntryType::DepositPreauth => "DepositPreauth",
-            LedgerEntryType::XChainOwnedClaimId => "XChainOwnedClaimID",
             LedgerEntryType::RippleState => "RippleState",
             LedgerEntryType::FeeSettings => "FeeSettings",
-            LedgerEntryType::XChainOwnedCreateAccountClaimId => "XChainOwnedCreateAccountClaimID",
             LedgerEntryType::Escrow => "Escrow",
             LedgerEntryType::PayChannel => "PayChannel",
             LedgerEntryType::AMM => "AMM",
@@ -202,14 +193,11 @@ pub fn ledger_entry_type_from_code(code: u16) -> Option<LedgerEntryType> {
         0x0066 => Some(LedgerEntryType::Amendments),
         0x0067 => Some(LedgerEntryType::GeneratorMap),
         0x0068 => Some(LedgerEntryType::LedgerHashes),
-        0x0069 => Some(LedgerEntryType::Bridge),
         0x006E => Some(LedgerEntryType::Nickname),
         0x006F => Some(LedgerEntryType::Offer),
         0x0070 => Some(LedgerEntryType::DepositPreauth),
-        0x0071 => Some(LedgerEntryType::XChainOwnedClaimId),
         0x0072 => Some(LedgerEntryType::RippleState),
         0x0073 => Some(LedgerEntryType::FeeSettings),
-        0x0074 => Some(LedgerEntryType::XChainOwnedCreateAccountClaimId),
         0x0075 => Some(LedgerEntryType::Escrow),
         0x0078 => Some(LedgerEntryType::PayChannel),
         0x0079 => Some(LedgerEntryType::AMM),
@@ -244,14 +232,11 @@ pub fn ledger_entry_type_from_name(name: &str) -> Option<LedgerEntryType> {
         "Amendments" => Some(LedgerEntryType::Amendments),
         "GeneratorMap" => Some(LedgerEntryType::GeneratorMap),
         "LedgerHashes" => Some(LedgerEntryType::LedgerHashes),
-        "Bridge" => Some(LedgerEntryType::Bridge),
         "Nickname" => Some(LedgerEntryType::Nickname),
         "Offer" => Some(LedgerEntryType::Offer),
         "DepositPreauth" => Some(LedgerEntryType::DepositPreauth),
-        "XChainOwnedClaimID" => Some(LedgerEntryType::XChainOwnedClaimId),
         "RippleState" => Some(LedgerEntryType::RippleState),
         "FeeSettings" => Some(LedgerEntryType::FeeSettings),
-        "XChainOwnedCreateAccountClaimID" => Some(LedgerEntryType::XChainOwnedCreateAccountClaimId),
         "Escrow" => Some(LedgerEntryType::Escrow),
         "PayChannel" => Some(LedgerEntryType::PayChannel),
         "AMM" => Some(LedgerEntryType::AMM),
@@ -342,11 +327,6 @@ const LEDGER_ENTRY_TYPE_CATALOG: &[LedgerEntryTypeInfo] = &[
         name: "LedgerHashes",
     },
     LedgerEntryTypeInfo {
-        entry_type: LedgerEntryType::Bridge,
-        code: 0x0069,
-        name: "Bridge",
-    },
-    LedgerEntryTypeInfo {
         entry_type: LedgerEntryType::Nickname,
         code: 0x006E,
         name: "Nickname",
@@ -362,11 +342,6 @@ const LEDGER_ENTRY_TYPE_CATALOG: &[LedgerEntryTypeInfo] = &[
         name: "DepositPreauth",
     },
     LedgerEntryTypeInfo {
-        entry_type: LedgerEntryType::XChainOwnedClaimId,
-        code: 0x0071,
-        name: "XChainOwnedClaimID",
-    },
-    LedgerEntryTypeInfo {
         entry_type: LedgerEntryType::RippleState,
         code: 0x0072,
         name: "RippleState",
@@ -375,11 +350,6 @@ const LEDGER_ENTRY_TYPE_CATALOG: &[LedgerEntryTypeInfo] = &[
         entry_type: LedgerEntryType::FeeSettings,
         code: 0x0073,
         name: "FeeSettings",
-    },
-    LedgerEntryTypeInfo {
-        entry_type: LedgerEntryType::XChainOwnedCreateAccountClaimId,
-        code: 0x0074,
-        name: "XChainOwnedCreateAccountClaimID",
     },
     LedgerEntryTypeInfo {
         entry_type: LedgerEntryType::Escrow,
@@ -1093,76 +1063,6 @@ pub fn amm_keylet(id: Uint256) -> Keylet {
     Keylet::new(LedgerEntryType::AMM, id)
 }
 
-pub fn bridge_keylet(id: Uint256) -> Keylet {
-    Keylet::new(LedgerEntryType::Bridge, id)
-}
-
-pub fn bridge_keylet_from_door_issue(door: Uint160, issue: Issue) -> Keylet {
-    Keylet::new(
-        LedgerEntryType::Bridge,
-        index_hash_with_slices(
-            LEDGER_NAMESPACE_BRIDGE,
-            &[door.data(), issue.currency.data()],
-        ),
-    )
-}
-
-pub fn xchain_owned_claim_id_keylet(id: Uint256) -> Keylet {
-    Keylet::new(LedgerEntryType::XChainOwnedClaimId, id)
-}
-
-pub fn xchain_owned_claim_id_keylet_from_bridge(
-    locking_chain_door: Uint160,
-    locking_chain_issue: Issue,
-    issuing_chain_door: Uint160,
-    issuing_chain_issue: Issue,
-    seq: u64,
-) -> Keylet {
-    Keylet::new(
-        LedgerEntryType::XChainOwnedClaimId,
-        index_hash_with_slices(
-            LEDGER_NAMESPACE_XCHAIN_CLAIM_ID,
-            &[
-                locking_chain_door.data(),
-                locking_chain_issue.account.data(),
-                locking_chain_issue.currency.data(),
-                issuing_chain_door.data(),
-                issuing_chain_issue.account.data(),
-                issuing_chain_issue.currency.data(),
-                &seq.to_be_bytes(),
-            ],
-        ),
-    )
-}
-
-pub fn xchain_owned_create_account_claim_id_keylet(id: Uint256) -> Keylet {
-    Keylet::new(LedgerEntryType::XChainOwnedCreateAccountClaimId, id)
-}
-
-pub fn xchain_owned_create_account_claim_id_keylet_from_bridge(
-    locking_chain_door: Uint160,
-    locking_chain_issue: Issue,
-    issuing_chain_door: Uint160,
-    issuing_chain_issue: Issue,
-    seq: u64,
-) -> Keylet {
-    Keylet::new(
-        LedgerEntryType::XChainOwnedCreateAccountClaimId,
-        index_hash_with_slices(
-            LEDGER_NAMESPACE_XCHAIN_CREATE_ACCOUNT_CLAIM_ID,
-            &[
-                locking_chain_door.data(),
-                locking_chain_issue.account.data(),
-                locking_chain_issue.currency.data(),
-                issuing_chain_door.data(),
-                issuing_chain_issue.account.data(),
-                issuing_chain_issue.currency.data(),
-                &seq.to_be_bytes(),
-            ],
-        ),
-    )
-}
-
 pub fn account_root_key(account_id: Uint160) -> Uint256 {
     index_hash_with_bytes(LEDGER_NAMESPACE_ACCOUNT, account_id.data())
 }
@@ -1281,7 +1181,7 @@ fn index_hash_with_u256s(namespace: u16, head: &[u8], values: &[Uint256]) -> Uin
 mod tests {
     use super::{
         Keylet, LedgerEntryType, account_keylet, account_root_key, amendments_key,
-        amendments_keylet, amm_keylet, bridge_keylet, check_keylet, check_keylet_from_key,
+        amendments_keylet, amm_keylet, check_keylet, check_keylet_from_key,
         credential_keylet, credential_keylet_from_key, delegate_keylet,
         deposit_preauth_credentials_keylet, deposit_preauth_keylet,
         deposit_preauth_keylet_from_key, did_keylet, directory_node_keylet, escrow_keylet,
@@ -1296,9 +1196,7 @@ mod tests {
         permissioned_domain_keylet_from_id, quality_from_key, quality_keylet, signers_keylet,
         signers_keylet_for_page, skip_keylet, skip_keylet_for_ledger, ticket_keylet,
         ticket_keylet_from_key, ticket_keylet_from_seq_proxy, unchecked_keylet, vault_keylet,
-        vault_keylet_from_key, xchain_owned_claim_id_keylet,
-        xchain_owned_create_account_claim_id_keylet,
-    };
+        vault_keylet_from_key, };
     use crate::SeqProxy;
     use basics::base_uint::{Uint160, Uint256};
 
@@ -1409,15 +1307,6 @@ mod tests {
             LedgerEntryType::Delegate
         );
         assert_eq!(amm_keylet(key).entry_type, LedgerEntryType::AMM);
-        assert_eq!(bridge_keylet(key).entry_type, LedgerEntryType::Bridge);
-        assert_eq!(
-            xchain_owned_claim_id_keylet(key).entry_type,
-            LedgerEntryType::XChainOwnedClaimId
-        );
-        assert_eq!(
-            xchain_owned_create_account_claim_id_keylet(key).entry_type,
-            LedgerEntryType::XChainOwnedCreateAccountClaimId
-        );
 
         assert_eq!(
             credential_keylet(account, other, b"cred").entry_type,

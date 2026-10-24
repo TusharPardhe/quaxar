@@ -1,7 +1,6 @@
 use protocol::{
     AccountID, CurrentTransactionRulesGuard, IOUAmount, Issue, MPTAmount, MPTIssue, Rules,
-    SOEStyle, SOETxMPTIssue, SOElement, SOTemplate, STAmount, STObject, STXChainBridge,
-    XChainBridgeChainType, currency_from_string, feature_amm, fix_inner_obj_template2,
+    SOEStyle, SOETxMPTIssue, SOElement, SOTemplate, STAmount, STObject, currency_from_string, feature_amm, fix_inner_obj_template2,
     get_field_by_symbol, make_mpt_id, parse_base58_account_id, register_runtime_sfield, sf_generic,
     validate_st_object,
 };
@@ -139,17 +138,11 @@ fn protocol_stobject_apply_template_rejected_leftover_keeps_template_and_fields_
 }
 
 #[test]
-fn protocol_stobject_typed_accessors_round_trip_issue_amount_and_xchain_bridge() {
+fn protocol_stobject_typed_accessors_round_trip_issue_and_amount() {
     let issuer = account("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh");
     let amount = STAmount::from_iou_amount(
         get_field_by_symbol("sfAmount"),
         IOUAmount::from_parts(2_500_000_000_000_000, -14).expect("amount"),
-        Issue::new(currency_from_string("USD"), issuer),
-    );
-    let bridge = STXChainBridge::from_parts(
-        issuer,
-        protocol::xrp_issue(),
-        account("r3kmLJN5D28dHuH8vZNUZpMC43pEHpaocV"),
         Issue::new(currency_from_string("USD"), issuer),
     );
 
@@ -159,10 +152,9 @@ fn protocol_stobject_typed_accessors_round_trip_issue_amount_and_xchain_bridge()
         get_field_by_symbol("sfAsset"),
         protocol::STIssue::new_with_asset(
             get_field_by_symbol("sfAsset"),
-            bridge.locking_chain_issue(),
+            protocol::Asset::Issue(protocol::xrp_issue()),
         ),
     );
-    object.set_field_xchain_bridge(get_field_by_symbol("sfXChainBridge"), bridge.clone());
 
     assert_eq!(
         object.get_field_amount(get_field_by_symbol("sfAmount")),
@@ -172,17 +164,7 @@ fn protocol_stobject_typed_accessors_round_trip_issue_amount_and_xchain_bridge()
         object
             .get_field_issue(get_field_by_symbol("sfAsset"))
             .asset(),
-        bridge.locking_chain_issue()
-    );
-    assert_eq!(
-        object.get_field_xchain_bridge(get_field_by_symbol("sfXChainBridge")),
-        bridge
-    );
-    assert_eq!(
-        object
-            .get_field_xchain_bridge(get_field_by_symbol("sfXChainBridge"))
-            .door(XChainBridgeChainType::Issuing),
-        account("r3kmLJN5D28dHuH8vZNUZpMC43pEHpaocV")
+        protocol::Asset::Issue(protocol::xrp_issue())
     );
 }
 

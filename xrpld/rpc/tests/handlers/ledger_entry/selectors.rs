@@ -7,50 +7,17 @@ fn ledger_entry_supports_common_selector_and_response_shapes() {
     let owner = account(0x11);
     let other = account(0x22);
     let issuer = account(0x33);
-    let bridge_locking_door = account(0x44);
-    let bridge_issuing_door = account(0x55);
-    let bridge_locking_currency = currency(0x66);
-    let bridge_issuing_currency = currency(0x77);
-    let bridge_locking_currency_text = "66".repeat(20);
-    let bridge_issuing_currency_text = "77".repeat(20);
     let ripple_currency_text = "99".repeat(20);
     let mpt_id = MPTID::from_hex("000102030405060708090A0B0C0D0E0F1011121314151617")
         .expect("mpt id should parse");
     let mpt_issuance_id = mpt_issuance_key(mpt_id);
     let mpt_holder = account(0x88);
-    let bridge_fields = (
-        bridge_locking_door,
-        bridge_locking_currency,
-        bridge_issuing_door,
-        bridge_issuing_currency,
-    );
 
     let account_key = account_keylet(account160(owner)).key;
     let state_key = line(owner, other, currency(0x99)).key;
     let directory_key = page_keylet(owner_dir_keylet(account160(owner)), 3).key;
     let offer_key = offer_keylet(account160(owner), 7).key;
     let amendments_key = amendments_key();
-    let bridge_key = bridge_key(
-        bridge_fields.0,
-        bridge_fields.1,
-        bridge_fields.2,
-        bridge_fields.3,
-        true,
-    );
-    let xchain_claim_key = xchain_claim_id_key(
-        bridge_fields.0,
-        Issue::new(bridge_fields.1, issuer),
-        bridge_fields.2,
-        Issue::new(bridge_fields.3, other),
-        5,
-    );
-    let xchain_create_key = xchain_create_account_claim_id_key(
-        bridge_fields.0,
-        Issue::new(bridge_fields.1, issuer),
-        bridge_fields.2,
-        Issue::new(bridge_fields.3, other),
-        6,
-    );
     let deposit_key =
         deposit_preauth_credentials_key(owner, &[(issuer, &[0xbb]), (other, &[0xaa])]);
     let mptoken_key = mptoken_key(mpt_issuance_id, mpt_holder);
@@ -194,146 +161,18 @@ fn ledger_entry_supports_common_selector_and_response_shapes() {
     let deposit_result = do_ledger_entry(&deposit_request, &source);
     assert_result_index(&deposit_result, deposit_key);
 
-    let bridge_request = request(
-        object([
-            ("ledger_index", JsonValue::Unsigned(9)),
-            (
-                "bridge_account",
-                JsonValue::String(to_base58(bridge_locking_door)),
-            ),
-            (
-                "bridge",
-                JsonValue::Object(BTreeMap::from([
-                    (
-                        "LockingChainDoor".to_owned(),
-                        JsonValue::String(to_base58(bridge_locking_door)),
-                    ),
-                    (
-                        "LockingChainIssue".to_owned(),
-                        JsonValue::Object(BTreeMap::from([
-                            (
-                                "currency".to_owned(),
-                                JsonValue::String(bridge_locking_currency_text.clone()),
-                            ),
-                            ("issuer".to_owned(), JsonValue::String(to_base58(issuer))),
-                        ])),
-                    ),
-                    (
-                        "IssuingChainDoor".to_owned(),
-                        JsonValue::String(to_base58(bridge_issuing_door)),
-                    ),
-                    (
-                        "IssuingChainIssue".to_owned(),
-                        JsonValue::Object(BTreeMap::from([
-                            (
-                                "currency".to_owned(),
-                                JsonValue::String(bridge_issuing_currency_text.clone()),
-                            ),
-                            ("issuer".to_owned(), JsonValue::String(to_base58(other))),
-                        ])),
-                    ),
-                ])),
-            ),
-        ]),
-        2,
-    );
-    let bridge_result = do_ledger_entry(&bridge_request, &source);
-    assert_result_index(&bridge_result, bridge_key);
-    assert_error(&bridge_result, "entryNotFound");
-    assert_error(&bridge_result, "entryNotFound");
-
-    let xchain_request = request(
-        object([
-            ("ledger_index", JsonValue::Unsigned(9)),
-            (
-                "xchain_owned_claim_id",
-                JsonValue::Object(BTreeMap::from([
-                    (
-                        "LockingChainDoor".to_owned(),
-                        JsonValue::String(to_base58(bridge_locking_door)),
-                    ),
-                    (
-                        "LockingChainIssue".to_owned(),
-                        JsonValue::Object(BTreeMap::from([
-                            (
-                                "currency".to_owned(),
-                                JsonValue::String(bridge_locking_currency_text.clone()),
-                            ),
-                            ("issuer".to_owned(), JsonValue::String(to_base58(issuer))),
-                        ])),
-                    ),
-                    (
-                        "IssuingChainDoor".to_owned(),
-                        JsonValue::String(to_base58(bridge_issuing_door)),
-                    ),
-                    (
-                        "IssuingChainIssue".to_owned(),
-                        JsonValue::Object(BTreeMap::from([
-                            (
-                                "currency".to_owned(),
-                                JsonValue::String(bridge_issuing_currency_text.clone()),
-                            ),
-                            ("issuer".to_owned(), JsonValue::String(to_base58(other))),
-                        ])),
-                    ),
-                    ("xchain_owned_claim_id".to_owned(), JsonValue::Unsigned(5)),
-                ])),
-            ),
-        ]),
-        2,
-    );
-    let xchain_result = do_ledger_entry(&xchain_request, &source);
-    assert_result_index(&xchain_result, xchain_claim_key);
-    assert_error(&xchain_result, "entryNotFound");
-    assert_error(&xchain_result, "entryNotFound");
-
-    let xchain_create_request = request(
-        object([
-            ("ledger_index", JsonValue::Unsigned(9)),
-            (
-                "xchain_owned_create_account_claim_id",
-                JsonValue::Object(BTreeMap::from([
-                    (
-                        "LockingChainDoor".to_owned(),
-                        JsonValue::String(to_base58(bridge_locking_door)),
-                    ),
-                    (
-                        "LockingChainIssue".to_owned(),
-                        JsonValue::Object(BTreeMap::from([
-                            (
-                                "currency".to_owned(),
-                                JsonValue::String(bridge_locking_currency_text.clone()),
-                            ),
-                            ("issuer".to_owned(), JsonValue::String(to_base58(issuer))),
-                        ])),
-                    ),
-                    (
-                        "IssuingChainDoor".to_owned(),
-                        JsonValue::String(to_base58(bridge_issuing_door)),
-                    ),
-                    (
-                        "IssuingChainIssue".to_owned(),
-                        JsonValue::Object(BTreeMap::from([
-                            (
-                                "currency".to_owned(),
-                                JsonValue::String(bridge_issuing_currency_text.clone()),
-                            ),
-                            ("issuer".to_owned(), JsonValue::String(to_base58(other))),
-                        ])),
-                    ),
-                    (
-                        "xchain_owned_create_account_claim_id".to_owned(),
-                        JsonValue::Unsigned(6),
-                    ),
-                ])),
-            ),
-        ]),
-        2,
-    );
-    let xchain_create_result = do_ledger_entry(&xchain_create_request, &source);
-    assert_result_index(&xchain_create_result, xchain_create_key);
-    assert_error(&xchain_create_result, "entryNotFound");
-    assert_error(&xchain_create_result, "entryNotFound");
+    // rippled #8255: the XChain selectors are gone, so a request naming only
+    // `bridge` has no ledger_entry params.
+    for (api_version, error) in [(1, "unknownOption"), (2, "invalidParams")] {
+        let removed = request(
+            object([
+                ("ledger_index", JsonValue::Unsigned(9)),
+                ("bridge", JsonValue::Object(BTreeMap::new())),
+            ]),
+            api_version,
+        );
+        assert_error(&do_ledger_entry(&removed, &source), error);
+    }
 
     let mpt_issuance_request = request(
         object([

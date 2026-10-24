@@ -9,7 +9,7 @@ use basics::{
 use crate::{
     JsonValue, LedgerFormats, Permission, SOEStyle, STAccount, STAmount, STArray, STBlob,
     STCurrency, STInt32, STIssue, STNumber, STObject, STUInt8, STUInt16, STUInt32, STUInt64,
-    STUInt128, STUInt160, STUInt192, STUInt256, STVector256, STXChainBridge, SerializedTypeId,
+    STUInt128, STUInt160, STUInt192, STUInt256, STVector256, SerializedTypeId,
     TxFormats, TxType, asset_from_json, currency_from_string, get_field_by_name,
     get_field_by_symbol, make_param_error, normalized_parts_from_json_input,
     normalized_parts_from_string, parse_base58_account_id, st_issue_from_json,
@@ -161,10 +161,6 @@ fn set_field_from_json(
         SerializedTypeId::Vector256 => {
             object.set_field_v256(field, parse_vector256_field(field, value)?)
         }
-        SerializedTypeId::XChainBridge => object.set_field_xchain_bridge(
-            field,
-            STXChainBridge::from_json_value(field, value).map_err(|_| invalid_data(name))?,
-        ),
         other => return Err(format!("Field '{name}' has unsupported type {other:?}.")),
     }
 
@@ -538,10 +534,6 @@ fn parse_permission_value(value: &JsonValue) -> Result<u32, String> {
 
 fn field_invalid(field: &'static crate::SField) -> String {
     format!("Field '{}' has invalid data.", field.name())
-}
-
-fn invalid_data(name: &str) -> String {
-    format!("Field '{name}' has invalid data.")
 }
 
 #[cfg(test)]

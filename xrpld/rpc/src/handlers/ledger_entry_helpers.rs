@@ -15,18 +15,16 @@ use basics::{
     string_utilities::str_unhex,
 };
 use protocol::{
-    AccountID, Asset, Bridge, Currency, Issue, JsonOptions, JsonValue, Keylet, LedgerEntryType,
-    STLedgerEntry, StBase, XChainOwnedClaimID, XChainOwnedCreateAccountClaimID, account_keylet,
-    amendments_key, asset_from_json, bridge_keylet_from_door_issue, check_keylet, credential_keylet,
+    AccountID, Asset, Currency, Issue, JsonOptions, JsonValue, Keylet, LedgerEntryType,
+    STLedgerEntry, StBase, account_keylet,
+    amendments_key, asset_from_json, check_keylet, credential_keylet,
     delegate_keylet, deposit_preauth_credentials_keylet, deposit_preauth_keylet, did_keylet,
     escrow_keylet, fee_settings_keylet, issue_from_json, line, loan_broker_keylet, loan_keylet,
     mpt_issuance_keylet_from_mptid, mptoken_keylet_from_mptid, negative_unl_keylet,
     nft_offer_keylet_for_owner, offer_keylet, oracle_keylet, owner_dir_keylet, page_keylet,
     parse_base58_account_id, pay_channel_keylet, permissioned_domain_keylet, sha512_half_slices,
     signers_keylet, skip_keylet, skip_keylet_for_ledger, ticket_keylet, to_currency, vault_keylet,
-    xchain_owned_claim_id_keylet_from_bridge,
-    xchain_owned_create_account_claim_id_keylet_from_bridge,
-};
+    };
 
 use crate::status::{RpcErrorCode, Status as RpcStatus};
 
@@ -39,29 +37,8 @@ pub struct DepositPreauthCredential {
     pub credential_type: Blob,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BridgeFields {
-    pub locking_chain_door: AccountID,
-    pub locking_chain_issue: Issue,
-    pub issuing_chain_door: AccountID,
-    pub issuing_chain_issue: Issue,
-}
-
 pub fn render_ledger_entry_json(node: &STLedgerEntry) -> JsonValue {
-    match node.get_type() {
-        LedgerEntryType::Bridge => Bridge::new(Arc::new(node.clone()))
-            .map(|bridge| bridge.as_st_ledger_entry().json(JsonOptions::NONE))
-            .unwrap_or_else(|_| node.json(JsonOptions::NONE)),
-        LedgerEntryType::XChainOwnedClaimId => XChainOwnedClaimID::new(Arc::new(node.clone()))
-            .map(|entry| entry.as_st_ledger_entry().json(JsonOptions::NONE))
-            .unwrap_or_else(|_| node.json(JsonOptions::NONE)),
-        LedgerEntryType::XChainOwnedCreateAccountClaimId => {
-            XChainOwnedCreateAccountClaimID::new(Arc::new(node.clone()))
-                .map(|entry| entry.as_st_ledger_entry().json(JsonOptions::NONE))
-                .unwrap_or_else(|_| node.json(JsonOptions::NONE))
-        }
-        _ => protocol::json_writer::ledger_entry_json(node),
-    }
+    protocol::json_writer::ledger_entry_json(node)
 }
 
 fn make_error(code: RpcErrorCode, message: impl Into<String>) -> JsonValue {
@@ -736,121 +713,6 @@ pub fn parse_credential(params: &JsonValue, field: &'static str) -> Result<Uint2
         Uint160::from_slice(subject.data()).expect("account width"),
         Uint160::from_slice(issuer.data()).expect("account width"),
         &cred_type,
-    )
-    .key)
-}
-
-pub fn parse_bridge(params: &JsonValue, field: &'static str) -> Result<Uint256, JsonValue> {
-    let JsonValue::Object(object) = params else {
-        return parse_object_id(params, field, "hex string or object");
-    };
-
-    let bridge_value = object
-        .get("bridge")
-        .ok_or_else(|| missing_field_error("bridge"))?;
-    if let JsonValue::String(_) = bridge_value {
-        return parse_object_id(bridge_value, field, "hex string or object");
-    }
-
-    let bridge = parse_bridge_fields(bridge_value)?;
-    let bridge_account = required_account_id(params, "bridge_account", "malformedBridgeAccount")?;
-
-    if bridge_account == bridge.locking_chain_door {
-        return Ok(bridge_keylet_from_door_issue(
-            Uint160::from_slice(bridge.locking_chain_door.data()).expect("account width"),
-            bridge.locking_chain_issue,
-        )
-        .key);
-    }
-    if bridge_account == bridge.issuing_chain_door {
-        return Ok(bridge_keylet_from_door_issue(
-            Uint160::from_slice(bridge.issuing_chain_door.data()).expect("account width"),
-            bridge.issuing_chain_issue,
-        )
-        .key);
-    }
-
-    Err(malformed_error("malformedRequest", ""))
-}
-
-pub fn parse_bridge_fields(params: &JsonValue) -> Result<BridgeFields, JsonValue> {
-    has_required(
-        params,
-        &[
-            "LockingChainDoor",
-            "LockingChainIssue",
-            "IssuingChainDoor",
-            "IssuingChainIssue",
-        ],
-        Some("malformedRequest"),
-    )?;
-
-    let JsonValue::Object(_object) = params else {
-        return Err(malformed_error(
-            "malformedRequest",
-            "Must be an object with bridge fields.",
-        ));
-    };
-
-    let locking_chain_door =
-        required_account_id(params, "LockingChainDoor", "malformedLockingChainDoor")?;
-    let issuing_chain_door =
-        required_account_id(params, "IssuingChainDoor", "malformedIssuingChainDoor")?;
-    let locking_chain_issue = required_issue(params, "LockingChainIssue", "malformedIssue")?;
-    let issuing_chain_issue = required_issue(params, "IssuingChainIssue", "malformedIssue")?;
-
-    Ok(BridgeFields {
-        locking_chain_door,
-        locking_chain_issue,
-        issuing_chain_door,
-        issuing_chain_issue,
-    })
-}
-
-pub fn parse_xchain_owned_claim_id(
-    params: &JsonValue,
-    field: &'static str,
-) -> Result<Uint256, JsonValue> {
-    let JsonValue::Object(_) = params else {
-        return parse_object_id(params, field, "hex string");
-    };
-
-    let bridge = parse_bridge_fields(params)?;
-    let seq = required_uint32(
-        params,
-        "xchain_owned_claim_id",
-        "malformedXChainOwnedClaimID",
-    )?;
-    Ok(xchain_owned_claim_id_keylet_from_bridge(
-        Uint160::from_slice(bridge.locking_chain_door.data()).expect("account width"),
-        bridge.locking_chain_issue,
-        Uint160::from_slice(bridge.issuing_chain_door.data()).expect("account width"),
-        bridge.issuing_chain_issue,
-        u64::from(seq),
-    )
-    .key)
-}
-
-pub fn parse_xchain_owned_create_account_claim_id(
-    params: &JsonValue,
-    field: &'static str,
-) -> Result<Uint256, JsonValue> {
-    let JsonValue::Object(_) = params else {
-        return parse_object_id(params, field, "hex string");
-    };
-
-    let bridge = parse_bridge_fields(params)?;
-    let seq = required_uint32(
-        params,
-        "xchain_owned_create_account_claim_id",
-        "malformedXChainOwnedCreateAccountClaimID",
-    )?;
-    Ok(xchain_owned_create_account_claim_id_keylet_from_bridge(
-        Uint160::from_slice(bridge.locking_chain_door.data()).expect("account width"),
-        bridge.locking_chain_issue,
-        Uint160::from_slice(bridge.issuing_chain_door.data()).expect("account width"),
-        bridge.issuing_chain_issue,
-        u64::from(seq),
     )
     .key)
 }

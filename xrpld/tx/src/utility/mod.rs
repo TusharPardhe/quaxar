@@ -169,7 +169,6 @@ pub mod vault_withdraw_preclaim;
 pub mod vault_withdraw_preclaim_front;
 pub mod vault_withdraw_preclaim_tail;
 pub mod vault_withdraw_preflight;
-pub mod x_chain_bridge;
 
 // Re-export all from submodules
 pub use bridge_domain_read_view_preclaim::*;
@@ -342,7 +341,6 @@ pub use vault_withdraw_preclaim::*;
 pub use vault_withdraw_preclaim_front::*;
 pub use vault_withdraw_preclaim_tail::*;
 pub use vault_withdraw_preflight::*;
-pub use x_chain_bridge::*;
 pub mod nftoken_burn;
 pub mod nftoken_mint;
 pub use nftoken_mint::*;

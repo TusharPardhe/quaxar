@@ -5,7 +5,7 @@ use std::fmt;
 use basics::{buffer::Buffer, string_utilities::str_unhex};
 
 use crate::{
-    AccountID, Asset, JsonValue, MPTAmount, PublicKey, SField, STAmount, STXChainBridge, XRPAmount,
+    AccountID, Asset, JsonValue, MPTAmount, PublicKey, SField, STAmount, XRPAmount,
     asset_from_json, normalized_parts_from_string, parse_base58_account_id,
 };
 
@@ -214,21 +214,6 @@ impl JsonFieldRead for STAmount {
         let member = get_member(value, field)?;
         parse_st_amount(field, member).map_err(|expected| {
             JsonGetOrThrowError::TypeMismatch(JsonTypeMismatchError::new(field.name(), expected))
-        })
-    }
-}
-
-impl JsonFieldRead for STXChainBridge {
-    fn read_json_field(
-        value: &JsonValue,
-        field: &'static SField,
-    ) -> Result<Self, JsonGetOrThrowError> {
-        let member = get_member(value, field)?;
-        STXChainBridge::from_json_value(field, member).map_err(|_| {
-            JsonGetOrThrowError::TypeMismatch(JsonTypeMismatchError::new(
-                field.name(),
-                "STXChainBridge",
-            ))
         })
     }
 }

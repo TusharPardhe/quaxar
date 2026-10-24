@@ -1074,8 +1074,6 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
         let can_create_account = matches!(
             txn_type,
             protocol::TxType::PAYMENT
-                | protocol::TxType::XCHAIN_ADD_CLAIM_ATTESTATION
-                | protocol::TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION
                 | protocol::TxType::AMM_CREATE
                 | protocol::TxType::VAULT_CREATE
                 | protocol::TxType::LOAN_BROKER_SET

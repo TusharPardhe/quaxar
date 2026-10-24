@@ -11,7 +11,7 @@ use crate::{
     AccountID, InnerObjectFormats, JsonOptions, JsonValue, SField, SOEStyle, SOTemplate, STAccount,
     STAmount, STBlob, STCurrency, STInt32, STIssue, STNumber, STPathSet, STUInt8, STUInt16,
     STUInt32, STUInt64, STUInt128, STUInt160, STUInt192, STUInt256, STVar, STVector256,
-    STXChainBridge, SerialIter, SerializedTypeId, Serializer, StBase, StBaseCore, ValidationError,
+    SerialIter, SerializedTypeId, Serializer, StBase, StBaseCore, ValidationError,
     downcast_stbase_mut, downcast_stbase_ref, fix_inner_obj_template2,
     get_current_transaction_rules, get_field_by_symbol, sf_generic,
 };
@@ -439,14 +439,6 @@ impl STObject {
         })
     }
 
-    pub fn get_field_xchain_bridge(&self, field: &'static SField) -> STXChainBridge {
-        self.get_field_by_const_ref::<STXChainBridge, _>(
-            field,
-            STXChainBridge::with_field(field),
-            |value| value,
-        )
-    }
-
     pub fn get_field_v256(&self, field: &'static SField) -> STVector256 {
         self.get_field_by_const_ref::<STVector256, _>(
             field,
@@ -572,11 +564,6 @@ impl STObject {
     }
 
     pub fn set_field_issue(&mut self, field: &'static SField, mut value: STIssue) {
-        value.set_fname(field);
-        self.set_stbase(value);
-    }
-
-    pub fn set_field_xchain_bridge(&mut self, field: &'static SField, mut value: STXChainBridge) {
         value.set_fname(field);
         self.set_stbase(value);
     }

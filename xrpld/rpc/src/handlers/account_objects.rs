@@ -121,12 +121,6 @@ fn deletion_blocker_filter(params: &JsonValue) -> Option<Vec<LedgerEntryType>> {
         ("nft_page", LedgerEntryType::NFTokenPage),
         ("payment_channel", LedgerEntryType::PayChannel),
         ("state", LedgerEntryType::RippleState),
-        ("xchain_owned_claim_id", LedgerEntryType::XChainOwnedClaimId),
-        (
-            "xchain_owned_create_account_claim_id",
-            LedgerEntryType::XChainOwnedCreateAccountClaimId,
-        ),
-        ("bridge", LedgerEntryType::Bridge),
         ("mpt_issuance", LedgerEntryType::MPTokenIssuance),
         ("mptoken", LedgerEntryType::MPToken),
         ("permissioned_domain", LedgerEntryType::PermissionedDomain),

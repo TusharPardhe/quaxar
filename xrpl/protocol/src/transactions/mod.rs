@@ -62,7 +62,6 @@ pub mod sponsorship_set;
 pub mod sponsorship_transfer;
 pub mod st_tx;
 pub mod st_validation;
-pub mod st_xchain_bridge;
 pub mod sttx_multi_sign;
 pub mod sttx_multi_sign_check;
 pub mod sttx_single_sign;
@@ -82,15 +81,6 @@ pub mod vault_delete;
 pub mod vault_deposit;
 pub mod vault_set;
 pub mod vault_withdraw;
-pub mod x_chain_account_create_commit;
-pub mod x_chain_add_account_create_attestation;
-pub mod x_chain_add_claim_attestation;
-pub mod x_chain_claim;
-pub mod x_chain_commit;
-pub mod x_chain_create_bridge;
-pub mod x_chain_create_claim_id;
-pub mod x_chain_modify_bridge;
-pub mod xchain_attestations;
 
 pub use account_delete::{AccountDelete, AccountDeleteBuilder};
 pub use account_set::{AccountSet, AccountSetBuilder};
@@ -167,17 +157,3 @@ pub use vault_delete::{VaultDelete, VaultDeleteBuilder};
 pub use vault_deposit::{VaultDeposit, VaultDepositBuilder};
 pub use vault_set::{VaultSet, VaultSetBuilder};
 pub use vault_withdraw::{VaultWithdraw, VaultWithdrawBuilder};
-pub use x_chain_account_create_commit::{
-    XChainAccountCreateCommit, XChainAccountCreateCommitBuilder,
-};
-pub use x_chain_add_account_create_attestation::{
-    XChainAddAccountCreateAttestation, XChainAddAccountCreateAttestationBuilder,
-};
-pub use x_chain_add_claim_attestation::{
-    XChainAddClaimAttestation, XChainAddClaimAttestationBuilder,
-};
-pub use x_chain_claim::{XChainClaim, XChainClaimBuilder};
-pub use x_chain_commit::{XChainCommit, XChainCommitBuilder};
-pub use x_chain_create_bridge::{XChainCreateBridge, XChainCreateBridgeBuilder};
-pub use x_chain_create_claim_id::{XChainCreateClaimID, XChainCreateClaimIDBuilder};
-pub use x_chain_modify_bridge::{XChainModifyBridge, XChainModifyBridgeBuilder};

@@ -12,7 +12,7 @@ use std::ptr;
 use crate::{
     SField, STAccount, STAmount, STArray, STBlob, STCurrency, STInt32, STIssue, STNumber, STObject,
     STPathSet, STUInt8, STUInt16, STUInt32, STUInt64, STUInt128, STUInt160, STUInt192, STUInt256,
-    STVector256, STXChainBridge, SerialIter, SerializedTypeId, StBase, StBaseCore, ValidationError,
+    STVector256, SerialIter, SerializedTypeId, StBase, StBaseCore, ValidationError,
 };
 
 const STVAR_INLINE_SIZE: usize = 72;
@@ -212,9 +212,6 @@ impl STVar {
             SerializedTypeId::Array => Self::new(STArray::from_serial_iter(sit, field, depth)),
             SerializedTypeId::Currency => Self::new(STCurrency::from_serial_iter(sit, field)),
             SerializedTypeId::PathSet => Self::new(STPathSet::from_serial_iter(sit, field)),
-            SerializedTypeId::XChainBridge => {
-                Self::new(STXChainBridge::from_serial_iter(sit, field))
-            }
             _ => panic!("Unknown object type"),
         }
     }
@@ -257,7 +254,6 @@ impl STVar {
             SerializedTypeId::Array => Self::new(STArray::new(field)),
             SerializedTypeId::Currency => Self::new(STCurrency::with_field(field)),
             SerializedTypeId::PathSet => Self::new(STPathSet::new(field)),
-            SerializedTypeId::XChainBridge => Self::new(STXChainBridge::with_field(field)),
             _ => panic!("Unknown object type"),
         }
     }

@@ -139,30 +139,6 @@ wrap_selector_3arg!(parse_ledger_hashes_selector, helpers::parse_ledger_hashes);
 wrap_selector_3arg!(parse_fee_settings_selector, helpers::parse_fee_settings);
 wrap_selector_3arg!(parse_index_selector, helpers::parse_index);
 
-fn parse_bridge(
-    params: &JsonValue,
-    field: &'static str,
-    _api_version: u32,
-) -> Result<Uint256, JsonValue> {
-    helpers::parse_bridge(params, field)
-}
-
-fn parse_xchain_owned_claim_id(
-    params: &JsonValue,
-    field: &'static str,
-    _api_version: u32,
-) -> Result<Uint256, JsonValue> {
-    helpers::parse_xchain_owned_claim_id(params, field)
-}
-
-fn parse_xchain_owned_create_account_claim_id(
-    params: &JsonValue,
-    field: &'static str,
-    _api_version: u32,
-) -> Result<Uint256, JsonValue> {
-    helpers::parse_xchain_owned_create_account_claim_id(params, field)
-}
-
 fn parse_did_selector(
     params: &JsonValue,
     field: &'static str,
@@ -294,12 +270,6 @@ fn selectors() -> &'static [Selector] {
             use_full_params: false,
         },
         Selector {
-            field: "bridge",
-            expected_type: LedgerEntryType::Bridge,
-            parser: parse_bridge,
-            use_full_params: true,
-        },
-        Selector {
             field: "offer",
             expected_type: LedgerEntryType::Offer,
             parser: parse_offer_selector,
@@ -312,12 +282,6 @@ fn selectors() -> &'static [Selector] {
             use_full_params: false,
         },
         Selector {
-            field: "xchain_owned_claim_id",
-            expected_type: LedgerEntryType::XChainOwnedClaimId,
-            parser: parse_xchain_owned_claim_id,
-            use_full_params: false,
-        },
-        Selector {
             field: "state",
             expected_type: LedgerEntryType::RippleState,
             parser: parse_ripple_state_selector,
@@ -327,12 +291,6 @@ fn selectors() -> &'static [Selector] {
             field: "fee",
             expected_type: LedgerEntryType::FeeSettings,
             parser: parse_fee_settings_selector,
-            use_full_params: false,
-        },
-        Selector {
-            field: "xchain_owned_create_account_claim_id",
-            expected_type: LedgerEntryType::XChainOwnedCreateAccountClaimId,
-            parser: parse_xchain_owned_create_account_claim_id,
             use_full_params: false,
         },
         Selector {

@@ -143,15 +143,10 @@ fn resolve_entry_type(filter: &str) -> Option<LedgerEntryType> {
             "directory" => Some(LedgerEntryType::DirectoryNode),
             "amendments" => Some(LedgerEntryType::Amendments),
             "hashes" => Some(LedgerEntryType::LedgerHashes),
-            "bridge" => Some(LedgerEntryType::Bridge),
             "offer" => Some(LedgerEntryType::Offer),
             "deposit_preauth" => Some(LedgerEntryType::DepositPreauth),
-            "xchain_owned_claim_id" => Some(LedgerEntryType::XChainOwnedClaimId),
             "state" => Some(LedgerEntryType::RippleState),
             "fee" => Some(LedgerEntryType::FeeSettings),
-            "xchain_owned_create_account_claim_id" => {
-                Some(LedgerEntryType::XChainOwnedCreateAccountClaimId)
-            }
             "escrow" => Some(LedgerEntryType::Escrow),
             "payment_channel" => Some(LedgerEntryType::PayChannel),
             "amm" => Some(LedgerEntryType::AMM),
