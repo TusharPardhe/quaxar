@@ -6,7 +6,7 @@ use super::{
     apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim,
     apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim_and_network_id,
     apply_submit_transactor_shell_with_preclaim_and_delivered_amount, batch_base_fee,
-    calculate_default_sttx_base_fee, calculate_sttx_base_fee, canonical_sttx_consequences,
+    calculate_default_sttx_base_fee, calculate_sttx_base_fee,
     consensus_status_event, loan_set_counterparty_preflight_ter,
     observer_quorum_alternate_candidate, preferred_lcl_matches_local_or_parent,
     queue_apply_preclaim_ter, record_applied_open_transactions, transaction_preflight_ter,
@@ -781,7 +781,6 @@ fn ledger_view(seq: u32, account: AccountID, account_sequence: u32, tx_ids: &[Ui
                         reserve: 1_000_000,
                         increment: 200_000,
                     },
-                    false,
                 ),
             ),
         )
@@ -5414,23 +5413,6 @@ fn typed_preclaim_dispatcher_covers_all_84_routed_quaxar_types() {
         (TxType::AMM_VOTE, DexReadViewHelper),
         (TxType::AMM_BID, DexReadViewHelper),
         (TxType::AMM_DELETE, DexReadViewHelper),
-        (TxType::XCHAIN_CREATE_CLAIM_ID, BridgeDomainReadViewHelper),
-        (TxType::XCHAIN_COMMIT, BridgeDomainReadViewHelper),
-        (TxType::XCHAIN_CLAIM, BridgeDomainReadViewHelper),
-        (
-            TxType::XCHAIN_ACCOUNT_CREATE_COMMIT,
-            BridgeDomainReadViewHelper,
-        ),
-        (
-            TxType::XCHAIN_ADD_CLAIM_ATTESTATION,
-            BridgeDomainReadViewHelper,
-        ),
-        (
-            TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION,
-            BridgeDomainReadViewHelper,
-        ),
-        (TxType::XCHAIN_MODIFY_BRIDGE, BridgeDomainReadViewHelper),
-        (TxType::XCHAIN_CREATE_BRIDGE, BridgeDomainReadViewHelper),
         (TxType::DID_SET, BridgeDomainAuditedNoop),
         (TxType::DID_DELETE, BridgeDomainAuditedNoop),
         (TxType::ORACLE_SET, BridgeDomainReadViewHelper),
@@ -6262,27 +6244,6 @@ fn persistent_submit_sandbox_is_restored_during_unwind() {
         holder.lock().expect("sandbox holder mutex").is_some(),
         "a caught batch panic must not discard the persistent open-ledger sandbox"
     );
-}
-
-#[test]
-fn xchain_commit_queue_consequences_include_native_amount_only() {
-    for (amount, expected) in [
-        (STAmount::new_native(1234, false), 1234),
-        (STAmount::new_native(0, false), 0),
-        (STAmount::new_native(1234, true), 0),
-    ] {
-        let tx = STTx::new(TxType::XCHAIN_COMMIT, |tx| {
-            tx.set_field_amount(
-                get_field_by_symbol("sfFee"),
-                STAmount::new_native(10, false),
-            );
-            tx.set_field_u32(get_field_by_symbol("sfSequence"), 7);
-            tx.set_field_amount(get_field_by_symbol("sfAmount"), amount.clone());
-        });
-        let consequences = canonical_sttx_consequences(&tx);
-        assert_eq!(consequences.potential_spend(), expected);
-        assert_eq!(consequences.fee(), 10);
-    }
 }
 
 #[test]

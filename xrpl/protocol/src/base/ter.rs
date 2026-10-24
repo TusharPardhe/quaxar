@@ -398,12 +398,6 @@ macro_rules! ter_catalog {
             "temINVALID_BYTECODE",
             "Malformed: Provided byte code is invalid."
         );
-        $macro!(
-            TEM_TEMP_DISABLED,
-            -246,
-            "temTEMP_DISABLED",
-            "The transaction requires logic that is currently temporarily disabled."
-        );
 
         $macro!(TEF_FAILURE, -199, "tefFAILURE", "Failed to apply.");
         $macro!(
@@ -550,6 +544,18 @@ macro_rules! ter_catalog {
             -174,
             "tefBYTECODE_NOT_INCLUDED",
             "WASM code requires a field that was not included."
+        );
+        $macro!(
+            TEF_TEMP_DISABLED,
+            -173,
+            "tefTEMP_DISABLED",
+            "The transaction requires logic that is currently temporarily disabled."
+        );
+        $macro!(
+            TEF_EXCEEDS_LIMIT,
+            -172,
+            "tefEXCEEDS_LIMIT",
+            "The transaction exceeds a limit set by fee voting."
         );
 
         $macro!(TER_RETRY, -99, "terRETRY", "Retry transaction.");

@@ -5,7 +5,7 @@
 //! field-presence facts; it never invokes apply code or opens a sandbox.
 
 use ledger::ReadView;
-use protocol::{STTx, Ter, TxType, feature_xrp_fees, get_field_by_symbol};
+use protocol::{STTx, Ter, TxType, get_field_by_symbol};
 
 use crate::{ChangePreclaimFacts, run_change_preclaim};
 
@@ -37,7 +37,6 @@ pub fn run_change_read_view_preclaim<V: ReadView>(
             TxType::FEE,
             ChangePreclaimFacts {
                 ledger_is_open: false,
-                xrp_fees_enabled: view.rules().enabled(&feature_xrp_fees()),
                 base_fee_present: tx.is_field_present(sf("sfBaseFee")),
                 reference_fee_units_present: tx.is_field_present(sf("sfReferenceFeeUnits")),
                 reserve_base_present: tx.is_field_present(sf("sfReserveBase")),
@@ -58,7 +57,7 @@ mod tests {
     use basics::base_uint::Uint256;
     use ledger::{Fees, LedgerHeader, ReadView, ReadViewTx, Rules, ViewError};
     use protocol::{
-        Keylet, STAmount, STLedgerEntry, STTx, Ter, TxType, XRPAmount, feature_xrp_fees,
+        Keylet, STAmount, STLedgerEntry, STTx, Ter, TxType, XRPAmount,
     };
 
     use super::{run_change_read_view_preclaim, sf};
@@ -154,7 +153,7 @@ mod tests {
     fn open_ledger_rejection_precedes_fee_shape_validation() {
         let view = View {
             open: true,
-            rules: Rules::new([feature_xrp_fees()]),
+            rules: Rules::new([]),
         };
         let malformed_fee = STTx::new(TxType::FEE, |_| {});
 
@@ -166,35 +165,32 @@ mod tests {
 
     #[test]
     fn fee_field_shapes_preserve_rippled_required_before_forbidden_ordering() {
-        let legacy_view = View::default();
-        let missing_legacy_with_xrp_fields = xrp_fee_tx();
+        // rippled #7349 retired XRPFees: drops fields are required and legacy
+        // fields forbidden, whatever the ledger rules.
+        let view = View::default();
         let mut legacy_with_xrp_field = legacy_fee_tx();
         legacy_with_xrp_field.set_field_amount(
             sf("sfBaseFeeDrops"),
             STAmount::from_xrp_amount(XRPAmount::from_drops(1)),
         );
-        let xrp_view = View {
-            open: false,
-            rules: Rules::new([feature_xrp_fees()]),
-        };
         let mut xrp_with_legacy_field = xrp_fee_tx();
         xrp_with_legacy_field.set_field_u64(sf("sfBaseFee"), 1);
 
         assert_eq!(
-            run_change_read_view_preclaim(
-                &legacy_view,
-                &missing_legacy_with_xrp_fields,
-                TxType::FEE,
-            ),
+            run_change_read_view_preclaim(&view, &xrp_fee_tx(), TxType::FEE),
+            Some(Ter::TES_SUCCESS)
+        );
+        assert_eq!(
+            run_change_read_view_preclaim(&view, &legacy_fee_tx(), TxType::FEE),
             Some(Ter::TEM_MALFORMED),
-            "legacy required fields fail before forbidden XRP fields"
+            "required drops fields fail first"
         );
         assert_eq!(
-            run_change_read_view_preclaim(&legacy_view, &legacy_with_xrp_field, TxType::FEE),
-            Some(Ter::TEM_DISABLED)
+            run_change_read_view_preclaim(&view, &legacy_with_xrp_field, TxType::FEE),
+            Some(Ter::TEM_MALFORMED)
         );
         assert_eq!(
-            run_change_read_view_preclaim(&xrp_view, &xrp_with_legacy_field, TxType::FEE),
+            run_change_read_view_preclaim(&view, &xrp_with_legacy_field, TxType::FEE),
             Some(Ter::TEM_MALFORMED)
         );
     }

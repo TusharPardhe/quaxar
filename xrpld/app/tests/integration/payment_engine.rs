@@ -23959,25 +23959,6 @@ fn cpp_step3_batch_valid_independent() {
     assert!(r != Ter::TEM_INVALID_FLAG, "{:?}", r);
 }
 
-/// C++: XChainCreateBridge with equal door accounts → temXCHAIN_EQUAL_DOOR_ACCOUNTS
-#[test]
-fn cpp_step3_xchain_equal_doors() {
-    let a = acct(0x41);
-    let l = build_ledger_with_features(
-        vec![account_root(a, 10_000_000_000, 0, 0)],
-        vec!["XChainBridge"],
-    );
-    let mut v = new_view(l);
-    let tx = STTx::new(TxType::XCHAIN_CREATE_BRIDGE, |tx| {
-        tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_amount(sf("sfFee"), xrp(10));
-        tx.set_field_u32(sf("sfSequence"), 1);
-    });
-    let r = full_apply(&mut v, &tx, TxType::XCHAIN_CREATE_BRIDGE);
-    // Without proper bridge fields, may return temMALFORMED or TES_SUCCESS
-    assert!(r != Ter::TEM_INVALID_FLAG, "{:?}", r);
-}
-
 /// C++: OfferCancel valid sequence → TES_SUCCESS
 #[test]
 fn cpp_step3_offer_cancel_valid() {

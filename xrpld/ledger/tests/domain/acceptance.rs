@@ -135,7 +135,7 @@ fn ledger_set_immutable_and_setup_from_state_map_runs_setup_after_finalization()
     });
 
     let ok = ledger
-        .set_immutable_and_setup_from_state_map(true, &feature_xrp_fees())
+        .set_immutable_and_setup_from_state_map(true)
         .expect("setup after finalization should decode");
 
     assert!(ok);
@@ -164,7 +164,7 @@ fn ledger_set_immutable_and_setup_from_config_reseeds_presets_and_applies_defaul
                 amendments_key(),
                 encode_amendments_entry(&[feature_xrp_fees(), sample_uint256(0x8C)]),
             ),
-            (fees_key(), encode_fee_settings_entry(44, 55, 66, false)),
+            (fees_key(), encode_fee_settings_entry(44, 55, 66)),
         ],
         false,
         804,
@@ -326,7 +326,7 @@ fn ledger_set_accepted_and_setup_from_state_map_preserves_bool_setup_outcome() {
     let missing_amendments_hash = sample_hash(0xA4);
     let fee_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
-        SHAMapItem::new(fees_key(), encode_fee_settings_entry(10, 20, 30, false)),
+        SHAMapItem::new(fees_key(), encode_fee_settings_entry(10, 20, 30)),
         0,
     );
     let root = SHAMapTreeNode::new_inner(1);
@@ -361,7 +361,7 @@ fn ledger_set_accepted_and_setup_from_state_map_preserves_bool_setup_outcome() {
     ledger.set_rules(original_rules.clone());
 
     let ok = ledger
-        .set_accepted_and_setup_from_state_map(321, 60, false, &feature_xrp_fees())
+        .set_accepted_and_setup_from_state_map(321, 60, false)
         .expect("setup after acceptance should preserve bool failure semantics");
 
     assert!(!ok);

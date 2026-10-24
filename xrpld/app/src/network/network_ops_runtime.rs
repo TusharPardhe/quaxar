@@ -1057,13 +1057,8 @@ pub(crate) fn check_validity_with_router(
 }
 
 fn validity_facts(transaction: &STTx) -> CheckValidityFacts {
-    let txn_signature = get_field_by_symbol("sfTxnSignature");
-    let signers = get_field_by_symbol("sfSigners");
     CheckValidityFacts {
         inner_batch_flag_set: transaction.is_flag(tfInnerBatchTxn),
-        txn_signature_present: transaction.is_field_present(txn_signature),
-        signing_pub_key_empty: transaction.get_signing_pub_key().is_empty(),
-        signers_present: transaction.is_field_present(signers),
         alternate_signature_present: transaction
             .is_field_present(get_field_by_symbol("sfCounterpartySignature"))
             || transaction.is_field_present(get_field_by_symbol("sfSponsorSignature")),

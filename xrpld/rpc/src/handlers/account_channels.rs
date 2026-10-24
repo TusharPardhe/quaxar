@@ -8,6 +8,7 @@
 #![allow(clippy::manual_contains, clippy::question_mark)]
 //! including account-public base58 rendering for `public_key`.
 
+use crate::handlers::owner_dir_marker::is_related_to_account;
 use std::{collections::BTreeMap, sync::Arc};
 
 use basics::base_uint::{Uint160, Uint256};
@@ -130,40 +131,6 @@ fn get_start_hint(sle: &STLedgerEntry, account_id: AccountID) -> u64 {
 
             sle.get_field_u64(get_field_by_symbol("sfOwnerNode"))
         }
-    }
-}
-
-fn is_related_to_account(sle: &STLedgerEntry, account_id: AccountID) -> bool {
-    match sle.get_type() {
-        LedgerEntryType::RippleState => {
-            let ripple_state = RippleState::new(Arc::new(sle.clone()))
-                .expect("RippleState ownership markers should wrap cleanly");
-            ripple_state.get_low_limit().issue().account == account_id
-                || ripple_state.get_high_limit().issue().account == account_id
-        }
-        LedgerEntryType::PayChannel => {
-            let pay_channel = PayChannel::new(Arc::new(sle.clone()))
-                .expect("PayChannel ownership markers should wrap cleanly");
-            pay_channel.get_account() == account_id || pay_channel.get_destination() == account_id
-        }
-        LedgerEntryType::SignerList => {
-            *sle.key()
-                == protocol::signers_keylet(
-                    Uint160::from_slice(account_id.data()).expect("account width"),
-                )
-                .key
-        }
-        LedgerEntryType::NFTokenOffer => {
-            let nft_offer = NFTokenOffer::new(Arc::new(sle.clone()))
-                .expect("NFTokenOffer ownership markers should wrap cleanly");
-            nft_offer.get_owner() == account_id
-        }
-        _ if sle.is_field_present(get_field_by_symbol("sfAccount")) => {
-            sle.get_account_id(get_field_by_symbol("sfAccount")) == account_id
-                || (sle.is_field_present(get_field_by_symbol("sfDestination"))
-                    && sle.get_account_id(get_field_by_symbol("sfDestination")) == account_id)
-        }
-        _ => false,
     }
 }
 
@@ -349,60 +316,32 @@ where
     }
 }
 
-fn parse_marker(
-    source: &impl AccountChannelsSource,
-    ledger: &LedgerLookupLedger,
-    account_id: AccountID,
-    params: &JsonValue,
-) -> Result<(Uint256, u64), JsonValue> {
-    let JsonValue::Object(object) = params else {
-        return Ok((Uint256::zero(), 0));
-    };
-
-    let Some(marker) = object.get("marker") else {
-        return Ok((Uint256::zero(), 0));
-    };
-
-    let JsonValue::String(marker) = marker else {
-        return Err(expected_field_error("marker", "string"));
-    };
-
-    let mut parts = marker.splitn(3, ',');
-    let Some(first) = parts.next() else {
-        return Err(rpc_error(RpcErrorCode::InvalidParams));
-    };
-    let Some(second) = parts.next() else {
-        return Err(rpc_error(RpcErrorCode::InvalidParams));
-    };
-
-    let Ok(after) = Uint256::from_hex(first) else {
-        return Err(rpc_error(RpcErrorCode::InvalidParams));
-    };
-
-    let Ok(hint) = second.parse::<u64>() else {
-        return Err(rpc_error(RpcErrorCode::InvalidParams));
-    };
-
-    let Some(marker_sle) = source.read_ledger_entry(ledger, after) else {
-        return Err(rpc_error(RpcErrorCode::InvalidParams));
-    };
-
-    if !is_related_to_account(&marker_sle, account_id) {
-        return Err(rpc_error(RpcErrorCode::InvalidParams));
-    }
-
-    Ok((after, hint))
-}
-
 pub fn do_account_channels<S: AccountChannelsSource>(
     request: &AccountChannelsRequest<'_>,
     source: &S,
 ) -> JsonValue {
+    if let Err(status) = crate::handlers::ledger_lookup::validate_ledger_selector(request.params) {
+        let mut error = JsonValue::Object(BTreeMap::new());
+        status.inject(&mut error);
+        return error;
+    }
     tracing::trace!(target: "rpc", method = "account_channels", "account_channels query");
     let account_text = match account_string(request.params) {
         Ok(account) => account,
         Err(error) => return error,
     };
+
+    // rippled rpc-spec: limit and marker format are request validation, so
+    // they precede the ledger lookup and actNotFound (#8573).
+    let limit = match read_limit_field(request.params, request.role, Tuning::ACCOUNT_CHANNELS) {
+        Ok(limit) => limit,
+        Err(status) => return json_to_error(status),
+    };
+    let parsed_marker =
+        match crate::handlers::owner_dir_marker::parse_account_marker_param(request.params) {
+            Ok(marker) => marker,
+            Err(error) => return error,
+        };
 
     let context = LedgerLookupContext {
         params: request.params,
@@ -434,16 +373,17 @@ pub fn do_account_channels<S: AccountChannelsSource>(
         },
     };
 
-    let limit = match read_limit_field(request.params, request.role, Tuning::ACCOUNT_CHANNELS) {
-        Ok(limit) => limit,
-        Err(status) => return json_to_error(status),
-    };
-
-    let (start_after, start_hint) = match parse_marker(source, &ledger, account_id, request.params)
-    {
-        Ok(marker) => marker,
-        Err(error) => return error,
-    };
+    let (start_after, start_hint) = parsed_marker.unwrap_or((Uint256::zero(), 0));
+    if parsed_marker.is_some() {
+        let Some(marker_sle) = source.read_ledger_entry(&ledger, start_after) else {
+            return rpc_error(RpcErrorCode::InvalidParams);
+        };
+        if !is_related_to_account(&marker_sle, |page| {
+            source.read_owner_dir_page(&ledger, account_id, page)
+        }) {
+            return rpc_error(RpcErrorCode::InvalidParams);
+        }
+    }
 
     let mut count = 0u32;
     let mut marker: Option<Uint256> = None;

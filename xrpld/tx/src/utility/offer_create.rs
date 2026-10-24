@@ -207,17 +207,13 @@ where
         )
     };
 
-    // Fill-or-kill: failure to fully cross aborts with only fees paid. Under
-    // fixFillOrKill a tfSell FOK checks that all takerGets were delivered
-    // (output side) rather than that all takerPays were consumed, matching
-    // rippled OfferCreate.cpp.
-    let fix_fill_or_kill = ctx
-        .view()
-        .rules()
-        .enabled(&protocol::feature_id("fixFillOrKill"));
+    // Fill-or-kill: failure to fully cross aborts with only fees paid. A
+    // tfSell FOK checks that all takerGets were delivered (output side)
+    // rather than that all takerPays were consumed, matching rippled
+    // OfferCreate.cpp (fixFillOrKill retired in rippled #7366).
     let is_sell = (flags & TF_SELL) != 0;
     if (flags & TF_FILL_OR_KILL) != 0 {
-        let not_fully_filled = if fix_fill_or_kill && is_sell {
+        let not_fully_filled = if is_sell {
             remaining_gets.signum() > 0
         } else {
             remaining_pays.signum() > 0

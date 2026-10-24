@@ -60,7 +60,6 @@ fn constructor_item_helpers_preserve_current_key_and_payload_shapes() {
         10,
         20,
         30,
-        &[feature_xrp_fees()],
     ));
 
     let items = constructor_ledger_items(&[account_root.clone(), amendments.clone(), fees.clone()]);

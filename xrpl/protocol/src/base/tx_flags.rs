@@ -170,9 +170,6 @@ pub const AMM_WITHDRAW_FLAGS_MASK: FlagValue = transaction_flags_mask(AMM_WITHDR
 pub const AMM_CLAWBACK_TWO_ASSETS_FLAG: FlagValue = 0x0000_0001;
 pub const AMM_CLAWBACK_FLAGS_MASK: FlagValue = transaction_flags_mask(AMM_CLAWBACK_TWO_ASSETS_FLAG);
 
-pub const XCHAIN_MODIFY_BRIDGE_CLEAR_ACCOUNT_CREATE_AMOUNT_FLAG: FlagValue = 0x0001_0000;
-pub const XCHAIN_MODIFY_BRIDGE_FLAGS_MASK: FlagValue =
-    transaction_flags_mask(XCHAIN_MODIFY_BRIDGE_CLEAR_ACCOUNT_CREATE_AMOUNT_FLAG);
 
 pub const VAULT_PRIVATE_FLAG: FlagValue = 0x0001_0000;
 pub const VAULT_SHARE_NON_TRANSFERABLE_FLAG: FlagValue = 0x0002_0000;
@@ -412,8 +409,6 @@ alias_consts!(
     (AMM_WITHDRAW_FLAGS_MASK => tfAMMWithdrawMask),
     (AMM_CLAWBACK_TWO_ASSETS_FLAG => tfClawTwoAssets),
     (AMM_CLAWBACK_FLAGS_MASK => tfAMMClawbackMask),
-    (XCHAIN_MODIFY_BRIDGE_CLEAR_ACCOUNT_CREATE_AMOUNT_FLAG => tfClearAccountCreateAmount),
-    (XCHAIN_MODIFY_BRIDGE_FLAGS_MASK => tfXChainModifyBridgeMask),
     (VAULT_PRIVATE_FLAG => tfVaultPrivate),
     (VAULT_SHARE_NON_TRANSFERABLE_FLAG => tfVaultShareNonTransferable),
     (VAULT_CREATE_FLAGS_MASK => tfVaultCreateMask),
@@ -666,13 +661,6 @@ pub fn get_amm_clawback_flags() -> &'static FlagMap {
     FLAGS.get_or_init(|| make_flag_map(&[("tfClawTwoAssets", tfClawTwoAssets)]))
 }
 
-pub fn get_xchain_modify_bridge_flags() -> &'static FlagMap {
-    static FLAGS: OnceLock<FlagMap> = OnceLock::new();
-    FLAGS.get_or_init(|| {
-        make_flag_map(&[("tfClearAccountCreateAmount", tfClearAccountCreateAmount)])
-    })
-}
-
 pub fn get_vault_create_flags() -> &'static FlagMap {
     static FLAGS: OnceLock<FlagMap> = OnceLock::new();
     FLAGS.get_or_init(|| {
@@ -725,6 +713,30 @@ pub fn get_loan_manage_flags() -> &'static FlagMap {
 pub fn get_loan_broker_set_flags() -> &'static FlagMap {
     static FLAGS: OnceLock<FlagMap> = OnceLock::new();
     FLAGS.get_or_init(|| make_flag_map(&[("tfLoanBrokerPrivate", tfLoanBrokerPrivate)]))
+}
+
+pub fn get_sponsorship_set_flags() -> &'static FlagMap {
+    static FLAGS: OnceLock<FlagMap> = OnceLock::new();
+    FLAGS.get_or_init(|| {
+        make_flag_map(&[
+            ("tfSponsorshipSetRequireSignForFee", tfSponsorshipSetRequireSignForFee),
+            ("tfSponsorshipClearRequireSignForFee", tfSponsorshipClearRequireSignForFee),
+            ("tfSponsorshipSetRequireSignForReserve", tfSponsorshipSetRequireSignForReserve),
+            ("tfSponsorshipClearRequireSignForReserve", tfSponsorshipClearRequireSignForReserve),
+            ("tfDeleteObject", tfDeleteObject),
+        ])
+    })
+}
+
+pub fn get_sponsorship_transfer_flags() -> &'static FlagMap {
+    static FLAGS: OnceLock<FlagMap> = OnceLock::new();
+    FLAGS.get_or_init(|| {
+        make_flag_map(&[
+            ("tfSponsorshipEnd", tfSponsorshipEnd),
+            ("tfSponsorshipCreate", tfSponsorshipCreate),
+            ("tfSponsorshipReassign", tfSponsorshipReassign),
+        ])
+    })
 }
 
 pub fn get_asf_flag_map() -> &'static FlagMap {
@@ -791,16 +803,20 @@ pub fn get_all_tx_flags() -> &'static FlagMapPairList {
             ("AMMDeposit".to_string(), get_amm_deposit_flags().clone()),
             ("AMMWithdraw".to_string(), get_amm_withdraw_flags().clone()),
             ("AMMClawback".to_string(), get_amm_clawback_flags().clone()),
-            (
-                "XChainModifyBridge".to_string(),
-                get_xchain_modify_bridge_flags().clone(),
-            ),
             ("VaultCreate".to_string(), get_vault_create_flags().clone()),
             ("Batch".to_string(), get_batch_flags().clone()),
             ("LoanSet".to_string(), get_loan_set_flags().clone()),
             ("LoanPay".to_string(), get_loan_pay_flags().clone()),
             ("LoanManage".to_string(), get_loan_manage_flags().clone()),
             ("LoanBrokerSet".to_string(), get_loan_broker_set_flags().clone()),
+            (
+                "SponsorshipSet".to_string(),
+                get_sponsorship_set_flags().clone(),
+            ),
+            (
+                "SponsorshipTransfer".to_string(),
+                get_sponsorship_transfer_flags().clone(),
+            ),
         ]
     })
 }
@@ -827,7 +843,6 @@ pub use self::get_payment_flags as getPaymentFlags;
 pub use self::get_trust_set_flags as getTrustSetFlags;
 pub use self::get_universal_flags as getUniversalFlags;
 pub use self::get_vault_create_flags as getVaultCreateFlags;
-pub use self::get_xchain_modify_bridge_flags as getXChainModifyBridgeFlags;
 
 pub const fn transaction_flags_mask(transaction_flags: FlagValue) -> FlagValue {
     !(UNIVERSAL_TRANSACTION_FLAGS | transaction_flags)
@@ -1043,16 +1058,19 @@ mod tests {
                 "AMMDeposit",
                 "AMMWithdraw",
                 "AMMClawback",
-                "XChainModifyBridge",
                 "VaultCreate",
                 "Batch",
                 "LoanSet",
                 "LoanPay",
                 "LoanManage",
                 "LoanBrokerSet",
+                "SponsorshipSet",
+                "SponsorshipTransfer",
             ]
         );
-        assert_eq!(all.len(), 22);
+        // "universal" plus rippled's 23 maps, less ConfidentialMPTHolderKeyUpdate
+        // (#8266, not ported).
+        assert_eq!(all.len(), 23);
         assert_eq!(
             all[1].1.get("tfRequireDestTag"),
             Some(&ACCOUNT_SET_REQUIRE_DEST_TAG_FLAG)
@@ -1062,7 +1080,7 @@ mod tests {
             Some(&PAYMENT_PARTIAL_PAYMENT_FLAG)
         );
         assert_eq!(
-            all[17].1.get("tfAllOrNothing"),
+            all[16].1.get("tfAllOrNothing"),
             Some(&BATCH_ALL_OR_NOTHING_FLAG)
         );
     }

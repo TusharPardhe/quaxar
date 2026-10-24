@@ -19,7 +19,7 @@
 //! no comparisons. Free (untemplated) objects sort their few fields.
 //!
 //! Types without a dedicated writer (e.g. `STNumber`, `STPathSet`,
-//! `STXChainBridge`) fall back to `json()` for that field only.
+//!) fall back to `json()` for that field only.
 
 use crate::keylet::ledger_entry_type_from_code;
 use crate::ter::trans_token;

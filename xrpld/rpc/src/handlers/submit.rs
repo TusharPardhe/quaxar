@@ -38,7 +38,7 @@ mod tests {
     };
     use ledger::RawView;
     use protocol::{
-        AccountID, Permission, Rules, STAmount, STArray, STObject, STTx, STXChainBridge, Ter,
+        AccountID, Permission, Rules, STAmount, STArray, STObject, STTx, Ter,
         TxType, get_field_by_symbol,
     };
     use std::cell::RefCell;
@@ -468,60 +468,6 @@ mod tests {
     }
 
     #[test]
-    fn xchain_create_bridge_nondoor_owner_maps_to_tem_xchain_bridge_nondoor_owner() {
-        let source = account(0x54);
-        let locking_door = account(0x55);
-        let issuing_door = account(0x56);
-        let bridge = STXChainBridge::from_parts(
-            locking_door,
-            protocol::xrp_issue(),
-            issuing_door,
-            protocol::xrp_issue(),
-        );
-        let tx = STTx::new(TxType::XCHAIN_CREATE_BRIDGE, |object| {
-            object.set_account_id(get_field_by_symbol("sfAccount"), source);
-            object.set_field_xchain_bridge(get_field_by_symbol("sfXChainBridge"), bridge);
-            object.set_field_amount(
-                get_field_by_symbol("sfSignatureReward"),
-                STAmount::new_native(10, false),
-            );
-            object.set_field_amount(
-                get_field_by_symbol("sfFee"),
-                STAmount::new_native(10, false),
-            );
-        });
-
-        assert_eq!(
-            submit_semantic_preflight(&tx, &rules_with_tx_enabled(TxType::XCHAIN_CREATE_BRIDGE)),
-            Ter::TEM_XCHAIN_BRIDGE_NONDOOR_OWNER
-        );
-    }
-
-    #[test]
-    fn xchain_modify_bridge_without_updates_maps_to_tem_malformed_like_reference() {
-        let source = account(0x57);
-        let bridge = STXChainBridge::from_parts(
-            source,
-            protocol::xrp_issue(),
-            account(0x58),
-            protocol::xrp_issue(),
-        );
-        let tx = STTx::new(TxType::XCHAIN_MODIFY_BRIDGE, |object| {
-            object.set_account_id(get_field_by_symbol("sfAccount"), source);
-            object.set_field_xchain_bridge(get_field_by_symbol("sfXChainBridge"), bridge);
-            object.set_field_amount(
-                get_field_by_symbol("sfFee"),
-                STAmount::new_native(10, false),
-            );
-        });
-
-        assert_eq!(
-            submit_semantic_preflight(&tx, &rules_with_tx_enabled(TxType::XCHAIN_MODIFY_BRIDGE)),
-            Ter::TEM_MALFORMED
-        );
-    }
-
-    #[test]
     fn nftoken_create_offer_without_sell_flag_or_owner_maps_to_tem_malformed() {
         let source = account(0x59);
         let tx = STTx::new(TxType::NFTOKEN_CREATE_OFFER, |object| {
@@ -541,7 +487,7 @@ mod tests {
         });
 
         assert_eq!(
-            submit_semantic_preflight(&tx, &rules_with_tx_enabled(TxType::XCHAIN_CREATE_CLAIM_ID)),
+            submit_semantic_preflight(&tx, &rules_with_tx_enabled(TxType::NFTOKEN_CREATE_OFFER)),
             Ter::TEM_MALFORMED
         );
     }
@@ -566,111 +512,8 @@ mod tests {
         });
 
         assert_eq!(
-            submit_semantic_preflight(&tx, &rules_with_tx_enabled(TxType::XCHAIN_COMMIT)),
+            submit_semantic_preflight(&tx, &rules_with_tx_enabled(TxType::NFTOKEN_CREATE_OFFER)),
             Ter::TEM_BAD_AMOUNT
-        );
-    }
-
-    #[test]
-    fn xchain_create_claim_id_negative_reward_maps_to_tem_xchain_bridge_bad_reward_amount() {
-        let source = account(0x5B);
-        let bridge = STXChainBridge::from_parts(
-            source,
-            protocol::xrp_issue(),
-            account(0x5C),
-            protocol::xrp_issue(),
-        );
-        let tx = STTx::new(TxType::XCHAIN_CREATE_CLAIM_ID, |object| {
-            object.set_account_id(get_field_by_symbol("sfAccount"), source);
-            object.set_field_xchain_bridge(get_field_by_symbol("sfXChainBridge"), bridge);
-            object.set_field_amount(
-                get_field_by_symbol("sfSignatureReward"),
-                STAmount::new_native(1, true),
-            );
-            object.set_field_amount(
-                get_field_by_symbol("sfFee"),
-                STAmount::new_native(10, false),
-            );
-        });
-
-        assert_eq!(
-            submit_semantic_preflight(
-                &tx,
-                &rules_with_tx_enabled(TxType::XCHAIN_ADD_CLAIM_ATTESTATION)
-            ),
-            Ter::TEM_XCHAIN_BRIDGE_BAD_REWARD_AMOUNT
-        );
-    }
-
-    #[test]
-    fn xchain_commit_negative_amount_maps_to_tem_bad_amount() {
-        let source = account(0x5D);
-        let bridge = STXChainBridge::from_parts(
-            source,
-            protocol::xrp_issue(),
-            account(0x5E),
-            protocol::xrp_issue(),
-        );
-        let tx = STTx::new(TxType::XCHAIN_COMMIT, |object| {
-            object.set_account_id(get_field_by_symbol("sfAccount"), source);
-            object.set_field_xchain_bridge(get_field_by_symbol("sfXChainBridge"), bridge);
-            object.set_field_amount(
-                get_field_by_symbol("sfAmount"),
-                STAmount::new_native(1, true),
-            );
-            object.set_field_amount(
-                get_field_by_symbol("sfFee"),
-                STAmount::new_native(10, false),
-            );
-        });
-
-        assert_eq!(
-            submit_semantic_preflight(&tx, &rules_with_tx_enabled(TxType::XCHAIN_COMMIT)),
-            Ter::TEM_BAD_AMOUNT
-        );
-    }
-
-    #[test]
-    fn xchain_add_claim_attestation_invalid_public_key_maps_to_tem_xchain_bad_proof() {
-        let source = account(0x5F);
-        let bridge = STXChainBridge::from_parts(
-            account(0x60),
-            protocol::xrp_issue(),
-            account(0x61),
-            protocol::xrp_issue(),
-        );
-        let tx = STTx::new(TxType::XCHAIN_ADD_CLAIM_ATTESTATION, |object| {
-            object.set_account_id(get_field_by_symbol("sfAccount"), source);
-            object.set_field_xchain_bridge(get_field_by_symbol("sfXChainBridge"), bridge);
-            object.set_account_id(
-                get_field_by_symbol("sfAttestationSignerAccount"),
-                account(0x62),
-            );
-            object.set_field_vl(get_field_by_symbol("sfPublicKey"), &[]);
-            object.set_field_vl(get_field_by_symbol("sfSignature"), &[0x01, 0x02]);
-            object.set_account_id(get_field_by_symbol("sfOtherChainSource"), account(0x63));
-            object.set_field_amount(
-                get_field_by_symbol("sfAmount"),
-                STAmount::new_native(10, false),
-            );
-            object.set_account_id(
-                get_field_by_symbol("sfAttestationRewardAccount"),
-                account(0x64),
-            );
-            object.set_field_u8(get_field_by_symbol("sfWasLockingChainSend"), 1);
-            object.set_field_u64(get_field_by_symbol("sfXChainClaimID"), 1);
-            object.set_field_amount(
-                get_field_by_symbol("sfFee"),
-                STAmount::new_native(10, false),
-            );
-        });
-
-        assert_eq!(
-            submit_semantic_preflight(
-                &tx,
-                &rules_with_tx_enabled(TxType::XCHAIN_ADD_CLAIM_ATTESTATION)
-            ),
-            Ter::TEM_XCHAIN_BAD_PROOF
         );
     }
 
@@ -883,14 +726,13 @@ use ledger::Ledger;
 use protocol::ter::trans_human;
 use protocol::{
     AccountID, Asset, CurrentTransactionRulesGuard, JsonOptions, JsonValue, Keylet,
-    LedgerEntryType, Permission, Rules, STLedgerEntry, STTx, STXChainBridge, Ter, TxType,
-    XRPAmount, account_keylet, bridge_keylet_from_door_issue, check_keylet_from_key,
+    LedgerEntryType, Permission, Rules, STLedgerEntry, STTx, Ter, TxType,
+    XRPAmount, account_keylet, check_keylet_from_key,
     deposit_preauth_keylet, did_keylet, escrow_keylet, feature_amm, feature_id,
     feature_single_asset_vault, get_field_by_symbol, is_tec_claim, is_tes_success, jss, line,
     mpt_issuance_keylet_from_mptid, mptoken_keylet_from_mptid, oracle_keylet,
     pay_channel_keylet_from_key, permissioned_domain_keylet_from_id, trans_token,
-    vault_keylet_from_key, xchain_owned_claim_id_keylet_from_bridge,
-};
+    vault_keylet_from_key, };
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -1025,53 +867,8 @@ fn escrow_keylet_for(source: AccountID, sequence: u32) -> Keylet {
     escrow_keylet(account_to_uint160(source), sequence)
 }
 
-fn ledger_bridge_exists(ledger: &Ledger, bridge: &tx::XChainBridgeSpec) -> bool {
-    ledger_keylet_exists(
-        ledger,
-        bridge_keylet_from_door_issue(
-            account_to_uint160(bridge.locking_chain_door),
-            bridge.locking_chain_issue,
-        ),
-    ) || ledger_keylet_exists(
-        ledger,
-        bridge_keylet_from_door_issue(
-            account_to_uint160(bridge.issuing_chain_door),
-            bridge.issuing_chain_issue,
-        ),
-    )
-}
 
-fn ledger_claim_id_exists(ledger: &Ledger, bridge: &tx::XChainBridgeSpec, claim_id: u64) -> bool {
-    ledger_keylet_exists(
-        ledger,
-        xchain_owned_claim_id_keylet_from_bridge(
-            account_to_uint160(bridge.locking_chain_door),
-            bridge.locking_chain_issue,
-            account_to_uint160(bridge.issuing_chain_door),
-            bridge.issuing_chain_issue,
-            claim_id,
-        ),
-    )
-}
 
-fn ledger_bridge_entry(ledger: &Ledger, bridge: &tx::XChainBridgeSpec) -> Option<STLedgerEntry> {
-    ledger_read_keylet(
-        ledger,
-        bridge_keylet_from_door_issue(
-            account_to_uint160(bridge.locking_chain_door),
-            bridge.locking_chain_issue,
-        ),
-    )
-    .or_else(|| {
-        ledger_read_keylet(
-            ledger,
-            bridge_keylet_from_door_issue(
-                account_to_uint160(bridge.issuing_chain_door),
-                bridge.issuing_chain_issue,
-            ),
-        )
-    })
-}
 
 fn tx_required_feature(tx_type: TxType) -> Option<basics::base_uint::Uint256> {
     Permission::get_instance().get_tx_feature(tx_type)
@@ -1163,94 +960,8 @@ fn parse_signer_list_set_entries(
     Ok(parsed_entries)
 }
 
-fn parse_xchain_bridge_spec(st_tx: &STTx) -> Result<tx::XChainBridgeSpec, Ter> {
-    let bridge_field = get_field_by_symbol("sfXChainBridge");
-    if !st_tx.is_field_present(bridge_field) {
-        return Err(Ter::TEM_MALFORMED);
-    }
 
-    let bridge = st_tx.get_field_xchain_bridge(bridge_field);
-    let locking_issue = match bridge.locking_chain_issue() {
-        protocol::Asset::Issue(issue) => issue,
-        _ => return Err(Ter::TEM_MALFORMED),
-    };
-    let issuing_issue = match bridge.issuing_chain_issue() {
-        protocol::Asset::Issue(issue) => issue,
-        _ => return Err(Ter::TEM_MALFORMED),
-    };
 
-    Ok(tx::XChainBridgeSpec {
-        locking_chain_door: bridge.locking_chain_door(),
-        locking_chain_issue: locking_issue,
-        issuing_chain_door: bridge.issuing_chain_door(),
-        issuing_chain_issue: issuing_issue,
-    })
-}
-
-fn xchain_add_claim_attestation_preflight(st_tx: &STTx) -> Ter {
-    let bridge_field = get_field_by_symbol("sfXChainBridge");
-    if !st_tx.is_field_present(bridge_field) {
-        return Ter::TEM_MALFORMED;
-    }
-
-    let public_key_field = get_field_by_symbol("sfPublicKey");
-    if protocol::PublicKey::from_slice(&st_tx.get_field_vl(public_key_field)).is_err() {
-        return Ter::TEM_XCHAIN_BAD_PROOF;
-    }
-
-    let bridge = st_tx.get_field_xchain_bridge(bridge_field);
-    let attestation = protocol::attestations::AttestationClaim::from_transaction_st_object(st_tx);
-    if !attestation.valid_amounts() || !attestation.verify(&bridge) {
-        return Ter::TEM_XCHAIN_BAD_PROOF;
-    }
-    if attestation.base.sending_amount.signum() <= 0 {
-        return Ter::TEM_XCHAIN_BAD_PROOF;
-    }
-    let expected_issue = match bridge.issue(STXChainBridge::src_chain(
-        attestation.base.was_locking_chain_send,
-    )) {
-        Asset::Issue(issue) => issue,
-        Asset::MPTIssue(_) => return Ter::TEM_XCHAIN_BAD_PROOF,
-    };
-    if attestation.base.sending_amount.issue() != expected_issue {
-        return Ter::TEM_XCHAIN_BAD_PROOF;
-    }
-
-    Ter::TES_SUCCESS
-}
-
-fn xchain_add_account_create_attestation_preflight(st_tx: &STTx) -> Ter {
-    let bridge_field = get_field_by_symbol("sfXChainBridge");
-    if !st_tx.is_field_present(bridge_field) {
-        return Ter::TEM_MALFORMED;
-    }
-
-    let public_key_field = get_field_by_symbol("sfPublicKey");
-    if protocol::PublicKey::from_slice(&st_tx.get_field_vl(public_key_field)).is_err() {
-        return Ter::TEM_XCHAIN_BAD_PROOF;
-    }
-
-    let bridge = st_tx.get_field_xchain_bridge(bridge_field);
-    let attestation =
-        protocol::attestations::AttestationCreateAccount::from_transaction_st_object(st_tx);
-    if !attestation.valid_amounts() || !attestation.verify(&bridge) {
-        return Ter::TEM_XCHAIN_BAD_PROOF;
-    }
-    if attestation.base.sending_amount.signum() <= 0 {
-        return Ter::TEM_XCHAIN_BAD_PROOF;
-    }
-    let expected_issue = match bridge.issue(STXChainBridge::src_chain(
-        attestation.base.was_locking_chain_send,
-    )) {
-        Asset::Issue(issue) => issue,
-        Asset::MPTIssue(_) => return Ter::TEM_XCHAIN_BAD_PROOF,
-    };
-    if attestation.base.sending_amount.issue() != expected_issue {
-        return Ter::TEM_XCHAIN_BAD_PROOF;
-    }
-
-    Ter::TES_SUCCESS
-}
 
 #[cfg(test)]
 fn submit_semantic_preflight(st_tx: &STTx, rules: &Rules) -> Ter {
@@ -1889,216 +1600,6 @@ fn submit_semantic_preflight_with_ledger(
                 mpt_amount_exceeds_max: false,
             })
         }
-        TxType::XCHAIN_CREATE_BRIDGE => {
-            let signature_reward_field = get_field_by_symbol("sfSignatureReward");
-            if !st_tx.is_field_present(signature_reward_field) {
-                return Ter::TEM_MALFORMED;
-            }
-
-            let Ok(bridge) = parse_xchain_bridge_spec(st_tx) else {
-                return Ter::TEM_MALFORMED;
-            };
-            let min_account_create_field = get_field_by_symbol("sfMinAccountCreateAmount");
-            tx::run_xchain_create_bridge_preflight(tx::XChainCreateBridgePreflightFacts {
-                account: st_tx.get_account_id(get_field_by_symbol("sfAccount")),
-                reward: st_tx.get_field_amount(signature_reward_field),
-                min_account_create: st_tx
-                    .is_field_present(min_account_create_field)
-                    .then(|| st_tx.get_field_amount(min_account_create_field)),
-                bridge,
-            })
-        }
-        TxType::XCHAIN_MODIFY_BRIDGE => {
-            let Ok(bridge) = parse_xchain_bridge_spec(st_tx) else {
-                return Ter::TEM_MALFORMED;
-            };
-            let signature_reward_field = get_field_by_symbol("sfSignatureReward");
-            let min_account_create_field = get_field_by_symbol("sfMinAccountCreateAmount");
-            tx::run_xchain_modify_bridge_preflight(tx::XChainModifyBridgePreflightFacts {
-                account: st_tx.get_account_id(get_field_by_symbol("sfAccount")),
-                reward: st_tx
-                    .is_field_present(signature_reward_field)
-                    .then(|| st_tx.get_field_amount(signature_reward_field)),
-                min_account_create: st_tx
-                    .is_field_present(min_account_create_field)
-                    .then(|| st_tx.get_field_amount(min_account_create_field)),
-                clear_account_create: st_tx
-                    .is_flag(protocol::XCHAIN_MODIFY_BRIDGE_CLEAR_ACCOUNT_CREATE_AMOUNT_FLAG),
-                bridge,
-            })
-        }
-        TxType::XCHAIN_CREATE_CLAIM_ID => {
-            let reward_field = get_field_by_symbol("sfSignatureReward");
-            if !st_tx.is_field_present(reward_field) {
-                return Ter::TEM_MALFORMED;
-            }
-
-            let reward = st_tx.get_field_amount(reward_field);
-            if !reward.native() || reward.signum() <= 0 || !reward.is_legal_net() {
-                return Ter::TEM_XCHAIN_BRIDGE_BAD_REWARD_AMOUNT;
-            }
-
-            if let Some(ledger) = ledger {
-                let Ok(bridge) = parse_xchain_bridge_spec(st_tx) else {
-                    return Ter::TEM_MALFORMED;
-                };
-                if !ledger_bridge_exists(ledger, &bridge) {
-                    return Ter::TEC_NO_ENTRY;
-                }
-            }
-
-            Ter::TES_SUCCESS
-        }
-        TxType::XCHAIN_COMMIT => {
-            let amount_field = get_field_by_symbol("sfAmount");
-            if !st_tx.is_field_present(amount_field) {
-                return Ter::TEM_MALFORMED;
-            }
-
-            let amount = st_tx.get_field_amount(amount_field);
-            if amount.signum() <= 0 || !amount.is_legal_net() {
-                return Ter::TEM_BAD_AMOUNT;
-            }
-            let Ok(bridge) = parse_xchain_bridge_spec(st_tx) else {
-                return Ter::TEM_MALFORMED;
-            };
-            if amount.asset() != Asset::Issue(bridge.locking_chain_issue)
-                && amount.asset() != Asset::Issue(bridge.issuing_chain_issue)
-            {
-                return Ter::TEM_BAD_ISSUER;
-            }
-
-            if let Some(ledger) = ledger {
-                let Some(sle_bridge) = ledger_bridge_entry(ledger, &bridge) else {
-                    return Ter::TEC_NO_ENTRY;
-                };
-                let this_door = sle_bridge.get_account_id(get_field_by_symbol("sfAccount"));
-                let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
-                if this_door == account {
-                    return Ter::TEC_XCHAIN_SELF_COMMIT;
-                }
-
-                let expected_issue = if this_door == bridge.locking_chain_door {
-                    bridge.locking_chain_issue
-                } else if this_door == bridge.issuing_chain_door {
-                    bridge.issuing_chain_issue
-                } else {
-                    return Ter::TEC_INTERNAL;
-                };
-                if amount.issue() != expected_issue {
-                    return Ter::TEC_XCHAIN_BAD_TRANSFER_ISSUE;
-                }
-            }
-
-            Ter::TES_SUCCESS
-        }
-        TxType::XCHAIN_CLAIM => {
-            let amount_field = get_field_by_symbol("sfAmount");
-            if !st_tx.is_field_present(amount_field) {
-                return Ter::TEM_MALFORMED;
-            }
-
-            let amount = st_tx.get_field_amount(amount_field);
-            if amount.signum() <= 0 || !amount.is_legal_net() {
-                return Ter::TEM_BAD_AMOUNT;
-            }
-
-            if let Some(ledger) = ledger {
-                let Ok(bridge) = parse_xchain_bridge_spec(st_tx) else {
-                    return Ter::TEM_MALFORMED;
-                };
-                if !ledger_bridge_exists(ledger, &bridge) {
-                    return Ter::TEC_NO_ENTRY;
-                }
-                let claim_id_field = get_field_by_symbol("sfXChainClaimID");
-                if !st_tx.is_field_present(claim_id_field) {
-                    return Ter::TEM_MALFORMED;
-                }
-                if !ledger_claim_id_exists(ledger, &bridge, st_tx.get_field_u64(claim_id_field)) {
-                    return Ter::TEC_NO_ENTRY;
-                }
-            }
-
-            Ter::TES_SUCCESS
-        }
-        TxType::XCHAIN_ACCOUNT_CREATE_COMMIT => {
-            let amount_field = get_field_by_symbol("sfAmount");
-            let reward_field = get_field_by_symbol("sfSignatureReward");
-            if !st_tx.is_field_present(amount_field) || !st_tx.is_field_present(reward_field) {
-                return Ter::TEM_MALFORMED;
-            }
-
-            let amount = st_tx.get_field_amount(amount_field);
-            if amount.signum() <= 0 || !amount.is_legal_net() {
-                return Ter::TEM_BAD_AMOUNT;
-            }
-
-            let reward = st_tx.get_field_amount(reward_field);
-            if reward.signum() < 0 || !reward.is_legal_net() {
-                return Ter::TEM_BAD_AMOUNT;
-            }
-            if reward.asset() != amount.asset() {
-                return Ter::TEM_BAD_AMOUNT;
-            }
-            let Ok(bridge) = parse_xchain_bridge_spec(st_tx) else {
-                return Ter::TEM_MALFORMED;
-            };
-
-            if let Some(ledger) = ledger {
-                let Some(sle_bridge) = ledger_bridge_entry(ledger, &bridge) else {
-                    return Ter::TEC_NO_ENTRY;
-                };
-                if reward != sle_bridge.get_field_amount(get_field_by_symbol("sfSignatureReward")) {
-                    return Ter::TEC_XCHAIN_REWARD_MISMATCH;
-                }
-
-                let min_account_create_field = get_field_by_symbol("sfMinAccountCreateAmount");
-                if !sle_bridge.is_field_present(min_account_create_field) {
-                    return Ter::TEC_XCHAIN_CREATE_ACCOUNT_DISABLED;
-                }
-                let min_account_create = sle_bridge.get_field_amount(min_account_create_field);
-                if amount < min_account_create {
-                    return Ter::TEC_XCHAIN_INSUFF_CREATE_AMOUNT;
-                }
-                if min_account_create.asset() != amount.asset() {
-                    return Ter::TEC_XCHAIN_BAD_TRANSFER_ISSUE;
-                }
-
-                let this_door = sle_bridge.get_account_id(get_field_by_symbol("sfAccount"));
-                let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
-                if this_door == account {
-                    return Ter::TEC_XCHAIN_SELF_COMMIT;
-                }
-
-                let expected_issue = if this_door == bridge.locking_chain_door {
-                    bridge.locking_chain_issue
-                } else if this_door == bridge.issuing_chain_door {
-                    bridge.issuing_chain_issue
-                } else {
-                    return Ter::TEC_INTERNAL;
-                };
-                if amount.issue() != expected_issue {
-                    return Ter::TEC_XCHAIN_BAD_TRANSFER_ISSUE;
-                }
-
-                let dst_issue = if this_door == bridge.locking_chain_door {
-                    bridge.issuing_chain_issue
-                } else if this_door == bridge.issuing_chain_door {
-                    bridge.locking_chain_issue
-                } else {
-                    return Ter::TEC_INTERNAL;
-                };
-                if !dst_issue.native() {
-                    return Ter::TEC_XCHAIN_CREATE_ACCOUNT_NONXRP_ISSUE;
-                }
-            }
-
-            Ter::TES_SUCCESS
-        }
-        TxType::XCHAIN_ADD_CLAIM_ATTESTATION => xchain_add_claim_attestation_preflight(st_tx),
-        TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION => {
-            xchain_add_account_create_attestation_preflight(st_tx)
-        }
         TxType::ORACLE_SET => {
             let price_data_series_field = get_field_by_symbol("sfPriceDataSeries");
             let provider_field = get_field_by_symbol("sfProvider");
@@ -2315,6 +1816,10 @@ fn submit_semantic_preflight_with_ledger(
                 is_private: st_tx.is_flag(protocol::tfVaultPrivate),
                 assets_maximum_is_negative: st_tx.is_field_present(assets_maximum_field)
                     && st_tx.get_field_amount(assets_maximum_field).negative(),
+                assets_maximum_out_of_range: rules
+                    .enabled(&protocol::feature_id("fixCleanup3_5_0"))
+                    && st_tx.is_field_present(assets_maximum_field)
+                    && !asset.is_representable(st_tx.get_field_number(assets_maximum_field).value()),
                 mptoken_metadata_len: st_tx
                     .is_field_present(mptoken_metadata_field)
                     .then(|| st_tx.get_field_vl(mptoken_metadata_field).len()),

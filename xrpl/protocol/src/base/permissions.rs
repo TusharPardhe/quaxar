@@ -312,7 +312,6 @@ fn amendment_string_to_feature(raw: &str) -> Option<Uint256> {
         "featurePermissionedDomains" => "PermissionedDomains",
         "featurePriceOracle" => "PriceOracle",
         "featureSingleAssetVault" => "SingleAssetVault",
-        "featureXChainBridge" => "XChainBridge",
         "fixNFTokenPageLinks" => "fixNFTokenPageLinks",
         other => other.strip_prefix("feature").unwrap_or(other),
     };
@@ -323,7 +322,7 @@ fn amendment_string_to_feature(raw: &str) -> Option<Uint256> {
 #[cfg(test)]
 mod tests {
     use super::{GranularPermissionType, Permission};
-    use crate::{Rules, STTx, TxType, feature_xchain_bridge, get_field_by_symbol, tfSetFreeze};
+    use crate::{Rules, STTx, TxType, get_field_by_symbol, tfSetFreeze};
 
     #[test]
     fn permissions_map_granular_and_tx_level_names() {
@@ -342,10 +341,10 @@ mod tests {
     #[test]
     fn delegability_honors_required_amendments() {
         let permission = Permission::get_instance();
-        let value = Permission::tx_to_permission_type(TxType::XCHAIN_COMMIT);
+        let value = Permission::tx_to_permission_type(TxType::DID_SET);
 
         assert!(!permission.is_delegable(value, &Rules::new(std::iter::empty())));
-        assert!(permission.is_delegable(value, &Rules::new([feature_xchain_bridge()])));
+        assert!(permission.is_delegable(value, &Rules::new([crate::feature_id("DID")])));
     }
 
     #[test]

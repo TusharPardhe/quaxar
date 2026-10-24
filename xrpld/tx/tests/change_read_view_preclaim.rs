@@ -125,12 +125,12 @@ fn fee_preclaim_preserves_legacy_and_xrp_fee_field_ordering() {
 
     assert_eq!(
         run_change_read_view_preclaim(&legacy_view, &missing_legacy_with_xrp_fields, TxType::FEE,),
-        Some(Ter::TEM_MALFORMED),
-        "legacy required fields fail before forbidden XRP fields"
+        Some(Ter::TES_SUCCESS),
+        "rippled #7349: the drops shape is valid whatever the ledger rules"
     );
     assert_eq!(
         run_change_read_view_preclaim(&legacy_view, &legacy_with_xrp_field, TxType::FEE),
-        Some(Ter::TEM_DISABLED)
+        Some(Ter::TEM_MALFORMED)
     );
     assert_eq!(
         run_change_read_view_preclaim(&xrp_view, &xrp_with_legacy_field, TxType::FEE),

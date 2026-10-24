@@ -17872,7 +17872,6 @@ fn loan_pay_base_fee_uses_loan_scale_and_upward_periodic_rounding() {
     let mut ledger = empty_ledger(vec![loan, broker, vault]);
     ledger.set_rules(protocol::Rules::new([
         protocol::feature_id("LendingProtocol"),
-        protocol::feature_id("fixSecurity3_1_3"),
     ]));
 
     let tx = STTx::new(TxType::LOAN_PAY, |tx| {

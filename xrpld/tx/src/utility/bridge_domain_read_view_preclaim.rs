@@ -1,6 +1,7 @@
-//! Immutable `ReadView` preclaim helpers for the bridge and domain families.
+//! Immutable `ReadView` preclaim helpers for the domain families (the XChain
+//! bridge family was removed with rippled #8255).
 //!
-//! This module owns only XChain, Oracle, DID, PermissionedDomain, and
+//! This module owns only Oracle, DID, PermissionedDomain, and
 //! Credential transaction types. It mirrors the corresponding rippled
 //! `preclaim(...)` methods with immutable reads and deliberately returns
 //! `None` for every transaction type it does not own. It never invokes apply
@@ -10,22 +11,16 @@ use std::sync::Arc;
 
 use basics::base_uint::Uint160;
 use ledger::ReadView;
-use protocol::{
-    AccountID, Asset, Issue, PublicKey, STLedgerEntry, STTx, STXChainBridge, Ter, TxType,
-    XChainBridgeChainType, calc_account_id, get_field_by_symbol, lsfAllowTrustLineClawback,
-    lsfDisableMaster,
-};
+use protocol::{AccountID, STLedgerEntry, STTx, Ter, TxType, get_field_by_symbol};
 
 use crate::{
     CredentialAcceptPreclaimFacts, CredentialCreatePreclaimFacts, CredentialDeletePreclaimFacts,
     OracleDeletePreclaimFacts, OracleSetPreclaimFacts, OracleSetPreclaimFrontFacts,
     OracleSetReserveSink, OracleSetSeriesEntry, OracleTokenPair,
     PermissionedDomainDeletePreclaimFacts, PermissionedDomainSetPreclaimFacts,
-    XChainCreateBridgePreclaimFacts, XChainModifyBridgePreclaimFacts,
     run_credential_accept_preclaim, run_credential_create_preclaim, run_credential_delete_preclaim,
     run_oracle_delete_preclaim, run_oracle_set_preclaim, run_oracle_set_preclaim_front,
     run_permissioned_domain_delete_preclaim, run_permissioned_domain_set_preclaim,
-    run_xchain_create_bridge_preclaim, run_xchain_modify_bridge_preclaim,
 };
 
 fn sf(name: &str) -> &'static protocol::SField {
@@ -47,58 +42,10 @@ fn read_account<V: ReadView>(
     view.read(account_keylet(account)).map_err(|_| read_error())
 }
 
-fn bridge_issue(bridge: &STXChainBridge, chain: XChainBridgeChainType) -> Asset {
-    bridge.issue(chain)
-}
 
-fn bridge_keylet(bridge: &STXChainBridge, chain: XChainBridgeChainType) -> protocol::Keylet {
-    protocol::bridge_keylet_from_door_issue(
-        Uint160::from_void(bridge.door(chain).data()),
-        *bridge.issue(chain).get::<Issue>(),
-    )
-}
 
-fn read_bridge<V: ReadView>(
-    view: &V,
-    bridge: &STXChainBridge,
-) -> Result<Option<Arc<STLedgerEntry>>, Ter> {
-    for chain in [
-        XChainBridgeChainType::Locking,
-        XChainBridgeChainType::Issuing,
-    ] {
-        if let Some(entry) = view
-            .read(bridge_keylet(bridge, chain))
-            .map_err(|_| read_error())?
-            && entry.get_field_xchain_bridge(sf("sfXChainBridge")) == *bridge
-        {
-            return Ok(Some(entry));
-        }
-    }
-    Ok(None)
-}
 
-fn xchain_claim_id_keylet(bridge: &STXChainBridge, claim_id: u64) -> protocol::Keylet {
-    protocol::xchain_owned_claim_id_keylet_from_bridge(
-        Uint160::from_void(bridge.locking_chain_door().data()),
-        *bridge.locking_chain_issue().get::<Issue>(),
-        Uint160::from_void(bridge.issuing_chain_door().data()),
-        *bridge.issuing_chain_issue().get::<Issue>(),
-        claim_id,
-    )
-}
 
-fn bridge_chain_for_door(
-    bridge: &STXChainBridge,
-    door: AccountID,
-) -> Result<XChainBridgeChainType, Ter> {
-    if door == bridge.locking_chain_door() {
-        Ok(XChainBridgeChainType::Locking)
-    } else if door == bridge.issuing_chain_door() {
-        Ok(XChainBridgeChainType::Issuing)
-    } else {
-        Err(Ter::TEC_INTERNAL)
-    }
-}
 
 fn account_has_reserve<V: ReadView>(view: &V, account: &STLedgerEntry, adjustment: i8) -> bool {
     account.get_field_amount(sf("sfBalance")).xrp().drops()
@@ -134,233 +81,12 @@ fn oracle_series(series: &protocol::STArray) -> Vec<OracleSetSeriesEntry> {
         .collect()
 }
 
-fn preclaim_xchain_create_bridge<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
-    let account = tx.get_account_id(sf("sfAccount"));
-    let bridge = tx.get_field_xchain_bridge(sf("sfXChainBridge"));
-    // rippled queries issuing first, then locking, and returns duplicate before
-    // its issuer or reserve reads.
-    if view
-        .exists(bridge_keylet(&bridge, XChainBridgeChainType::Issuing))
-        .map_err(|_| read_error())?
-        || view
-            .exists(bridge_keylet(&bridge, XChainBridgeChainType::Locking))
-            .map_err(|_| read_error())?
-    {
-        return Ok(Ter::TEC_DUPLICATE);
-    }
 
-    let source_chain = STXChainBridge::src_chain(account == bridge.locking_chain_door());
-    let source_issue = bridge_issue(&bridge, source_chain);
-    let source_issuer = match &source_issue {
-        Asset::Issue(issue) if !issue.native() => read_account(view, issue.account)?,
-        _ => None,
-    };
-    if matches!(&source_issue, Asset::Issue(issue) if !issue.native()) {
-        let Some(source_issuer) = source_issuer.as_ref() else {
-            return Ok(Ter::TEC_NO_ISSUER);
-        };
-        if source_issuer.is_flag(lsfAllowTrustLineClawback) {
-            return Ok(Ter::TEC_NO_PERMISSION);
-        }
-    }
-    let account_entry = read_account(view, account)?;
 
-    Ok(run_xchain_create_bridge_preclaim(
-        XChainCreateBridgePreclaimFacts {
-            account,
-            bridge: crate::XChainBridgeSpec {
-                locking_chain_door: bridge.locking_chain_door(),
-                locking_chain_issue: *bridge.locking_chain_issue().get::<Issue>(),
-                issuing_chain_door: bridge.issuing_chain_door(),
-                issuing_chain_issue: *bridge.issuing_chain_issue().get::<Issue>(),
-            },
-            bridge_exists_on_locking: false,
-            bridge_exists_on_issuing: false,
-            source_issue_issuer_exists: true,
-            source_issue_allows_clawback: false,
-            account_exists: account_entry.is_some(),
-            reserve_sufficient: account_entry
-                .as_ref()
-                .is_some_and(|entry| account_has_reserve(view, entry, 1)),
-        },
-    ))
-}
 
-fn preclaim_xchain_modify_bridge<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
-    let account = tx.get_account_id(sf("sfAccount"));
-    let bridge = tx.get_field_xchain_bridge(sf("sfXChainBridge"));
-    let chain = STXChainBridge::src_chain(account == bridge.locking_chain_door());
-    Ok(run_xchain_modify_bridge_preclaim(
-        XChainModifyBridgePreclaimFacts {
-            bridge_exists: view
-                .read(bridge_keylet(&bridge, chain))
-                .map_err(|_| read_error())?
-                .is_some(),
-        },
-    ))
-}
 
-fn preclaim_xchain_claim<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
-    let account = tx.get_account_id(sf("sfAccount"));
-    let bridge = tx.get_field_xchain_bridge(sf("sfXChainBridge"));
-    let amount = tx.get_field_amount(sf("sfAmount"));
-    let Some(bridge_entry) = read_bridge(view, &bridge)? else {
-        return Ok(Ter::TEC_NO_ENTRY);
-    };
-    if read_account(view, tx.get_account_id(sf("sfDestination")))?.is_none() {
-        return Ok(Ter::TEC_NO_DST);
-    }
-    let chain = bridge_chain_for_door(&bridge, bridge_entry.get_account_id(sf("sfAccount")))?;
-    if amount.asset() != bridge_issue(&bridge, chain) {
-        return Ok(Ter::TEC_XCHAIN_BAD_TRANSFER_ISSUE);
-    }
-    if bridge_issue(&bridge, XChainBridgeChainType::Locking).native()
-        != bridge_issue(&bridge, XChainBridgeChainType::Issuing).native()
-    {
-        return Ok(Ter::TEC_INTERNAL);
-    }
-    let Some(claim) = view
-        .read(xchain_claim_id_keylet(
-            &bridge,
-            tx.get_field_u64(sf("sfXChainClaimID")),
-        ))
-        .map_err(|_| read_error())?
-    else {
-        return Ok(Ter::TEC_XCHAIN_NO_CLAIM_ID);
-    };
-    Ok(if claim.get_account_id(sf("sfAccount")) == account {
-        Ter::TES_SUCCESS
-    } else {
-        Ter::TEC_XCHAIN_BAD_CLAIM_ID
-    })
-}
 
-fn preclaim_xchain_commit<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
-    let account = tx.get_account_id(sf("sfAccount"));
-    let bridge = tx.get_field_xchain_bridge(sf("sfXChainBridge"));
-    let Some(bridge_entry) = read_bridge(view, &bridge)? else {
-        return Ok(Ter::TEC_NO_ENTRY);
-    };
-    let door = bridge_entry.get_account_id(sf("sfAccount"));
-    if door == account {
-        return Ok(Ter::TEC_XCHAIN_SELF_COMMIT);
-    }
-    let chain = bridge_chain_for_door(&bridge, door)?;
-    Ok(
-        if tx.get_field_amount(sf("sfAmount")).asset() == bridge_issue(&bridge, chain) {
-            Ter::TES_SUCCESS
-        } else {
-            Ter::TEC_XCHAIN_BAD_TRANSFER_ISSUE
-        },
-    )
-}
 
-fn preclaim_xchain_create_claim_id<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
-    let account = tx.get_account_id(sf("sfAccount"));
-    let bridge = tx.get_field_xchain_bridge(sf("sfXChainBridge"));
-    let Some(bridge_entry) = read_bridge(view, &bridge)? else {
-        return Ok(Ter::TEC_NO_ENTRY);
-    };
-    if tx.get_field_amount(sf("sfSignatureReward"))
-        != bridge_entry.get_field_amount(sf("sfSignatureReward"))
-    {
-        return Ok(Ter::TEC_XCHAIN_REWARD_MISMATCH);
-    }
-    let Some(account_entry) = read_account(view, account)? else {
-        return Ok(Ter::TER_NO_ACCOUNT);
-    };
-    Ok(if account_has_reserve(view, &account_entry, 1) {
-        Ter::TES_SUCCESS
-    } else {
-        Ter::TEC_INSUFFICIENT_RESERVE
-    })
-}
-
-fn preclaim_xchain_create_account_commit<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
-    let account = tx.get_account_id(sf("sfAccount"));
-    let bridge = tx.get_field_xchain_bridge(sf("sfXChainBridge"));
-    let amount = tx.get_field_amount(sf("sfAmount"));
-    let Some(bridge_entry) = read_bridge(view, &bridge)? else {
-        return Ok(Ter::TEC_NO_ENTRY);
-    };
-    if tx.get_field_amount(sf("sfSignatureReward"))
-        != bridge_entry.get_field_amount(sf("sfSignatureReward"))
-    {
-        return Ok(Ter::TEC_XCHAIN_REWARD_MISMATCH);
-    }
-    if !bridge_entry.is_field_present(sf("sfMinAccountCreateAmount")) {
-        return Ok(Ter::TEC_XCHAIN_CREATE_ACCOUNT_DISABLED);
-    }
-    let min_create = bridge_entry.get_field_amount(sf("sfMinAccountCreateAmount"));
-    if amount < min_create {
-        return Ok(Ter::TEC_XCHAIN_INSUFF_CREATE_AMOUNT);
-    }
-    if amount.asset() != min_create.asset() {
-        return Ok(Ter::TEC_XCHAIN_BAD_TRANSFER_ISSUE);
-    }
-    let door = bridge_entry.get_account_id(sf("sfAccount"));
-    if door == account {
-        return Ok(Ter::TEC_XCHAIN_SELF_COMMIT);
-    }
-    let source = bridge_chain_for_door(&bridge, door)?;
-    let destination = STXChainBridge::other_chain(source);
-    if amount.asset() != bridge_issue(&bridge, source) {
-        return Ok(Ter::TEC_XCHAIN_BAD_TRANSFER_ISSUE);
-    }
-    Ok(if bridge_issue(&bridge, destination).native() {
-        Ter::TES_SUCCESS
-    } else {
-        Ter::TEC_XCHAIN_CREATE_ACCOUNT_NONXRP_ISSUE
-    })
-}
-
-fn preclaim_xchain_attestation<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
-    let bridge = tx.get_field_xchain_bridge(sf("sfXChainBridge"));
-    let Some(bridge_entry) = read_bridge(view, &bridge)? else {
-        return Ok(Ter::TEC_NO_ENTRY);
-    };
-    let door = bridge_entry.get_account_id(sf("sfAccount"));
-    if read_account(view, door)?.is_none() {
-        return Ok(Ter::TEC_INTERNAL);
-    }
-    let Some(signer_list) = view
-        .read(protocol::signers_keylet(Uint160::from_void(door.data())))
-        .map_err(|_| read_error())?
-    else {
-        return Ok(Ter::TEC_XCHAIN_NO_SIGNERS_LIST);
-    };
-    let signer = tx.get_account_id(sf("sfAttestationSignerAccount"));
-    if !signer_list
-        .get_field_array(sf("sfSignerEntries"))
-        .iter()
-        .any(|entry| entry.get_account_id(sf("sfAccount")) == signer)
-    {
-        return Ok(Ter::TEC_NO_PERMISSION);
-    }
-    let Ok(public_key) = PublicKey::from_slice(&tx.get_field_vl(sf("sfPublicKey"))) else {
-        return Ok(Ter::TEC_INTERNAL);
-    };
-    let account_from_key = calc_account_id(public_key.as_bytes());
-    let signer_account = read_account(view, signer)?;
-    Ok(match signer_account {
-        Some(account_entry) if account_from_key == signer => {
-            if account_entry.is_flag(lsfDisableMaster) {
-                Ter::TEC_XCHAIN_BAD_PUBLIC_KEY_ACCOUNT_PAIR
-            } else {
-                Ter::TES_SUCCESS
-            }
-        }
-        Some(account_entry)
-            if account_entry.is_field_present(sf("sfRegularKey"))
-                && account_entry.get_account_id(sf("sfRegularKey")) == account_from_key =>
-        {
-            Ter::TES_SUCCESS
-        }
-        Some(_) => Ter::TEC_XCHAIN_BAD_PUBLIC_KEY_ACCOUNT_PAIR,
-        None if account_from_key == signer => Ter::TES_SUCCESS,
-        None => Ter::TEC_XCHAIN_BAD_PUBLIC_KEY_ACCOUNT_PAIR,
-    })
-}
 
 fn preclaim_oracle_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let account = tx.get_account_id(sf("sfAccount"));
@@ -580,15 +306,6 @@ pub fn run_bridge_domain_read_view_preclaim<V: ReadView>(
     txn_type: TxType,
 ) -> Option<Ter> {
     let result = match txn_type {
-        TxType::XCHAIN_CREATE_BRIDGE => preclaim_xchain_create_bridge(view, tx),
-        TxType::XCHAIN_MODIFY_BRIDGE => preclaim_xchain_modify_bridge(view, tx),
-        TxType::XCHAIN_CLAIM => preclaim_xchain_claim(view, tx),
-        TxType::XCHAIN_COMMIT => preclaim_xchain_commit(view, tx),
-        TxType::XCHAIN_CREATE_CLAIM_ID => preclaim_xchain_create_claim_id(view, tx),
-        TxType::XCHAIN_ADD_CLAIM_ATTESTATION | TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION => {
-            preclaim_xchain_attestation(view, tx)
-        }
-        TxType::XCHAIN_ACCOUNT_CREATE_COMMIT => preclaim_xchain_create_account_commit(view, tx),
         TxType::ORACLE_SET => preclaim_oracle_set(view, tx),
         TxType::ORACLE_DELETE => preclaim_oracle_delete(view, tx),
         // DIDSet and DIDDelete inherit Transactor::preclaim unchanged in
@@ -614,8 +331,8 @@ mod tests {
     use basics::base_uint::{Uint160, Uint256};
     use ledger::{Fees, LedgerHeader, ReadView, ReadViewTx, Rules, ViewError};
     use protocol::{
-        AccountID, LedgerEntryType, STAmount, STLedgerEntry, STTx, STXChainBridge, Ter, TxType,
-        XRPAmount, get_field_by_symbol, lsfAllowTrustLineClawback, xrp_issue,
+        AccountID, LedgerEntryType, STAmount, STLedgerEntry, STTx, Ter, TxType,
+        XRPAmount, get_field_by_symbol,
     };
 
     #[derive(Debug, Default)]
@@ -701,34 +418,6 @@ mod tests {
         entry
     }
 
-    fn bridge() -> STXChainBridge {
-        STXChainBridge::from_parts(account(1), xrp_issue(), account(2), xrp_issue())
-    }
-
-    fn iou_bridge(issuer: AccountID) -> STXChainBridge {
-        STXChainBridge::from_parts(
-            account(1),
-            protocol::Issue::new(protocol::Currency::from_u64(1), issuer),
-            account(2),
-            protocol::Issue::new(protocol::Currency::from_u64(2), account(2)),
-        )
-    }
-
-    fn xchain_tx(txn_type: TxType) -> STTx {
-        STTx::new(txn_type, |tx| {
-            tx.set_account_id(sf("sfAccount"), account(3));
-            tx.set_field_xchain_bridge(sf("sfXChainBridge"), bridge());
-            tx.set_field_amount(
-                sf("sfAmount"),
-                STAmount::from_xrp_amount(XRPAmount::from_drops(1)),
-            );
-            tx.set_field_amount(
-                sf("sfSignatureReward"),
-                STAmount::from_xrp_amount(XRPAmount::from_drops(0)),
-            );
-        })
-    }
-
     #[test]
     fn only_owned_types_have_results_and_did_noops_are_explicit() {
         let view = View::default();
@@ -745,68 +434,6 @@ mod tests {
             "DID inherits rippled Transactor::preclaim unchanged"
         );
         assert!(view.entries.is_empty(), "preclaim must not mutate the view");
-    }
-
-    #[test]
-    fn xchain_routes_every_owned_type_through_exact_initial_read_checks() {
-        let view = View::default();
-        for txn_type in [
-            TxType::XCHAIN_MODIFY_BRIDGE,
-            TxType::XCHAIN_CLAIM,
-            TxType::XCHAIN_COMMIT,
-            TxType::XCHAIN_CREATE_CLAIM_ID,
-            TxType::XCHAIN_ADD_CLAIM_ATTESTATION,
-            TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION,
-            TxType::XCHAIN_ACCOUNT_CREATE_COMMIT,
-        ] {
-            assert_eq!(
-                run_bridge_domain_read_view_preclaim(&view, &xchain_tx(txn_type), txn_type),
-                Some(Ter::TEC_NO_ENTRY),
-                "{txn_type:?} must fail at rippled readBridge"
-            );
-        }
-        assert_eq!(
-            run_bridge_domain_read_view_preclaim(
-                &view,
-                &xchain_tx(TxType::XCHAIN_CREATE_BRIDGE),
-                TxType::XCHAIN_CREATE_BRIDGE,
-            ),
-            Some(Ter::TER_NO_ACCOUNT)
-        );
-    }
-
-    #[test]
-    fn create_bridge_issuer_results_precede_the_source_account_read() {
-        // Make the submitting account the locking door so `issuer` below is
-        // the issuer of the selected source-chain issue.
-        let source = account(1);
-        let issuer = account(4);
-        let source_key = protocol::account_keylet(Uint160::from_void(source.data())).key;
-        let mut view = View::default();
-        view.fail_reads.insert(source_key);
-        let tx = STTx::new(TxType::XCHAIN_CREATE_BRIDGE, |tx| {
-            tx.set_account_id(sf("sfAccount"), source);
-            tx.set_field_xchain_bridge(sf("sfXChainBridge"), iou_bridge(issuer));
-            tx.set_field_amount(
-                sf("sfSignatureReward"),
-                STAmount::from_xrp_amount(XRPAmount::from_drops(0)),
-            );
-        });
-
-        assert_eq!(
-            run_bridge_domain_read_view_preclaim(&view, &tx, TxType::XCHAIN_CREATE_BRIDGE),
-            Some(Ter::TEC_NO_ISSUER),
-            "pinned preclaim returns the missing issuer before reading the source account"
-        );
-
-        let mut clawback_issuer = account_entry(issuer);
-        clawback_issuer.set_field_u32(sf("sfFlags"), lsfAllowTrustLineClawback);
-        view.insert(clawback_issuer);
-        assert_eq!(
-            run_bridge_domain_read_view_preclaim(&view, &tx, TxType::XCHAIN_CREATE_BRIDGE),
-            Some(Ter::TEC_NO_PERMISSION),
-            "the issuer clawback prohibition also precedes the source account read"
-        );
     }
 
     #[test]
@@ -856,37 +483,6 @@ mod tests {
             Some(Ter::TEC_DUPLICATE),
             "duplicate precedes the pseudo-account prohibition"
         );
-    }
-
-    #[test]
-    fn xchain_commit_preserves_self_commit_before_transfer_issue_check() {
-        let bridge = bridge();
-        let mut view = View::default();
-        let mut entry = STLedgerEntry::from_type_and_key(
-            LedgerEntryType::Bridge,
-            protocol::bridge_keylet_from_door_issue(
-                Uint160::from_void(bridge.locking_chain_door().data()),
-                *bridge.locking_chain_issue().get::<protocol::Issue>(),
-            )
-            .key,
-        );
-        entry.set_account_id(sf("sfAccount"), bridge.locking_chain_door());
-        entry.set_field_xchain_bridge(sf("sfXChainBridge"), bridge.clone());
-        view.insert(entry);
-        let tx = STTx::new(TxType::XCHAIN_COMMIT, |tx| {
-            tx.set_account_id(sf("sfAccount"), bridge.locking_chain_door());
-            tx.set_field_xchain_bridge(sf("sfXChainBridge"), bridge);
-            tx.set_field_amount(
-                sf("sfAmount"),
-                STAmount::from_xrp_amount(XRPAmount::from_drops(1)),
-            );
-        });
-
-        assert_eq!(
-            run_bridge_domain_read_view_preclaim(&view, &tx, TxType::XCHAIN_COMMIT),
-            Some(Ter::TEC_XCHAIN_SELF_COMMIT)
-        );
-        assert_eq!(view.entries.len(), 1, "preclaim remains immutable");
     }
 
     #[test]

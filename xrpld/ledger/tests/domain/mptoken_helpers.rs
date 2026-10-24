@@ -147,8 +147,11 @@ fn escrow_lock_and_unlock_enforce_the_signed_mpt_protocol_cap() {
     );
 }
 
+/// rippled `isVaultPseudoAccountFrozen`: a vault share inherits the
+/// underlying freeze whenever SingleAssetVault is enabled, through
+/// sfReferenceHolding when the share carries it.
 #[test]
-fn reference_holding_freeze_inheritance_requires_fix_cleanup_3_2_0() {
+fn vault_share_freeze_inheritance_is_gated_on_single_asset_vault() {
     let underlying_issuer = account(0xC4);
     let vault_pseudo = account(0xC5);
     let holder = account(0xC6);
@@ -168,13 +171,43 @@ fn reference_holding_freeze_inheritance_requires_fix_cleanup_3_2_0() {
         share_issuance_with_reference(vault_pseudo, 1, protocol::lsfMPTCanTransfer, reference),
     ];
 
-    let legacy = ledger_with(entries.clone(), &[feature_id("SingleAssetVault")]);
+    let without_vaults = ledger_with(entries.clone(), &[feature_id("fixCleanup3_2_0")]);
     assert!(
-        !is_frozen_mpt(&legacy, &holder, &MPTIssue::new(share_id)).expect("legacy freeze check"),
-        "SingleAssetVault alone must not activate sfReferenceHolding inheritance",
+        !is_frozen_mpt(&without_vaults, &holder, &MPTIssue::new(share_id)).expect("freeze check"),
+        "without SingleAssetVault a share never inherits a freeze",
     );
-    let fixed = ledger_with(entries, &[feature_id("fixCleanup3_2_0")]);
-    assert!(is_frozen_mpt(&fixed, &holder, &MPTIssue::new(share_id)).expect("fixed freeze check"));
+    let with_vaults = ledger_with(entries, &[feature_id("SingleAssetVault")]);
+    assert!(is_frozen_mpt(&with_vaults, &holder, &MPTIssue::new(share_id)).expect("freeze check"));
+}
+
+/// rippled `isVaultPseudoAccountFrozen` fallback for shares created before
+/// sfReferenceHolding: the issuer's sfVaultID names the vault and its asset.
+#[test]
+fn legacy_vault_share_inherits_freeze_through_issuer_vault_id() {
+    let underlying_issuer = account(0xC7);
+    let vault_pseudo = account(0xC8);
+    let holder = account(0xC9);
+    let vault_id = Uint256::from_array([0xC8; 32]);
+    let underlying = Asset::MPTIssue(MPTIssue::new(mpt_id(underlying_issuer, 1)));
+    let share_id = mpt_id(vault_pseudo, 1);
+    let mut pseudo = account_entry(vault_pseudo);
+    pseudo.set_field_h256(sf("sfVaultID"), vault_id);
+    let ledger = ledger_with(
+        [
+            account_entry(underlying_issuer),
+            pseudo,
+            account_entry(holder),
+            issuance_entry_with_flags(
+                underlying_issuer,
+                1,
+                protocol::lsfMPTCanTransfer | protocol::lsfMPTLocked,
+            ),
+            issuance_entry_with_flags(vault_pseudo, 1, protocol::lsfMPTCanTransfer),
+            vault_entry(vault_id, holder, vault_pseudo, underlying),
+        ],
+        &[feature_id("SingleAssetVault")],
+    );
+    assert!(is_frozen_mpt(&ledger, &holder, &MPTIssue::new(share_id)).expect("freeze check"));
 }
 
 #[test]

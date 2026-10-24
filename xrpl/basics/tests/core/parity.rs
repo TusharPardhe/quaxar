@@ -802,8 +802,8 @@ fn number_public_helper_surface_roles() {
         assert_eq!(current_mantissa_max(), 9_999_999_999_999_999_999);
         assert_eq!(current_mantissa_log(), 18);
     }
-    assert_eq!(mantissa_scale_to_string(MantissaScale::Small), "small");
-    assert_eq!(mantissa_scale_to_string(MantissaScale::Large), "large");
+    assert_eq!(mantissa_scale_to_string(MantissaScale::Small), "Small");
+    assert_eq!(mantissa_scale_to_string(MantissaScale::Large), "Large330");
 }
 
 #[test]

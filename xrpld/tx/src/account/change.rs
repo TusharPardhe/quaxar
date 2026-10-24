@@ -33,7 +33,6 @@ pub struct ChangePreflightFacts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ChangePreclaimFacts {
     pub ledger_is_open: bool,
-    pub xrp_fees_enabled: bool,
     pub base_fee_present: bool,
     pub reference_fee_units_present: bool,
     pub reserve_base_present: bool,
@@ -115,34 +114,20 @@ pub const fn run_change_preclaim(txn_type: TxType, facts: ChangePreclaimFacts) -
 
     match txn_type {
         TxType::FEE => {
-            if facts.xrp_fees_enabled {
-                if !facts.base_fee_drops_present
-                    || !facts.reserve_base_drops_present
-                    || !facts.reserve_increment_drops_present
-                {
-                    return Ter::TEM_MALFORMED;
-                }
-                if facts.base_fee_present
-                    || facts.reference_fee_units_present
-                    || facts.reserve_base_present
-                    || facts.reserve_increment_present
-                {
-                    return Ter::TEM_MALFORMED;
-                }
-            } else {
-                if !facts.base_fee_present
-                    || !facts.reference_fee_units_present
-                    || !facts.reserve_base_present
-                    || !facts.reserve_increment_present
-                {
-                    return Ter::TEM_MALFORMED;
-                }
-                if facts.base_fee_drops_present
-                    || facts.reserve_base_drops_present
-                    || facts.reserve_increment_drops_present
-                {
-                    return Ter::TEM_DISABLED;
-                }
+            // rippled #7349 retired XRPFees: the drops fields are required and
+            // the legacy fields are forbidden.
+            if !facts.base_fee_drops_present
+                || !facts.reserve_base_drops_present
+                || !facts.reserve_increment_drops_present
+            {
+                return Ter::TEM_MALFORMED;
+            }
+            if facts.base_fee_present
+                || facts.reference_fee_units_present
+                || facts.reserve_base_present
+                || facts.reserve_increment_present
+            {
+                return Ter::TEM_MALFORMED;
             }
             Ter::TES_SUCCESS
         }
@@ -452,7 +437,6 @@ mod tests {
         let xrp_missing = run_change_preclaim(
             TxType::FEE,
             ChangePreclaimFacts {
-                xrp_fees_enabled: true,
                 base_fee_drops_present: true,
                 reserve_base_drops_present: true,
                 ..ChangePreclaimFacts::default()
@@ -461,7 +445,6 @@ mod tests {
         let xrp_forbids_legacy = run_change_preclaim(
             TxType::FEE,
             ChangePreclaimFacts {
-                xrp_fees_enabled: true,
                 base_fee_drops_present: true,
                 reserve_base_drops_present: true,
                 reserve_increment_drops_present: true,
@@ -492,7 +475,6 @@ mod tests {
         let xrp_valid = run_change_preclaim(
             TxType::FEE,
             ChangePreclaimFacts {
-                xrp_fees_enabled: true,
                 base_fee_drops_present: true,
                 reserve_base_drops_present: true,
                 reserve_increment_drops_present: true,
@@ -513,9 +495,10 @@ mod tests {
         assert_eq!(xrp_missing, Ter::TEM_MALFORMED);
         assert_eq!(xrp_forbids_legacy, Ter::TEM_MALFORMED);
         assert_eq!(legacy_missing, Ter::TEM_MALFORMED);
-        assert_eq!(legacy_forbids_xrp, Ter::TEM_DISABLED);
+        // rippled #7349: with XRPFees retired the legacy shape is malformed.
+        assert_eq!(legacy_forbids_xrp, Ter::TEM_MALFORMED);
         assert_eq!(xrp_valid, Ter::TES_SUCCESS);
-        assert_eq!(legacy_valid, Ter::TES_SUCCESS);
+        assert_eq!(legacy_valid, Ter::TEM_MALFORMED);
     }
 
     #[test]

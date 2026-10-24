@@ -79,12 +79,6 @@ fn smart_escrow_ter_catalog_is_pinned() {
             "Malformed: Provided byte code is invalid.",
         ),
         (
-            Ter::TEM_TEMP_DISABLED,
-            -246,
-            "temTEMP_DISABLED",
-            "The transaction requires logic that is currently temporarily disabled.",
-        ),
-        (
             Ter::TEF_NO_BYTECODE,
             -175,
             "tefNO_BYTECODE",
@@ -95,6 +89,18 @@ fn smart_escrow_ter_catalog_is_pinned() {
             -174,
             "tefBYTECODE_NOT_INCLUDED",
             "WASM code requires a field that was not included.",
+        ),
+        (
+            Ter::TEF_TEMP_DISABLED,
+            -173,
+            "tefTEMP_DISABLED",
+            "The transaction requires logic that is currently temporarily disabled.",
+        ),
+        (
+            Ter::TEF_EXCEEDS_LIMIT,
+            -172,
+            "tefEXCEEDS_LIMIT",
+            "The transaction exceeds a limit set by fee voting.",
         ),
         (
             Ter::TEC_OUT_OF_GAS,

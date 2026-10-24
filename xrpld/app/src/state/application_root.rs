@@ -78,9 +78,9 @@ use overlay::{Overlay, OverlayHandoff, OverlayImpl, PeerReservationSource};
 use perflog::PerfLogImp;
 use protocol::{
     AccountID, BatchTransactionFlags, JsonOptions, JsonValue, NodeID, NotTec, PublicKey,
-    REFERENCE_FEE_UNITS_DEPRECATED, Rules, STAmount, STLedgerEntry, STObject, STTx, SecretKey,
+    Rules, STAmount, STLedgerEntry, STObject, STTx, SecretKey,
     SeqProxy, Serializer, StBase, Ter, TxType, XRPAmount, account_keylet, calc_account_id,
-    calc_node_id, feature_xrp_fees, get_field_by_symbol, is_tec_claim, is_tef_failure,
+    calc_node_id, get_field_by_symbol, is_tec_claim, is_tef_failure,
     is_tem_malformed, is_tes_success, lsfDisableMaster, tfInnerBatchTxn,
 };
 use quaxar_core::DatabaseCon;
@@ -2851,15 +2851,7 @@ fn typed_preclaim_route(txn_type: TxType) -> TypedPreclaimRoute {
         | TxType::VAULT_DEPOSIT
         | TxType::VAULT_WITHDRAW
         | TxType::VAULT_CLAWBACK => TypedPreclaimRoute::VaultReadViewHelper,
-        TxType::XCHAIN_CREATE_CLAIM_ID
-        | TxType::XCHAIN_COMMIT
-        | TxType::XCHAIN_CLAIM
-        | TxType::XCHAIN_ACCOUNT_CREATE_COMMIT
-        | TxType::XCHAIN_ADD_CLAIM_ATTESTATION
-        | TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION
-        | TxType::XCHAIN_MODIFY_BRIDGE
-        | TxType::XCHAIN_CREATE_BRIDGE
-        | TxType::ORACLE_SET
+        TxType::ORACLE_SET
         | TxType::ORACLE_DELETE
         | TxType::PERMISSIONED_DOMAIN_SET
         | TxType::PERMISSIONED_DOMAIN_DELETE
@@ -4527,11 +4519,6 @@ fn canonical_sttx_consequences(sttx: &STTx) -> TxConsequences {
         TxType::REGULAR_KEY_SET | TxType::ACCOUNT_DELETE | TxType::SIGNER_LIST_SET => {
             TxConsequences::with_category(fee, seq, tx::TxConsequencesCategory::Blocker)
         }
-        TxType::XCHAIN_CLAIM
-        | TxType::XCHAIN_ADD_CLAIM_ATTESTATION
-        | TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION => {
-            TxConsequences::with_category(fee, seq, tx::TxConsequencesCategory::Blocker)
-        }
         TxType::PAYMENT => tx::run_payment_make_tx_consequences(
             fee,
             seq,
@@ -4574,11 +4561,6 @@ fn canonical_sttx_consequences(sttx: &STTx) -> TxConsequences {
             fee,
             seq,
             sttx.get_field_u32(get_field_by_symbol("sfTicketCount")),
-        ),
-        TxType::XCHAIN_COMMIT => TxConsequences::with_potential_spend(
-            fee,
-            seq,
-            native_spend(get_field_by_symbol("sfAmount")),
         ),
         TxType::SPONSORSHIP_SET => TxConsequences::with_potential_spend(
             fee,
@@ -4629,9 +4611,6 @@ mod canonical_consequences_tests {
             TxType::REGULAR_KEY_SET,
             TxType::ACCOUNT_DELETE,
             TxType::SIGNER_LIST_SET,
-            TxType::XCHAIN_CLAIM,
-            TxType::XCHAIN_ADD_CLAIM_ATTESTATION,
-            TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION,
         ] {
             assert!(canonical_sttx_consequences(&tx(txn_type, 1)).is_blocker());
         }
@@ -8690,7 +8669,7 @@ impl ApplicationRoot {
         {
             ledger_with_fetcher.set_node_batch_writer_result(writer);
         }
-        match ledger_with_fetcher.setup_from_state_map(&feature_xrp_fees()) {
+        match ledger_with_fetcher.setup_from_state_map() {
             Ok(true) => {
                 full_sync_debug!(
                     "[full_debug][ledger_fetcher] setup seq={} result=loaded fees_base={} fees_reserve={} fees_inc={}",
@@ -9074,12 +9053,6 @@ impl ApplicationRoot {
                 ),
             ),
         ]);
-        if !ledger.rules().enabled(&feature_xrp_fees()) {
-            notification.insert(
-                "fee_ref".to_owned(),
-                protocol::JsonValue::Unsigned(u64::from(REFERENCE_FEE_UNITS_DEPRECATED)),
-            );
-        }
         if self.network_ops_operating_mode() >= NetworkOpsOperatingMode::Syncing {
             if let Some(runtime) = self.ledger_master_runtime() {
                 notification.insert(

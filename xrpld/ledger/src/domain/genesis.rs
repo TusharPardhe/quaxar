@@ -92,7 +92,7 @@ mod tests {
         ConstructorAccountRootEntry, ConstructorFeeSettingsEntry, ConstructorLedgerEntry,
         amendments_key, constructor_ledger_entry_key, decode_constructor_account_root_entry,
         decode_constructor_amendments_entry, decode_constructor_fee_settings_entry,
-        encode_constructor_account_root_entry, feature_xrp_fees, fees_key,
+        encode_constructor_account_root_entry, fees_key,
     };
 
     fn bytes_to_hex(bytes: &[u8]) -> String {
@@ -175,25 +175,8 @@ mod tests {
     }
 
     #[test]
-    fn genesis_fees_item_round_trips_legacy_shape_without_xrp_fees() {
-        let (key, payload) = build_genesis_fees_item(10, 20, 30, &[]);
-
-        assert_eq!(key, fees_key());
-        assert_eq!(
-            decode_constructor_fee_settings_entry(&payload)
-                .expect("legacy genesis fees item should round-trip"),
-            ConstructorFeeSettingsEntry::Legacy {
-                base_fee: 10,
-                reference_fee_units: protocol::REFERENCE_FEE_UNITS_DEPRECATED,
-                reserve_base: Some(20),
-                reserve_increment: Some(30),
-            }
-        );
-    }
-
-    #[test]
-    fn genesis_fees_item_round_trips_xrp_shape_with_amendment() {
-        let (key, payload) = build_genesis_fees_item(11, 22, 33, &[feature_xrp_fees()]);
+    fn genesis_fees_item_always_uses_xrp_shape() {
+        let (key, payload) = build_genesis_fees_item(11, 22, 33, &[]);
 
         assert_eq!(key, fees_key());
         assert_eq!(

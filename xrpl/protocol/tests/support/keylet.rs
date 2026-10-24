@@ -13,8 +13,7 @@ use protocol::keylet::{
 };
 use protocol::{
     AccountID, Asset, Book, Currency, DIRECT_ACCOUNT_KEYLETS, Issue, MPTIssue, account_keylet,
-    account_root_key, amm, amm_keylet, book_keylet, bridge_keylet_from_door_issue,
-    check_keylet_from_key, credential_keylet_from_key, deposit_preauth_keylet_from_key, did_keylet,
+    account_root_key, amm, amm_keylet, book_keylet, check_keylet_from_key, credential_keylet_from_key, deposit_preauth_keylet_from_key, did_keylet,
     escrow_keylet_from_key, get_book_base, get_quality_next, ledger_hashes_keylet, line,
     line_from_issue, loan_broker_keylet_from_key, loan_key, loan_keylet_from_key,
     mpt_issuance_keylet_from_id, mpt_issuance_keylet_from_mptid, mptoken_keylet_from_id,
@@ -24,9 +23,7 @@ use protocol::{
     page_keylet, pay_channel_keylet_from_key, permissioned_domain_keylet_from_id, quality_from_key,
     quality_keylet, signers_keylet, signers_keylet_for_page, ticket_index,
     ticket_index_from_seq_proxy, ticket_keylet, ticket_keylet_from_key,
-    ticket_keylet_from_seq_proxy, vault_keylet_from_key, xchain_owned_claim_id_keylet_from_bridge,
-    xchain_owned_create_account_claim_id_keylet_from_bridge,
-};
+    ticket_keylet_from_seq_proxy, vault_keylet_from_key, };
 
 #[test]
 fn protocol_loan_key_matches_current_cpp_vector() {
@@ -346,56 +343,6 @@ fn protocol_amm_keylet_accepts_mpt_assets_and_canonicalizes() {
         protocol::LedgerEntryType::AMM
     );
     assert_ne!(amm(issue_asset, first_mpt), amm(first_mpt, second_mpt));
-}
-
-#[test]
-fn protocol_bridge_and_xchain_keylets_match_current_cpp_vectors() {
-    let locking_door = Uint160::from_hex("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
-        .expect("locking door should parse");
-    let issuing_door = Uint160::from_hex("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")
-        .expect("issuing door should parse");
-    let locking_issue = Issue::new(
-        Currency::from_hex("5553440000000000000000000000000000000000")
-            .expect("locking currency should parse"),
-        AccountID::from_hex("0000000000000000000000000000000000000000")
-            .expect("zero issuer should parse"),
-    );
-    let issuing_issue = Issue::new(
-        Currency::from_hex("434E590000000000000000000000000000000000")
-            .expect("issuing currency should parse"),
-        AccountID::from_hex("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC")
-            .expect("issuing issuer should parse"),
-    );
-
-    assert_eq!(
-        bridge_keylet_from_door_issue(locking_door, locking_issue).key,
-        Uint256::from_hex("C2772BC97F6567C08C8F15E72A34D7801DFFCAE55245FD8337C0F606EEC5E2E1")
-            .expect("bridge key should parse")
-    );
-    assert_eq!(
-        xchain_owned_claim_id_keylet_from_bridge(
-            locking_door,
-            locking_issue,
-            issuing_door,
-            issuing_issue,
-            7,
-        )
-        .key,
-        Uint256::from_hex("8B7ED2DA2F19997E31D74134896AF8765CBE4884C3AEAEDC6B6E16F89833E837")
-            .expect("xchain claim id key should parse")
-    );
-    assert_eq!(
-        xchain_owned_create_account_claim_id_keylet_from_bridge(
-            locking_door,
-            locking_issue,
-            issuing_door,
-            issuing_issue,
-            7,
-        )
-        .key,
-        Uint256::from_hex("BBB2B5028ED800A79E48DFC174C29E740AA6A71ED1F6A3C0FAC99B4A390E513D")
-            .expect("xchain create account claim id key should parse")
-    );
 }
 
 #[test]
@@ -786,13 +733,8 @@ fn protocol_ledger_entry_type_catalog_matches_current_cpp_codes_and_names() {
         );
     }
 
-    assert_eq!(
-        ledger_entry_type_from_name("XChainOwnedClaimID"),
-        Some(protocol::LedgerEntryType::XChainOwnedClaimId)
-    );
-    assert_eq!(
-        ledger_entry_type_from_name("XChainOwnedCreateAccountClaimID"),
-        Some(protocol::LedgerEntryType::XChainOwnedCreateAccountClaimId)
-    );
+    // rippled #8255 removed the XChain ledger entry types.
+    assert_eq!(ledger_entry_type_from_name("XChainOwnedClaimID"), None);
+    assert_eq!(ledger_entry_type_from_code(0x0069), None);
     assert_eq!(ledger_entry_type_from_code(0x0062), None);
 }

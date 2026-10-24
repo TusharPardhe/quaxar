@@ -30,6 +30,10 @@ fn sample_loaded_ledger(seq: u32) -> Ledger {
         )
         .expect("tx leaf should insert");
 
+    // Hashes are computed when the tree is unshared, as rippled's
+    // SHAMap::getHash() does before reading the root hash.
+    state_tree.unshare();
+    tx_tree.unshare();
     let state_root = state_tree.root();
     let tx_root = tx_tree.root();
     let header = LedgerHeader {

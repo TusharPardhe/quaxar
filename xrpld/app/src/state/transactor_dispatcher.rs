@@ -2973,8 +2973,6 @@ fn requires_source_pre_fee_balance(txn_type: TxType) -> bool {
     matches!(
         txn_type,
         TxType::SIGNER_LIST_SET
-            | TxType::XCHAIN_COMMIT
-            | TxType::XCHAIN_ACCOUNT_CREATE_COMMIT
             | TxType::CHECK_CREATE
             | TxType::CHECK_CASH
             | TxType::CREDENTIAL_CREATE
@@ -3010,7 +3008,6 @@ pub(crate) enum ApplyDispatchRoute {
     AccountAndPayment,
     Dex,
     NfToken,
-    XChain,
     CredentialAndDomain,
     Token,
     Vault,
@@ -3061,14 +3058,6 @@ pub(crate) fn apply_dispatch_route(txn_type: TxType) -> Option<ApplyDispatchRout
         | TxType::NFTOKEN_CANCEL_OFFER
         | TxType::NFTOKEN_ACCEPT_OFFER
         | TxType::NFTOKEN_MODIFY => NfToken,
-        TxType::XCHAIN_CREATE_CLAIM_ID
-        | TxType::XCHAIN_COMMIT
-        | TxType::XCHAIN_CLAIM
-        | TxType::XCHAIN_ACCOUNT_CREATE_COMMIT
-        | TxType::XCHAIN_ADD_CLAIM_ATTESTATION
-        | TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION
-        | TxType::XCHAIN_MODIFY_BRIDGE
-        | TxType::XCHAIN_CREATE_BRIDGE => XChain,
         TxType::DID_SET
         | TxType::DID_DELETE
         | TxType::ORACLE_SET
@@ -3127,60 +3116,6 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
     // `invoke_preclaim`. Rechecking here would incorrectly authorize against
     // sfAccount instead of sfDelegate for delegated transactions.
     match txn_type {
-        // --- XChain Bridge ---
-        TxType::XCHAIN_CREATE_BRIDGE => {
-            if !view.rules().enabled(&protocol::feature_id("XChainBridge")) {
-                return Ter::TEM_DISABLED;
-            }
-            crate::state::xchain::apply_xchain_create_bridge(view, sttx)
-        }
-        TxType::XCHAIN_MODIFY_BRIDGE => {
-            if !view.rules().enabled(&protocol::feature_id("XChainBridge")) {
-                return Ter::TEM_DISABLED;
-            }
-            crate::state::xchain::apply_xchain_modify_bridge(view, sttx)
-        }
-        TxType::XCHAIN_CLAIM => {
-            if !view.rules().enabled(&protocol::feature_id("XChainBridge")) {
-                return Ter::TEM_DISABLED;
-            }
-            crate::state::xchain::apply_xchain_claim(view, sttx)
-        }
-        TxType::XCHAIN_COMMIT => {
-            if !view.rules().enabled(&protocol::feature_id("XChainBridge")) {
-                return Ter::TEM_DISABLED;
-            }
-            crate::state::xchain::apply_xchain_commit(view, sttx, pre_fee_balance_drops)
-        }
-        TxType::XCHAIN_CREATE_CLAIM_ID => {
-            if !view.rules().enabled(&protocol::feature_id("XChainBridge")) {
-                return Ter::TEM_DISABLED;
-            }
-            crate::state::xchain::apply_xchain_create_claim_id(view, sttx)
-        }
-        TxType::XCHAIN_ADD_CLAIM_ATTESTATION => {
-            if !view.rules().enabled(&protocol::feature_id("XChainBridge")) {
-                return Ter::TEM_DISABLED;
-            }
-            crate::state::xchain::apply_xchain_add_claim_attestation(view, sttx)
-        }
-        TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION => {
-            if !view.rules().enabled(&protocol::feature_id("XChainBridge")) {
-                return Ter::TEM_DISABLED;
-            }
-            crate::state::xchain::apply_xchain_add_account_create_attestation(view, sttx)
-        }
-        TxType::XCHAIN_ACCOUNT_CREATE_COMMIT => {
-            if !view.rules().enabled(&protocol::feature_id("XChainBridge")) {
-                return Ter::TEM_DISABLED;
-            }
-            crate::state::xchain::apply_xchain_account_create_commit(
-                view,
-                sttx,
-                pre_fee_balance_drops,
-            )
-        }
-
         // --- Vault / Loan / Batch / Delegate ---
         TxType::VAULT_CREATE => {
             let pre_fee_balance_drops = match require_pre_fee_balance(pre_fee_balance_drops) {
@@ -8795,41 +8730,24 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 || protocol::STLedgerEntry::new(k).clone_as_object(),
                 |entry| entry.clone_as_object(),
             );
-            // `Change::applyFee` selects the format from the ledger rules, not
-            // from whichever fields happen to be present on the transaction.
-            // The pseudo-transaction preflight has already enforced the exact
-            // required/forbidden shape for this rule set.
-            if view.rules().enabled(&protocol::feature_xrp_fees()) {
-                obj.set_field_amount(
-                    sf("sfBaseFeeDrops"),
-                    sttx.get_field_amount(sf("sfBaseFeeDrops")),
-                );
-                obj.set_field_amount(
-                    sf("sfReserveBaseDrops"),
-                    sttx.get_field_amount(sf("sfReserveBaseDrops")),
-                );
-                obj.set_field_amount(
-                    sf("sfReserveIncrementDrops"),
-                    sttx.get_field_amount(sf("sfReserveIncrementDrops")),
-                );
-                // Exact `Change::applyFee` XRPFees transition: discard the
-                // legacy representation after writing all three drops fields.
-                obj.make_field_absent(sf("sfBaseFee"));
-                obj.make_field_absent(sf("sfReferenceFeeUnits"));
-                obj.make_field_absent(sf("sfReserveBase"));
-                obj.make_field_absent(sf("sfReserveIncrement"));
-            } else {
-                obj.set_field_u64(sf("sfBaseFee"), sttx.get_field_u64(sf("sfBaseFee")));
-                obj.set_field_u32(
-                    sf("sfReferenceFeeUnits"),
-                    sttx.get_field_u32(sf("sfReferenceFeeUnits")),
-                );
-                obj.set_field_u32(sf("sfReserveBase"), sttx.get_field_u32(sf("sfReserveBase")));
-                obj.set_field_u32(
-                    sf("sfReserveIncrement"),
-                    sttx.get_field_u32(sf("sfReserveIncrement")),
-                );
-            }
+            // rippled #7349 retired XRPFees: `Change::applyFee` always writes
+            // the drops fields and discards the legacy representation.
+            obj.set_field_amount(
+                sf("sfBaseFeeDrops"),
+                sttx.get_field_amount(sf("sfBaseFeeDrops")),
+            );
+            obj.set_field_amount(
+                sf("sfReserveBaseDrops"),
+                sttx.get_field_amount(sf("sfReserveBaseDrops")),
+            );
+            obj.set_field_amount(
+                sf("sfReserveIncrementDrops"),
+                sttx.get_field_amount(sf("sfReserveIncrementDrops")),
+            );
+            obj.make_field_absent(sf("sfBaseFee"));
+            obj.make_field_absent(sf("sfReferenceFeeUnits"));
+            obj.make_field_absent(sf("sfReserveBase"));
+            obj.make_field_absent(sf("sfReserveIncrement"));
             let sle = Arc::new(protocol::STLedgerEntry::from_stobject(obj, k.key));
             let result = if existing.is_some() {
                 view.update(sle)
@@ -9112,8 +9030,6 @@ mod tests {
     fn every_source_reserve_route_requires_the_shared_pre_fee_snapshot() {
         let expected = std::collections::BTreeSet::from([
             TxType::SIGNER_LIST_SET,
-            TxType::XCHAIN_COMMIT,
-            TxType::XCHAIN_ACCOUNT_CREATE_COMMIT,
             TxType::CHECK_CREATE,
             TxType::CHECK_CASH,
             TxType::CREDENTIAL_CREATE,

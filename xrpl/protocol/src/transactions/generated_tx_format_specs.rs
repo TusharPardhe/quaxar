@@ -873,7 +873,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         value: 35,
         name: "AMMCreate",
         delegable: "Delegation::delegable",
-        amendment: "featureAMM",
+        amendment: "uint256{}",
         privileges: "createPseudoAcct | mayCreateMPT",
         field_specs: &[
             FormatFieldSpec {
@@ -898,7 +898,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         value: 36,
         name: "AMMDeposit",
         delegable: "Delegation::delegable",
-        amendment: "featureAMM",
+        amendment: "uint256{}",
         privileges: "noPriv",
         field_specs: &[
             FormatFieldSpec {
@@ -943,7 +943,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         value: 37,
         name: "AMMWithdraw",
         delegable: "Delegation::delegable",
-        amendment: "featureAMM",
+        amendment: "uint256{}",
         privileges: "mayDeleteAcct | mayAuthorizeMPT",
         field_specs: &[
             FormatFieldSpec {
@@ -983,7 +983,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         value: 38,
         name: "AMMVote",
         delegable: "Delegation::delegable",
-        amendment: "featureAMM",
+        amendment: "uint256{}",
         privileges: "noPriv",
         field_specs: &[
             FormatFieldSpec {
@@ -1008,7 +1008,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         value: 39,
         name: "AMMBid",
         delegable: "Delegation::delegable",
-        amendment: "featureAMM",
+        amendment: "uint256{}",
         privileges: "noPriv",
         field_specs: &[
             FormatFieldSpec {
@@ -1043,7 +1043,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         value: 40,
         name: "AMMDelete",
         delegable: "Delegation::delegable",
-        amendment: "featureAMM",
+        amendment: "uint256{}",
         privileges: "mustDeleteAcct | mayDeleteMPT",
         field_specs: &[
             FormatFieldSpec {
@@ -1055,301 +1055,6 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
                 field_symbol: "sfAsset2",
                 style: SOEStyle::Required,
                 mpt: SOETxMPTIssue::Supported,
-            },
-        ],
-    },
-    TxFormatSpecInit {
-        tag_name: "ttXCHAIN_CREATE_CLAIM_ID",
-        value: 41,
-        name: "XChainCreateClaimID",
-        delegable: "Delegation::delegable",
-        amendment: "featureXChainBridge",
-        privileges: "noPriv",
-        field_specs: &[
-            FormatFieldSpec {
-                field_symbol: "sfXChainBridge",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfSignatureReward",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfOtherChainSource",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-        ],
-    },
-    TxFormatSpecInit {
-        tag_name: "ttXCHAIN_COMMIT",
-        value: 42,
-        name: "XChainCommit",
-        delegable: "Delegation::delegable",
-        amendment: "featureXChainBridge",
-        privileges: "noPriv",
-        field_specs: &[
-            FormatFieldSpec {
-                field_symbol: "sfXChainBridge",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfXChainClaimID",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfAmount",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfOtherChainDestination",
-                style: SOEStyle::Optional,
-                mpt: SOETxMPTIssue::None,
-            },
-        ],
-    },
-    TxFormatSpecInit {
-        tag_name: "ttXCHAIN_CLAIM",
-        value: 43,
-        name: "XChainClaim",
-        delegable: "Delegation::delegable",
-        amendment: "featureXChainBridge",
-        privileges: "noPriv",
-        field_specs: &[
-            FormatFieldSpec {
-                field_symbol: "sfXChainBridge",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfXChainClaimID",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfDestination",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfDestinationTag",
-                style: SOEStyle::Optional,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfAmount",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-        ],
-    },
-    TxFormatSpecInit {
-        tag_name: "ttXCHAIN_ACCOUNT_CREATE_COMMIT",
-        value: 44,
-        name: "XChainAccountCreateCommit",
-        delegable: "Delegation::delegable",
-        amendment: "featureXChainBridge",
-        privileges: "noPriv",
-        field_specs: &[
-            FormatFieldSpec {
-                field_symbol: "sfXChainBridge",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfDestination",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfAmount",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfSignatureReward",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-        ],
-    },
-    TxFormatSpecInit {
-        tag_name: "ttXCHAIN_ADD_CLAIM_ATTESTATION",
-        value: 45,
-        name: "XChainAddClaimAttestation",
-        delegable: "Delegation::delegable",
-        amendment: "featureXChainBridge",
-        privileges: "createAcct",
-        field_specs: &[
-            FormatFieldSpec {
-                field_symbol: "sfXChainBridge",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfAttestationSignerAccount",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfPublicKey",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfSignature",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfOtherChainSource",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfAmount",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfAttestationRewardAccount",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfWasLockingChainSend",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfXChainClaimID",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfDestination",
-                style: SOEStyle::Optional,
-                mpt: SOETxMPTIssue::None,
-            },
-        ],
-    },
-    TxFormatSpecInit {
-        tag_name: "ttXCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION",
-        value: 46,
-        name: "XChainAddAccountCreateAttestation",
-        delegable: "Delegation::delegable",
-        amendment: "featureXChainBridge",
-        privileges: "createAcct",
-        field_specs: &[
-            FormatFieldSpec {
-                field_symbol: "sfXChainBridge",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfAttestationSignerAccount",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfPublicKey",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfSignature",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfOtherChainSource",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfAmount",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfAttestationRewardAccount",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfWasLockingChainSend",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfXChainAccountCreateCount",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfDestination",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfSignatureReward",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-        ],
-    },
-    TxFormatSpecInit {
-        tag_name: "ttXCHAIN_MODIFY_BRIDGE",
-        value: 47,
-        name: "XChainModifyBridge",
-        delegable: "Delegation::delegable",
-        amendment: "featureXChainBridge",
-        privileges: "noPriv",
-        field_specs: &[
-            FormatFieldSpec {
-                field_symbol: "sfXChainBridge",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfSignatureReward",
-                style: SOEStyle::Optional,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfMinAccountCreateAmount",
-                style: SOEStyle::Optional,
-                mpt: SOETxMPTIssue::None,
-            },
-        ],
-    },
-    TxFormatSpecInit {
-        tag_name: "ttXCHAIN_CREATE_BRIDGE",
-        value: 48,
-        name: "XChainCreateBridge",
-        delegable: "Delegation::delegable",
-        amendment: "featureXChainBridge",
-        privileges: "noPriv",
-        field_specs: &[
-            FormatFieldSpec {
-                field_symbol: "sfXChainBridge",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfSignatureReward",
-                style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfMinAccountCreateAmount",
-                style: SOEStyle::Optional,
-                mpt: SOETxMPTIssue::None,
             },
         ],
     },

@@ -194,7 +194,7 @@ pub use persistence::{
 use protocol::{
     DecodedLedgerHashesEntry, Keylet, STArray, STLedgerEntry, STObject, STTx, SerialIter,
     Serializer, TxMeta, amendments_keylet, build_genesis_state_constructor_entries,
-    constructor_ledger_items, decode_ledger_hashes_entry, feature_xrp_fees, fee_settings_keylet,
+    constructor_ledger_items, decode_ledger_hashes_entry, fee_settings_keylet,
     get_field_by_symbol, make_rules_given_current, negative_unl_keylet, skip_keylet,
     skip_keylet_for_ledger,
 };
@@ -727,7 +727,6 @@ impl Ledger {
         backed: bool,
         default_fees: Fees,
         preset_features: I,
-        feature_xrp_fees: &Uint256,
     ) -> Result<Self, LedgerSetupError>
     where
         I: IntoIterator<Item = Uint256>,
@@ -735,7 +734,7 @@ impl Ledger {
         let mut ledger = Self::from_ledger_seq_and_close_time(ledger_seq, close_time, backed);
         ledger.rules = Rules::new(preset_features);
         ledger.apply_default_fees(default_fees);
-        let _ = ledger.setup_from_state_map(feature_xrp_fees)?;
+        let _ = ledger.setup_from_state_map()?;
         Ok(ledger)
     }
 
@@ -751,7 +750,6 @@ impl Ledger {
             backed,
             config.fees,
             config.features.iter(),
-            &feature_xrp_fees(),
         )
     }
 
@@ -914,7 +912,6 @@ impl Ledger {
         acquire: bool,
         journal: &J,
         default_fees: Fees,
-        feature_xrp_fees: &Uint256,
         family: &SHAMapFamily<CLOCK, S, FB, F, MR, NS>,
     ) -> Result<(Self, bool), LedgerSetupError>
     where
@@ -929,7 +926,6 @@ impl Ledger {
             Self::load_immutable_with_family(header, acquire, journal, family);
         let setup_loaded = ledger.setup_from_state_map_with_default_fees_and_family(
             default_fees,
-            feature_xrp_fees,
             family,
         )?;
 
@@ -966,7 +962,7 @@ impl Ledger {
             Self::load_immutable_with_family(header, acquire, journal, family);
         ledger.rules = Rules::new(config.features.iter());
         ledger.apply_default_fees(config.fees);
-        let setup_loaded = ledger.setup_from_state_map_with_family(&feature_xrp_fees(), family)?;
+        let setup_loaded = ledger.setup_from_state_map_with_family(family)?;
 
         if loaded && !setup_loaded {
             loaded = false;
@@ -1290,9 +1286,9 @@ impl Ledger {
     ) {
         self.node_fetcher = Some(fetcher);
         let _ = if self.fees.base == 0 && self.fees.reserve == 0 && self.fees.increment == 0 {
-            self.setup_from_state_map_with_default_fees(CURRENT_DEFAULT_FEES, &feature_xrp_fees())
+            self.setup_from_state_map_with_default_fees(CURRENT_DEFAULT_FEES)
         } else {
-            self.setup_from_state_map(&feature_xrp_fees())
+            self.setup_from_state_map()
         };
     }
 
@@ -1804,7 +1800,6 @@ impl Ledger {
     pub fn setup_with_entries(
         &mut self,
         entries: &LedgerSetupEntries,
-        feature_xrp_fees: &Uint256,
     ) -> bool {
         let mut ret = true;
 
@@ -1863,9 +1858,6 @@ impl Ledger {
                 if old_fees && new_fees {
                     ret = false;
                 }
-                if !self.rules.enabled(feature_xrp_fees) && new_fees {
-                    ret = false;
-                }
             }
         }
 
@@ -1901,19 +1893,17 @@ impl Ledger {
 
     pub fn setup_from_state_map(
         &mut self,
-        feature_xrp_fees: &Uint256,
     ) -> Result<bool, LedgerSetupError> {
         let entries = self.read_setup_entries_from_state_map()?;
-        Ok(self.setup_with_entries(&entries, feature_xrp_fees))
+        Ok(self.setup_with_entries(&entries))
     }
 
     pub fn setup_from_state_map_with_default_fees(
         &mut self,
         default_fees: Fees,
-        feature_xrp_fees: &Uint256,
     ) -> Result<bool, LedgerSetupError> {
         self.apply_default_fees(default_fees);
-        self.setup_from_state_map(feature_xrp_fees)
+        self.setup_from_state_map()
     }
 
     pub fn setup_from_state_map_with_config(
@@ -1921,12 +1911,11 @@ impl Ledger {
         config: &LedgerConfig,
     ) -> Result<bool, LedgerSetupError> {
         self.rules = Rules::new(config.features.iter());
-        self.setup_from_state_map_with_default_fees(config.fees, &feature_xrp_fees())
+        self.setup_from_state_map_with_default_fees(config.fees)
     }
 
     pub fn setup_from_state_map_with_family<CLOCK, S, FB, F, MR, NS>(
         &mut self,
-        feature_xrp_fees: &Uint256,
         family: &SHAMapFamily<CLOCK, S, FB, F, MR, NS>,
     ) -> Result<bool, LedgerSetupError>
     where
@@ -1937,13 +1926,12 @@ impl Ledger {
         MR: MissingNodeReporter,
     {
         let entries = self.read_setup_entries_from_state_map_with_family(family)?;
-        Ok(self.setup_with_entries(&entries, feature_xrp_fees))
+        Ok(self.setup_with_entries(&entries))
     }
 
     pub fn setup_from_state_map_with_default_fees_and_family<CLOCK, S, FB, F, MR, NS>(
         &mut self,
         default_fees: Fees,
-        feature_xrp_fees: &Uint256,
         family: &SHAMapFamily<CLOCK, S, FB, F, MR, NS>,
     ) -> Result<bool, LedgerSetupError>
     where
@@ -1954,7 +1942,7 @@ impl Ledger {
         MR: MissingNodeReporter,
     {
         self.apply_default_fees(default_fees);
-        self.setup_from_state_map_with_family(feature_xrp_fees, family)
+        self.setup_from_state_map_with_family(family)
     }
 
     pub fn setup_from_state_map_with_config_and_family<CLOCK, S, FB, F, MR, NS>(
@@ -1972,7 +1960,6 @@ impl Ledger {
         self.rules = Rules::new(config.features.iter());
         self.setup_from_state_map_with_default_fees_and_family(
             config.fees,
-            &feature_xrp_fees(),
             family,
         )
     }
@@ -1980,12 +1967,11 @@ impl Ledger {
     pub fn set_immutable_and_setup_from_state_map(
         &mut self,
         rehash: bool,
-        feature_xrp_fees: &Uint256,
     ) -> Result<bool, LedgerSetupError> {
         if !self.finalize_immutable(rehash) {
             return Ok(false);
         }
-        self.setup_from_state_map(feature_xrp_fees)
+        self.setup_from_state_map()
     }
 
     pub fn set_immutable_and_setup_from_config(
@@ -2065,7 +2051,7 @@ impl Ledger {
             return false;
         }
 
-        if let Err(error) = self.setup_from_state_map(&feature_xrp_fees())
+        if let Err(error) = self.setup_from_state_map()
             && !matches!(error, LedgerSetupError::Traversal(_))
         {
             panic!("xrpl::Ledger::setImmutable : setup failed: {error:?}");
@@ -2459,7 +2445,6 @@ impl Ledger {
         close_time: u32,
         close_resolution: u8,
         correct_close_time: bool,
-        feature_xrp_fees: &Uint256,
     ) -> Result<bool, LedgerSetupError> {
         self.header.close_time = close_time;
         self.header.close_time_resolution = close_resolution;
@@ -2471,7 +2456,7 @@ impl Ledger {
         if !self.finalize_immutable(true) {
             return Ok(false);
         }
-        self.setup_from_state_map(feature_xrp_fees)
+        self.setup_from_state_map()
     }
 
     pub fn set_accepted_and_setup_from_config(
@@ -2859,7 +2844,7 @@ impl Ledger {
             );
         }
 
-        let _ = self.set_immutable_and_setup_from_state_map(true, &feature_xrp_fees())?;
+        let _ = self.set_immutable_and_setup_from_state_map(true)?;
         journal.info(&format!("Loaded ledger: {}", self.header.hash));
         self.set_full();
         Ok(())
@@ -4058,7 +4043,7 @@ mod tests {
             reserve: 1_000_000,
             increment: 200_000,
         };
-        let fee_payload = encode_fee_settings_entry(fees, false);
+        let fee_payload = encode_fee_settings_entry(fees);
         let fee_key = fee_settings_keylet().key;
         let fee_leaf = shamap::tree_node::SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
@@ -4085,7 +4070,7 @@ mod tests {
         );
 
         let setup_without_fetcher = ledger
-            .setup_from_state_map(&feature_xrp_fees())
+            .setup_from_state_map()
             .expect("setup should report missing-node state without failing");
         assert!(!setup_without_fetcher);
         assert_eq!(ledger.fees(), Fees::default());
@@ -4099,7 +4084,7 @@ mod tests {
         }));
 
         let setup_with_fetcher = ledger
-            .setup_from_state_map(&feature_xrp_fees())
+            .setup_from_state_map()
             .expect("fetch-backed setup should succeed");
         assert!(setup_with_fetcher);
         assert_eq!(ledger.fees(), fees);

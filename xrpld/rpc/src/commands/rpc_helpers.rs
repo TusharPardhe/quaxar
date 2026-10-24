@@ -747,6 +747,21 @@ pub fn get_seed_from_rpc(params: &JsonValue) -> Result<Seed, Status> {
     Err(Status::new(RpcErrorCode::InvalidParams))
 }
 
+/// rippled `json::Value::asBool`: rpc-spec reads boolean options this way,
+/// so any non-empty string, non-zero number or non-empty container is true.
+pub fn json_as_bool(value: &JsonValue) -> bool {
+    match value {
+        JsonValue::Bool(value) => *value,
+        JsonValue::Signed(value) => *value != 0,
+        JsonValue::Unsigned(value) => *value != 0,
+        JsonValue::String(value) => !value.is_empty(),
+        JsonValue::Array(values) => !values.is_empty(),
+        JsonValue::Object(values) => !values.is_empty(),
+        // Raw holds pre-serialized server output; it never appears in a request.
+        JsonValue::Raw(_) | JsonValue::Null => false,
+    }
+}
+
 pub fn read_limit_field(params: &JsonValue, role: Role, range: LimitRange) -> Result<u32, Status> {
     let JsonValue::Object(object) = params else {
         return Ok(range.r_default);

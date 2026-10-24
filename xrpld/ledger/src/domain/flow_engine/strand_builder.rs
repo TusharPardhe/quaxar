@@ -709,6 +709,16 @@ fn validate_strand<V: ApplyView>(
                 if !protocol::is_consistent_book(protocol::Book::new(*book_in, *book_out, None)) {
                     return Ter::TEM_BAD_PATH;
                 }
+                // rippled #8468: an issuer paying with its own MPT issues it
+                // into the first book; record it like a holder-sourced
+                // MPTEndpointStep would, so a later book cannot output it again.
+                if index == 0
+                    && matches!(book_in, Asset::MPTIssue(_))
+                    && book_in.issuer() == *strand_src
+                    && view.rules().enabled(&protocol::feature_id("MPTokensV2"))
+                {
+                    seen_direct_src.push(*book_in);
+                }
                 if seen_book_outs.contains(book_out)
                     || seen_direct_src.contains(book_out)
                     || seen_direct_dst.contains(book_out)
@@ -1198,6 +1208,42 @@ mod tests {
         apply_offer_crossing_reserve_reduction(&mut view, &mut strand, &taker, Asset::Issue(issue))
             .expect("view");
         assert_eq!(first_reduction(&strand), 0, "existing trust line");
+    }
+
+    /// rippled #8468 BookStep::check: an issuer paying with its own MPT into
+    /// the first book records that MPT, so a later book that outputs it again
+    /// is a path loop under MPTokensV2.
+    #[test]
+    fn issuer_first_mpt_book_rejects_a_later_book_outputting_the_same_mpt() {
+        let issuer = make_account(7);
+        let dst = make_account(8);
+        let mpt_id = protocol::make_mpt_id(1, issuer);
+        let mpt = Asset::MPTIssue(protocol::MPTIssue::new(mpt_id));
+        let xrp = Asset::Issue(xrp_issue());
+        let mut issuance = STLedgerEntry::new(protocol::mpt_issuance_keylet_from_mptid(mpt_id));
+        issuance.set_account_id(sf("sfIssuer"), issuer);
+        issuance.set_field_u32(sf("sfFlags"), protocol::lsfMPTCanTrade);
+        let book = |book_in, book_out| StepKind::Book {
+            book_in,
+            book_out,
+            domain: None,
+            owner_pays_transfer_fee: false,
+            remove_self_crossing: false,
+        };
+        let strand = vec![book(mpt, xrp), book(xrp, mpt)];
+        let run = |features: Vec<basics::base_uint::Uint256>| {
+            let mut view = checked_view(
+                [account_root(issuer), account_root(dst), issuance.clone()],
+                features,
+            );
+            validate_strand(&mut view, &strand, &issuer, &dst, xrp, false)
+        };
+
+        assert_eq!(
+            run(vec![protocol::feature_id("MPTokensV2")]),
+            Ter::TEM_BAD_PATH_LOOP
+        );
+        assert_ne!(run(vec![]), Ter::TEM_BAD_PATH_LOOP);
     }
 
     #[test]

@@ -970,7 +970,7 @@ fn ledger_set_immutable_and_setup_from_state_map_runs_setup_after_finalization()
     });
 
     let ok = ledger
-        .set_immutable_and_setup_from_state_map(true, &feature_xrp_fees())
+        .set_immutable_and_setup_from_state_map(true)
         .expect("setup after finalization should decode");
 
     assert!(ok);
@@ -1205,7 +1205,7 @@ fn ledger_set_accepted_and_setup_from_state_map_preserves_bool_setup_outcome() {
     ledger.set_rules(original_rules.clone());
 
     let ok = ledger
-        .set_accepted_and_setup_from_state_map(321, 60, false, &feature_xrp_fees())
+        .set_accepted_and_setup_from_state_map(321, 60, false)
         .expect("setup after acceptance should preserve bool failure semantics");
 
     assert!(!ok);
@@ -1402,7 +1402,6 @@ fn ledger_from_ledger_seq_and_close_time_with_setup_applies_defaults_and_presets
             increment: 30,
         },
         [preset, feature_xrp_fees()],
-        &feature_xrp_fees(),
     )
     .expect("empty constructor setup path should not fail");
 
@@ -1674,7 +1673,6 @@ fn ledger_load_immutable_with_family_and_setup_decodes_loaded_state_entries_ctor
             reserve: 2,
             increment: 3,
         },
-        &feature_xrp_fees(),
         &family,
     )
     .expect("setup-aware immutable load should decode");
@@ -2662,7 +2660,6 @@ fn ledger_load_immutable_with_family_and_setup_marks_failed_setup_ctor() {
             reserve: 2,
             increment: 3,
         },
-        &feature_xrp_fees(),
         &family,
     )
     .expect("setup-aware immutable load should keep bool failure semantics");
@@ -2916,7 +2913,7 @@ fn ledger_setup_with_entries_resets_rules_to_presets_when_amendments_object_is_m
         [amendment],
     ));
 
-    let ok = ledger.setup_with_entries(&LedgerSetupEntries::default(), &feature_xrp_fees());
+    let ok = ledger.setup_with_entries(&LedgerSetupEntries::default());
 
     assert!(ok);
     assert!(ledger.rules().enabled(&preset));
@@ -2937,7 +2934,6 @@ fn ledger_setup_with_entries_preserves_prior_rules_when_amendment_lookup_hits_mi
             amendments: SetupLookup::MissingNode,
             fees: SetupLookup::MissingObject,
         },
-        &feature_xrp_fees(),
     );
 
     assert!(!ok);
@@ -2963,7 +2959,6 @@ fn ledger_setup_with_entries_accepts_legacy_fee_fields_when_xrp_fees_is_disabled
                 ..FeeSettingsFields::default()
             }),
         },
-        &feature_xrp_fees(),
     );
 
     assert!(ok);
@@ -3016,7 +3011,6 @@ fn ledger_setup_with_entries_accepts_xrp_amount_fee_fields_when_feature_is_enabl
                 ..FeeSettingsFields::default()
             }),
         },
-        &feature_xrp_fees(),
     );
 
     assert!(ok);
@@ -3062,34 +3056,6 @@ fn ledger_setup_with_entries_rejects_mixed_old_and_new_fee_formats() {
                 ..FeeSettingsFields::default()
             }),
         },
-        &feature_xrp_fees(),
-    );
-
-    assert!(!ok);
-}
-
-#[test]
-fn ledger_setup_with_entries_rejects_new_fee_fields_before_xrp_fees_amendment() {
-    let mut ledger = Ledger::new(LedgerHeader::default(), true);
-    ledger.apply_default_fees(Fees {
-        base: 1,
-        reserve: 2,
-        increment: 3,
-    });
-
-    let ok = ledger.setup_with_entries(
-        &LedgerSetupEntries {
-            amendments: SetupLookup::MissingObject,
-            fees: SetupLookup::Present(FeeSettingsFields {
-                base_fee_drops: Some(AmountField {
-                    drops: 44,
-                    native: true,
-                    negative: false,
-                }),
-                ..FeeSettingsFields::default()
-            }),
-        },
-        &feature_xrp_fees(),
     );
 
     assert!(!ok);
@@ -3124,7 +3090,6 @@ fn ledger_setup_with_entries_rejects_non_native_xrp_amount_fields() {
                 ..FeeSettingsFields::default()
             }),
         },
-        &feature_xrp_fees(),
     );
 
     assert!(!ok);
@@ -3169,7 +3134,7 @@ fn ledger_setup_from_state_map_decodes_amendments_and_legacy_fee_fields() {
     ledger.set_rules(Rules::new([preset]));
 
     let ok = ledger
-        .setup_from_state_map(&feature_xrp_fees())
+        .setup_from_state_map()
         .expect("state-map setup should decode");
 
     assert!(ok);
@@ -3222,7 +3187,6 @@ fn ledger_setup_with_entries_rejects_mixed_legacy_and_xrp_fee_formats() {
                 ..FeeSettingsFields::default()
             }),
         },
-        &feature_xrp_fees(),
     );
 
     assert!(!ok);
@@ -3393,7 +3357,7 @@ fn ledger_setup_from_state_map_with_family_decodes_xrp_fee_fields() {
     });
 
     let ok = ledger
-        .setup_from_state_map_with_family(&feature_xrp_fees(), &family)
+        .setup_from_state_map_with_family(&family)
         .expect("family-backed state-map setup should decode");
 
     assert!(ok);
@@ -3465,7 +3429,7 @@ fn ledger_setup_from_state_map_with_family_returns_false_for_missing_amendment_n
     ledger.set_rules(original_rules.clone());
 
     let ok = ledger
-        .setup_from_state_map_with_family(&feature_xrp_fees(), &family)
+        .setup_from_state_map_with_family(&family)
         .expect("missing-node setup should still return a bool outcome");
 
     assert!(!ok);
@@ -3511,30 +3475,10 @@ fn ledger_setup_from_state_map_rejects_negative_native_xrp_fee_amounts_in_narrow
     });
 
     let ok = ledger
-        .setup_from_state_map(&feature_xrp_fees())
+        .setup_from_state_map()
         .expect("negative native amount should decode through the narrowed port");
 
     assert!(!ok);
-}
-
-#[test]
-fn build_genesis_setup_items_uses_legacy_fee_object_without_xrp_fees_amendment() {
-    let amendment = sample_uint256(0xD1);
-    let config = sample_ledger_config([sample_uint256(0xD2)]);
-    let mut expected_fee_bytes = Vec::new();
-    expected_fee_bytes.extend_from_slice(&encode_u16_field(1, 0x0073));
-    expected_fee_bytes.extend_from_slice(&encode_u32_field(2, 0)); // Flags
-    expected_fee_bytes.extend_from_slice(&encode_u32_field(30, 10));
-    expected_fee_bytes.extend_from_slice(&encode_u32_field(31, 20));
-    expected_fee_bytes.extend_from_slice(&encode_u32_field(32, 30));
-    expected_fee_bytes.extend_from_slice(&encode_u64_field(5, 10));
-
-    let items = build_genesis_setup_items(&config, [amendment]);
-
-    assert_eq!(items.len(), 2);
-    assert_eq!(items[0].0, amendments_key());
-    assert_eq!(items[0].1, encode_amendments_entry(&[amendment]));
-    assert_eq!(items[1], (fees_key(), expected_fee_bytes));
 }
 
 #[test]
@@ -3573,15 +3517,10 @@ fn build_genesis_setup_items_omits_amendments_entry_when_list_is_empty() {
     assert_eq!(
         decode_constructor_fee_settings_entry(&items[0].1)
             .expect("genesis setup fees entry should decode"),
-        ConstructorFeeSettingsEntry::Legacy {
-            base_fee: config.fees.base,
-            reference_fee_units: 10,
-            reserve_base: Some(
-                u32::try_from(config.fees.reserve).expect("fee reserve should fit in u32"),
-            ),
-            reserve_increment: Some(
-                u32::try_from(config.fees.increment).expect("fee increment should fit in u32"),
-            ),
+        ConstructorFeeSettingsEntry::XrpDrops {
+            base_fee_drops: config.fees.base,
+            reserve_base_drops: config.fees.reserve,
+            reserve_increment_drops: config.fees.increment,
         }
     );
 }
@@ -3602,7 +3541,7 @@ fn build_genesis_setup_items_round_trip_through_setup_from_state_map() {
     ledger.apply_default_fees(config.fees);
 
     let loaded = ledger
-        .setup_from_state_map(&feature_xrp_fees())
+        .setup_from_state_map()
         .expect("genesis setup entries should decode through current ledger setup path");
 
     assert!(loaded);
@@ -3697,52 +3636,10 @@ fn create_genesis_setup_only_omits_amendments_entry_when_none_are_supplied() {
     assert_eq!(
         decode_constructor_fee_settings_entry(fees.data())
             .expect("genesis setup-only constructor should keep fees decodable"),
-        ConstructorFeeSettingsEntry::Legacy {
-            base_fee: config.fees.base,
-            reference_fee_units: 10,
-            reserve_base: Some(
-                u32::try_from(config.fees.reserve).expect("fee reserve should fit in u32"),
-            ),
-            reserve_increment: Some(
-                u32::try_from(config.fees.increment).expect("fee increment should fit in u32"),
-            ),
-        }
-    );
-}
-
-#[test]
-fn create_genesis_setup_only_uses_legacy_fee_shape_without_xrp_fees_amendment() {
-    let amendment = sample_uint256(0xDA);
-    let config = sample_ledger_config([sample_uint256(0xDB)]);
-    let ledger = Ledger::create_genesis_setup_only(false, &config, [amendment])
-        .expect("setup-only genesis constructor should insert singleton state entries");
-
-    let (amendments, _amendments_hash) = ledger
-        .state_map()
-        .peek_item_with_hash(amendments_key(), &mut |_| None)
-        .expect("legacy genesis setup-only constructor should keep state map readable")
-        .expect("legacy genesis setup-only constructor should insert amendments entry");
-    assert_eq!(
-        decode_constructor_amendments_entry(amendments.data())
-            .expect("legacy genesis setup-only constructor should keep amendments decodable"),
-        ConstructorAmendmentsEntry {
-            amendments: vec![amendment]
-        }
-    );
-
-    let (fees, _fees_hash) = ledger
-        .state_map()
-        .peek_item_with_hash(fees_key(), &mut |_| None)
-        .expect("legacy genesis setup-only constructor should keep state map readable")
-        .expect("legacy genesis setup-only constructor should insert fees entry");
-    assert_eq!(
-        decode_constructor_fee_settings_entry(fees.data())
-            .expect("legacy genesis setup-only constructor should keep fees decodable"),
-        ConstructorFeeSettingsEntry::Legacy {
-            base_fee: config.fees.base,
-            reference_fee_units: 10,
-            reserve_base: Some(20),
-            reserve_increment: Some(30),
+        ConstructorFeeSettingsEntry::XrpDrops {
+            base_fee_drops: config.fees.base,
+            reserve_base_drops: config.fees.reserve,
+            reserve_increment_drops: config.fees.increment,
         }
     );
 }
@@ -4176,15 +4073,10 @@ fn create_genesis_omits_amendments_entry_when_none_are_supplied() {
     assert_eq!(
         decode_constructor_fee_settings_entry(fees.data())
             .expect("genesis constructor should keep fees decodable"),
-        ConstructorFeeSettingsEntry::Legacy {
-            base_fee: config.fees.base,
-            reference_fee_units: 10,
-            reserve_base: Some(
-                u32::try_from(config.fees.reserve).expect("fee reserve should fit in u32"),
-            ),
-            reserve_increment: Some(
-                u32::try_from(config.fees.increment).expect("fee increment should fit in u32"),
-            ),
+        ConstructorFeeSettingsEntry::XrpDrops {
+            base_fee_drops: config.fees.base,
+            reserve_base_drops: config.fees.reserve,
+            reserve_increment_drops: config.fees.increment,
         }
     );
 }

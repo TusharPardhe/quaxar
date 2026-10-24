@@ -2,9 +2,9 @@ use basics::base_uint::Uint256;
 use protocol::{
     AccountID, ClawbackBuilder, HashPrefix, JsonOptions, KeyType, LoanSetBuilder, NumberJsonInput,
     Payment, PaymentBuilder, PaymentChannelCreateBuilder, SOEStyle, SOETxMPTIssue, SOElement,
-    SOTemplate, STAmount, STArray, STObject, STXChainBridge, SetFeeBuilder, TransactionBase,
+    SOTemplate, STAmount, STArray, STObject, SetFeeBuilder, TransactionBase,
     TxType, XRPAmount, build_multi_signing_data, derive_public_key, get_field_by_symbol,
-    normalized_parts_from_json_input, validate_st_object, xrp_issue,
+    normalized_parts_from_json_input, validate_st_object,
 };
 
 fn account(value: u64) -> AccountID {
@@ -66,27 +66,6 @@ fn wrapper_rejects_wrong_transaction_type() {
 
     let wrong = Payment::new(clawback.tx().clone());
     assert_eq!(wrong.unwrap_err(), "Invalid transaction type for Payment");
-}
-
-#[test]
-fn xchain_commit_builder_round_trips_typed_bridge() {
-    let (public, secret) = signing_keys();
-    let bridge = STXChainBridge::from_parts(account(10), xrp_issue(), account(20), xrp_issue());
-    let tx = protocol::XChainCommitBuilder::new(
-        account(1),
-        bridge.clone(),
-        9,
-        STAmount::from_xrp_amount(XRPAmount::from_drops(50)),
-        Some(3),
-        Some(fee_amount()),
-    )
-    .set_other_chain_destination(account(30))
-    .build(&public, &secret)
-    .expect("xchain commit");
-
-    assert_eq!(tx.get_x_chain_bridge(), bridge);
-    assert_eq!(tx.get_x_chain_claim_id(), 9);
-    assert_eq!(tx.get_other_chain_destination(), Some(account(30)));
 }
 
 #[test]

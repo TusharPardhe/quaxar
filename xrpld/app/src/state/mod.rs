@@ -33,4 +33,3 @@ pub mod transactor_oracle_bridge;
 pub mod trust_set;
 pub mod tuning;
 pub mod vault;
-pub mod xchain;

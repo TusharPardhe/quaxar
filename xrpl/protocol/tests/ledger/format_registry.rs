@@ -12,7 +12,8 @@ fn tx_formats_registry_matches_current_cpp_catalog_shape() {
         .collect::<Vec<_>>();
     let registry_names = formats.iter().map(|item| item.name()).collect::<Vec<_>>();
 
-    assert_eq!(formats.iter().count(), 84);
+    // rippled develop has 78; quaxar omits the two Cosign proposal types (Supported::No).
+    assert_eq!(formats.iter().count(), 76);
     assert_eq!(formats.get_common_fields().len(), 20);
     assert_eq!(
         common_symbols,
@@ -110,21 +111,21 @@ fn pinned_sponsorship_and_mpt_format_metadata_is_exact() {
             TxType::AMM_CREATE,
             "AMMCreate",
             "Delegation::delegable",
-            "featureAMM",
+            "uint256{}",
             "createPseudoAcct | mayCreateMPT",
         ),
         (
             TxType::AMM_WITHDRAW,
             "AMMWithdraw",
             "Delegation::delegable",
-            "featureAMM",
+            "uint256{}",
             "mayDeleteAcct | mayAuthorizeMPT",
         ),
         (
             TxType::AMM_DELETE,
             "AMMDelete",
             "Delegation::delegable",
-            "featureAMM",
+            "uint256{}",
             "mustDeleteAcct | mayDeleteMPT",
         ),
     ];

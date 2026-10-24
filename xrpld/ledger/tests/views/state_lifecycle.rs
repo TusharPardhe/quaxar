@@ -674,7 +674,6 @@ fn ledger_set_immutable_refreshes_rules_and_fees() {
                         reserve: 55,
                         increment: 66,
                     },
-                    true,
                 ),
             ),
         ],

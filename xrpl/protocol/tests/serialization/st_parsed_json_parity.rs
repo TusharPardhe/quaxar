@@ -175,7 +175,7 @@ fn st_parsed_json_account_currency_issue_and_amount_categories_match_cpp_rules()
 }
 
 #[test]
-fn st_parsed_json_pathset_bridge_and_number_categories_match_cpp_rules() {
+fn st_parsed_json_pathset_and_number_categories_match_cpp_rules() {
     let json = object([
         (
             "Paths",
@@ -191,39 +191,12 @@ fn st_parsed_json_pathset_bridge_and_number_categories_match_cpp_rules() {
                 ),
             ])])]),
         ),
-        (
-            "XChainBridge",
-            object([
-                (
-                    "LockingChainDoor",
-                    JsonValue::String("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh".to_owned()),
-                ),
-                (
-                    "LockingChainIssue",
-                    object([("currency", JsonValue::String("XRP".to_owned()))]),
-                ),
-                (
-                    "IssuingChainDoor",
-                    JsonValue::String("rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe".to_owned()),
-                ),
-                (
-                    "IssuingChainIssue",
-                    object([
-                        ("currency", JsonValue::String("USD".to_owned())),
-                        (
-                            "issuer",
-                            JsonValue::String("rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe".to_owned()),
-                        ),
-                    ]),
-                ),
-            ]),
-        ),
         ("AssetsAvailable", JsonValue::String("12.5".to_owned())),
     ]);
 
     let parsed = STParsedJSONObject::new("test", &json)
         .object
-        .expect("pathset, bridge, and number fields should parse");
+        .expect("pathset and number fields should parse");
     let paths = parsed.get_field_path_set(get_field_by_symbol("sfPaths"));
     assert_eq!(paths[0].size(), 1);
     assert!(paths[0][0].has_currency());
@@ -232,19 +205,6 @@ fn st_parsed_json_pathset_bridge_and_number_categories_match_cpp_rules() {
         "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
     );
 
-    let bridge = parsed.get_field_xchain_bridge(get_field_by_symbol("sfXChainBridge"));
-    assert_eq!(
-        to_base58(bridge.locking_chain_door()),
-        "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
-    );
-    assert_eq!(
-        bridge.issuing_chain_issue(),
-        protocol::Asset::Issue(protocol::Issue::new(
-            protocol::currency_from_string("USD"),
-            protocol::parse_base58_account_id("rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe")
-                .expect("issuer account"),
-        ))
-    );
     assert_eq!(
         parsed
             .get_field_number(get_field_by_symbol("sfAssetsAvailable"))
@@ -358,4 +318,11 @@ fn st_parsed_json_edge_case_failures_match_current_cpp_rules() {
             .object
             .is_none()
     );
+}
+
+/// rippled #8255 removed the XChainBridge field and STI_XCHAIN_BRIDGE (25).
+#[test]
+fn st_parsed_json_rejects_removed_xchain_bridge_field() {
+    let json = object([("XChainBridge", JsonValue::Object(Default::default()))]);
+    assert!(STParsedJSONObject::new("test", &json).object.is_none());
 }

@@ -445,31 +445,6 @@ pub fn validation_received_json(
         );
     }
 
-    if validation.is_field_present(get_field_by_symbol("sfBaseFee")) {
-        object.insert(
-            "base_fee".to_owned(),
-            JsonValue::Unsigned(validation.get_field_u64(get_field_by_symbol("sfBaseFee"))),
-        );
-    }
-
-    if validation.is_field_present(get_field_by_symbol("sfReserveBase")) {
-        object.insert(
-            "reserve_base".to_owned(),
-            JsonValue::Unsigned(u64::from(
-                validation.get_field_u32(get_field_by_symbol("sfReserveBase")),
-            )),
-        );
-    }
-
-    if validation.is_field_present(get_field_by_symbol("sfReserveIncrement")) {
-        object.insert(
-            "reserve_inc".to_owned(),
-            JsonValue::Unsigned(u64::from(
-                validation.get_field_u32(get_field_by_symbol("sfReserveIncrement")),
-            )),
-        );
-    }
-
     if validation.is_field_present(get_field_by_symbol("sfBaseFeeDrops")) {
         let amount = validation.get_field_amount(get_field_by_symbol("sfBaseFeeDrops"));
         if amount.native() {

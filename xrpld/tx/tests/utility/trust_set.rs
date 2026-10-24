@@ -53,7 +53,6 @@ fn preclaim_facts() -> TrustSetPreclaimFacts {
         account_requires_auth: true,
         destination_is_source: false,
         destination_exists: true,
-        amm_or_single_asset_vault_enabled: false,
         destination_account_flags: 0,
         trustline_exists: true,
         destination_is_pseudo_account: false,
@@ -226,7 +225,6 @@ fn trust_set_preclaim_maps_destination_and_disallow_incoming_rules() {
         ..preclaim_facts()
     });
     let no_dst = run_trust_set_preclaim_with_facts(TrustSetPreclaimFacts {
-        amm_or_single_asset_vault_enabled: true,
         destination_exists: false,
         ..preclaim_facts()
     });

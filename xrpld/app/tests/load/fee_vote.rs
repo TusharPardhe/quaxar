@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use app::{FeeSetup, FeeVote, FeeVoteJournal, FeeVoteLedgerView, ShamapVoteTxSet};
 use basics::tagged_cache::MonotonicClock;
-use ledger::{Fees, INITIAL_XRP_DROPS};
+use ledger::Fees;
 use protocol::{
-    KeyType, Rules, STAmount, STTx, STValidation, SecretKey, SerialIter, TxType,
-    VF_FULL_VALIDATION, calc_node_id, derive_public_key, feature_xrp_fees, get_field_by_symbol,
+    KeyType, STAmount, STTx, STValidation, SecretKey, SerialIter, TxType,
+    VF_FULL_VALIDATION, calc_node_id, derive_public_key, get_field_by_symbol,
 };
 use shamap::{storage::StorageTree, tree_node_cache::TreeNodeCache};
 use time::Duration;
@@ -34,7 +34,6 @@ impl FeeVoteJournal for RecordingJournal {
 
 struct FakeLedger {
     fees: Fees,
-    rules: Rules,
     seq: u32,
     is_flag_ledger: bool,
 }
@@ -42,10 +41,6 @@ struct FakeLedger {
 impl FeeVoteLedgerView for FakeLedger {
     fn fees(&self) -> Fees {
         self.fees
-    }
-
-    fn rules(&self) -> &Rules {
-        &self.rules
     }
 
     fn seq(&self) -> u32 {
@@ -98,7 +93,7 @@ fn fee_vote_setup() -> FeeSetup {
 }
 
 #[test]
-fn fee_vote_validation_uses_xrp_fee_fields_when_feature_is_enabled() {
+fn fee_vote_validation_uses_xrp_fee_fields() {
     let journal = RecordingJournal::default();
     let fee_vote = FeeVote::new(fee_vote_setup(), journal);
     let mut validation = validation_with_fill(1, 255, true, |_| {});
@@ -109,7 +104,6 @@ fn fee_vote_validation_uses_xrp_fee_fields_when_feature_is_enabled() {
             reserve: 200_000,
             increment: 50_000,
         },
-        &Rules::new([feature_xrp_fees()]),
         &mut validation,
     );
 
@@ -129,36 +123,6 @@ fn fee_vote_validation_uses_xrp_fee_fields_when_feature_is_enabled() {
 }
 
 #[test]
-fn fee_vote_validation_uses_legacy_fee_fields_when_feature_is_disabled() {
-    let fee_vote = FeeVote::new(fee_vote_setup(), RecordingJournal::default());
-    let mut validation = validation_with_fill(2, 255, true, |_| {});
-
-    fee_vote.do_validation(
-        Fees {
-            base: 10,
-            reserve: 200_000,
-            increment: 50_000,
-        },
-        &Rules::new(std::iter::empty()),
-        &mut validation,
-    );
-
-    assert_eq!(
-        validation.get_field_u64(get_field_by_symbol("sfBaseFee")),
-        42
-    );
-    assert_eq!(
-        validation.get_field_u32(get_field_by_symbol("sfReserveBase")),
-        1_234_567
-    );
-    assert_eq!(
-        validation.get_field_u32(get_field_by_symbol("sfReserveIncrement")),
-        7_654_321
-    );
-    assert!(!validation.is_field_present(get_field_by_symbol("sfBaseFeeDrops")));
-}
-
-#[test]
 fn fee_vote_inserts_a_single_fee_transaction_for_trusted_xrp_votes() {
     let fee_vote = FeeVote::new(fee_vote_setup(), RecordingJournal::default());
     let ledger = FakeLedger {
@@ -167,7 +131,6 @@ fn fee_vote_inserts_a_single_fee_transaction_for_trusted_xrp_votes() {
             reserve: 200_000,
             increment: 50_000,
         },
-        rules: Rules::new([feature_xrp_fees()]),
         seq: 256,
         is_flag_ledger: true,
     };
@@ -220,7 +183,7 @@ fn fee_vote_inserts_a_single_fee_transaction_for_trusted_xrp_votes() {
 }
 
 #[test]
-fn fee_vote_ignores_invalid_or_untrusted_votes_when_selecting_legacy_values() {
+fn fee_vote_ignores_invalid_or_untrusted_votes_() {
     let fee_vote = FeeVote::new(
         FeeSetup {
             reference_fee: protocol::XRPAmount::from_drops(30),
@@ -235,23 +198,30 @@ fn fee_vote_ignores_invalid_or_untrusted_votes_when_selecting_legacy_values() {
             reserve: 200,
             increment: 20,
         },
-        rules: Rules::new(std::iter::empty()),
         seq: 512,
         is_flag_ledger: true,
     };
     let validations = vec![
         validation_with_fill(5, 512, true, |validation| {
-            validation.set_field_u64(get_field_by_symbol("sfBaseFee"), 30);
-            validation.set_field_u32(get_field_by_symbol("sfReserveBase"), 300);
-            validation.set_field_u32(get_field_by_symbol("sfReserveIncrement"), 30);
+            validation.set_field_amount(get_field_by_symbol("sfBaseFeeDrops"), STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(30)));
+            validation.set_field_amount(get_field_by_symbol("sfReserveBaseDrops"), STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(300)));
+            validation.set_field_amount(get_field_by_symbol("sfReserveIncrementDrops"), STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(30)));
         }),
         validation_with_fill(6, 512, true, |validation| {
-            validation.set_field_u64(get_field_by_symbol("sfBaseFee"), INITIAL_XRP_DROPS + 1);
+            // A non-native amount is not a usable fee vote (rippled doVote: noVote).
+            validation.set_field_amount(
+                get_field_by_symbol("sfBaseFeeDrops"),
+                STAmount::from_iou_amount(
+                    get_field_by_symbol("sfBaseFeeDrops"),
+                    protocol::IOUAmount::from_parts(99, 0).expect("iou"),
+                    protocol::Issue::new(protocol::currency_from_string("USD"), protocol::AccountID::from_array([9; 20])),
+                ),
+            );
         }),
         validation_with_fill(7, 512, false, |validation| {
-            validation.set_field_u64(get_field_by_symbol("sfBaseFee"), 99);
-            validation.set_field_u32(get_field_by_symbol("sfReserveBase"), 999);
-            validation.set_field_u32(get_field_by_symbol("sfReserveIncrement"), 999);
+            validation.set_field_amount(get_field_by_symbol("sfBaseFeeDrops"), STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(99)));
+            validation.set_field_amount(get_field_by_symbol("sfReserveBaseDrops"), STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(999)));
+            validation.set_field_amount(get_field_by_symbol("sfReserveIncrementDrops"), STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(999)));
         }),
     ];
     let mut txs = Vec::<STTx>::new();
@@ -260,16 +230,13 @@ fn fee_vote_ignores_invalid_or_untrusted_votes_when_selecting_legacy_values() {
 
     assert_eq!(txs.len(), 1);
     let tx = &txs[0];
-    assert_eq!(tx.get_field_u64(get_field_by_symbol("sfBaseFee")), 30);
-    assert_eq!(tx.get_field_u32(get_field_by_symbol("sfReserveBase")), 300);
+    assert_eq!(tx.get_field_amount(get_field_by_symbol("sfBaseFeeDrops")), STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(30)));
+    assert_eq!(tx.get_field_amount(get_field_by_symbol("sfReserveBaseDrops")), STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(300)));
     assert_eq!(
-        tx.get_field_u32(get_field_by_symbol("sfReserveIncrement")),
-        30
+        tx.get_field_amount(get_field_by_symbol("sfReserveIncrementDrops")),
+        STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(30))
     );
-    assert_eq!(
-        tx.get_field_u32(get_field_by_symbol("sfReferenceFeeUnits")),
-        protocol::REFERENCE_FEE_UNITS_DEPRECATED
-    );
+    assert!(!tx.is_field_present(get_field_by_symbol("sfBaseFee")));
 }
 
 #[test]
@@ -281,7 +248,6 @@ fn shamap_vote_tx_set_stores_fee_vote_transactions_in_real_shamap() {
             reserve: 200_000,
             increment: 50_000,
         },
-        rules: Rules::new([feature_xrp_fees()]),
         seq: 256,
         is_flag_ledger: true,
     };

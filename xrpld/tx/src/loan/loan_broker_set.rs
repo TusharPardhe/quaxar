@@ -42,6 +42,38 @@ pub struct LoanBrokerSetPreflightFacts {
     pub private_flag_is_set: bool,
 }
 
+/// rippled LoanBrokerSet preclaim value check on `sfDebtMaximum`:
+/// `(fixCleanup3_5_0 && !isRepresentable) || STAmount{asset, v} != v`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DebtMaximumRepresentability {
+    /// The value converts to the vault asset unchanged.
+    #[default]
+    Exact,
+    /// tecPRECISION_LOSS: rounded on conversion, or (fixCleanup3_5_0, rippled
+    /// #8527) out of range for the asset.
+    PrecisionLoss,
+    /// Out of range without fixCleanup3_5_0: rippled's `STAmount{asset, v}`
+    /// throws, so preclaim fails with tefEXCEPTION.
+    Throws,
+}
+
+impl DebtMaximumRepresentability {
+    pub fn classify(asset: protocol::Asset, value: basics::number::NumberParts, fix_cleanup_3_5_0: bool) -> Self {
+        if !asset.is_representable(value) {
+            return if fix_cleanup_3_5_0 {
+                Self::PrecisionLoss
+            } else {
+                Self::Throws
+            };
+        }
+        if asset.round_trips(value) {
+            Self::Exact
+        } else {
+            Self::PrecisionLoss
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LoanBrokerSetPreclaimFacts {
     pub vault_exists: bool,
@@ -52,7 +84,7 @@ pub struct LoanBrokerSetPreclaimFacts {
     pub submitter_is_broker_owner: bool,
     pub debt_maximum_is_zero_or_not_below_current_debt: bool,
     pub debt_maximum_is_present: bool,
-    pub debt_maximum_is_representable: bool,
+    pub debt_maximum_representability: DebtMaximumRepresentability,
     pub can_add_holding_result: Ter,
     pub check_frozen_result: Ter,
     /// The existing broker being updated has lsfLoanBrokerPrivate.
@@ -270,8 +302,14 @@ pub fn run_loan_broker_set_preclaim(facts: LoanBrokerSetPreclaimFacts) -> Ter {
         return Ter::TEC_OBJECT_NOT_FOUND;
     }
 
-    if facts.debt_maximum_is_present && !facts.debt_maximum_is_representable {
-        return Ter::TEC_PRECISION_LOSS;
+    if facts.debt_maximum_is_present {
+        match facts.debt_maximum_representability {
+            DebtMaximumRepresentability::Exact => {}
+            DebtMaximumRepresentability::PrecisionLoss => return Ter::TEC_PRECISION_LOSS,
+            DebtMaximumRepresentability::Throws => {
+                basics::contract::throw_overflow("DebtMaximum is out of range for the asset")
+            }
+        }
     }
 
     Ter::TES_SUCCESS

@@ -251,6 +251,11 @@ pub fn do_account_nfts<S: AccountNFTsSource>(
     request: &AccountNFTsRequest<'_>,
     source: &S,
 ) -> JsonValue {
+    if let Err(status) = crate::handlers::ledger_lookup::validate_ledger_selector(request.params) {
+        let mut error = JsonValue::Object(BTreeMap::new());
+        status.inject(&mut error);
+        return error;
+    }
     tracing::trace!(target: "rpc", method = "account_nfts", "account_nfts query");
     let account = match parse_account(request.params) {
         Ok(account) => account,

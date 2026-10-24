@@ -59,7 +59,7 @@ fn typed_ported_decode_dispatches_ledger_hashes() {
 
 #[test]
 fn typed_constructor_decode_dispatches_fee_settings() {
-    let payload = encode_fee_settings_entry(10, 20, 30, true);
+    let payload = encode_fee_settings_entry(10, 20, 30);
 
     let decoded =
         decode_constructor_ledger_entry(&payload).expect("constructor fee settings should decode");
@@ -190,7 +190,6 @@ fn typed_constructor_item_builds_current_genesis_fee_singleton() {
         10,
         20,
         30,
-        &[feature_xrp_fees()],
     ));
 
     let (key, payload) = constructor_ledger_item(&entry);
@@ -207,25 +206,6 @@ fn typed_constructor_item_builds_current_genesis_fee_singleton() {
 }
 
 #[test]
-fn typed_constructor_item_builds_current_genesis_legacy_fee_singleton() {
-    let entry =
-        ConstructorLedgerEntry::FeeSettings(make_constructor_fee_settings_entry(10, 20, 30, &[]));
-
-    let (key, payload) = constructor_ledger_item(&entry);
-
-    assert_eq!(key, fees_key());
-    assert_eq!(
-        decode_constructor_fee_settings_entry(&payload),
-        Ok(ConstructorFeeSettingsEntry::Legacy {
-            base_fee: 10,
-            reference_fee_units: protocol::REFERENCE_FEE_UNITS_DEPRECATED,
-            reserve_base: Some(20),
-            reserve_increment: Some(30),
-        })
-    );
-}
-
-#[test]
 fn typed_constructor_item_builds_current_genesis_account_root() {
     let entry = ConstructorLedgerEntry::AccountRoot(ConstructorAccountRootEntry {
         sequence: 1,
@@ -237,21 +217,6 @@ fn typed_constructor_item_builds_current_genesis_account_root() {
 
     assert_eq!(key, account_root_key(genesis_account_id()));
     assert_eq!(decode_constructor_ledger_entry(&payload), Ok(entry));
-}
-
-#[test]
-fn legacy_constructor_fee_builder_omits_overflowing_reserve_fields() {
-    let entry = make_constructor_fee_settings_entry(10, u64::from(u32::MAX) + 1, 30, &[]);
-
-    assert_eq!(
-        entry,
-        ConstructorFeeSettingsEntry::Legacy {
-            base_fee: 10,
-            reference_fee_units: 10,
-            reserve_base: None,
-            reserve_increment: Some(30),
-        }
-    );
 }
 
 #[test]

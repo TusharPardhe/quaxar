@@ -557,9 +557,17 @@ fn preclaim_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
             .is_some(),
         None => false,
     };
+    let fix_cleanup_3_5_0 = view
+        .rules()
+        .enabled(&protocol::feature_id("fixCleanup3_5_0"));
+    let vault_asset = vault.get_field_issue(sf("sfAsset")).asset();
+    let assets_maximum_out_of_range = fix_cleanup_3_5_0
+        && tx.is_field_present(sf("sfAssetsMaximum"))
+        && !vault_asset.is_representable(tx.get_field_number(sf("sfAssetsMaximum")).value());
     Ok(run_vault_set_preclaim(VaultSetPreclaimFacts {
         vault_exists: true,
         submitter_is_owner: vault.get_account_id(sf("sfOwner")) == account,
+        assets_maximum_out_of_range,
         issuance_exists: issuance.is_some(),
         domain_id_present: domain.is_some(),
         domain_id_is_zero: domain.is_some_and(|id| id.is_zero()),
@@ -1094,6 +1102,37 @@ mod tests {
             Some(Ter::TEC_NO_PERMISSION)
         );
         assert_eq!(view.entries.len(), 1, "ReadView helper must not mutate");
+    }
+    /// rippled #8527 VaultSet::preclaim: under fixCleanup3_5_0 an
+    /// AssetsMaximum out of range for the vault asset is tecPRECISION_LOSS,
+    /// checked after ownership and before the share-issuance lookup.
+    #[test]
+    fn vault_set_rejects_out_of_range_assets_maximum_under_cleanup_3_5_0() {
+        let id = Uint256::from_u64(3);
+        let tx = STTx::new(TxType::VAULT_SET, |tx| {
+            tx.set_field_h256(sf("sfVaultID"), id);
+            tx.set_account_id(sf("sfAccount"), account(1));
+            tx.set_field_number(
+                sf("sfAssetsMaximum"),
+                protocol::STNumber::from(basics::number::NumberParts::from_i64(
+                    1_000_000_000_000_000_000,
+                )),
+            );
+        });
+        let run = |rules| {
+            let mut view = View {
+                rules,
+                ..View::default()
+            };
+            view.insert(vault(id, account(1), account(2)));
+            run_vault_read_view_preclaim(&view, &tx, TxType::VAULT_SET)
+        };
+        assert_eq!(
+            run(Rules::new([protocol::feature_id("fixCleanup3_5_0")])),
+            Some(Ter::TEC_PRECISION_LOSS)
+        );
+        // Before the fix the share issuance lookup comes next (missing here).
+        assert_eq!(run(Rules::new([])), Some(Ter::TEF_INTERNAL));
     }
     #[test]
     fn closed_ended_phase_boundaries_and_withdraw_gate_match_v1_1() {

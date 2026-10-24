@@ -1000,15 +1000,6 @@ fn run_preflight(view: &impl ReadView, tx: &STTx, txn_type: TxType) -> Ter {
         // --- Loan transactors ---
         TxType::LOAN_BROKER_SET => Ter::TES_SUCCESS,
         TxType::LOAN_BROKER_DELETE => Ter::TES_SUCCESS,
-        // --- XChainBridge ---
-        TxType::XCHAIN_CREATE_BRIDGE => Ter::TES_SUCCESS,
-        TxType::XCHAIN_MODIFY_BRIDGE => Ter::TES_SUCCESS,
-        TxType::XCHAIN_CREATE_CLAIM_ID => Ter::TES_SUCCESS,
-        TxType::XCHAIN_COMMIT => Ter::TES_SUCCESS,
-        TxType::XCHAIN_CLAIM => Ter::TES_SUCCESS,
-        TxType::XCHAIN_ACCOUNT_CREATE_COMMIT => Ter::TES_SUCCESS,
-        TxType::XCHAIN_ADD_CLAIM_ATTESTATION => Ter::TES_SUCCESS,
-        TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION => Ter::TES_SUCCESS,
         // --- VaultSet/Clawback ---
         TxType::VAULT_SET => Ter::TES_SUCCESS,
         TxType::VAULT_CLAWBACK => Ter::TES_SUCCESS,

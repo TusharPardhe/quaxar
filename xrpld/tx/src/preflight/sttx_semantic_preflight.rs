@@ -198,7 +198,6 @@ fn validate_sttx_flag_mask(tx: &STTx, rules: &Rules) -> NotTec {
         TxType::MPTOKEN_ISSUANCE_CREATE => flags & protocol::MPT_ISSUANCE_CREATE_FLAGS_MASK,
         TxType::MPTOKEN_ISSUANCE_SET => flags & protocol::MPT_ISSUANCE_SET_FLAGS_MASK,
         TxType::MPTOKEN_AUTHORIZE => flags & protocol::MPT_UNAUTHORIZE_FLAGS_MASK,
-        TxType::XCHAIN_MODIFY_BRIDGE => flags & protocol::XCHAIN_MODIFY_BRIDGE_FLAGS_MASK,
         TxType::VAULT_CREATE => flags & protocol::VAULT_CREATE_FLAGS_MASK,
         TxType::BATCH => flags & protocol::BATCH_FLAGS_MASK,
         TxType::LOAN_SET => flags & protocol::LOAN_SET_FLAGS_MASK,
@@ -285,13 +284,6 @@ fn validate_sttx_flag_mask(tx: &STTx, rules: &Rules) -> NotTec {
         | TxType::CHECK_CANCEL
         | TxType::NFTOKEN_BURN
         | TxType::CLAWBACK
-        | TxType::XCHAIN_CREATE_CLAIM_ID
-        | TxType::XCHAIN_COMMIT
-        | TxType::XCHAIN_CLAIM
-        | TxType::XCHAIN_ACCOUNT_CREATE_COMMIT
-        | TxType::XCHAIN_ADD_CLAIM_ATTESTATION
-        | TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION
-        | TxType::XCHAIN_CREATE_BRIDGE
         | TxType::ORACLE_SET
         | TxType::ORACLE_DELETE
         | TxType::LEDGER_STATE_FIX
@@ -445,9 +437,6 @@ fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
             }
         }
         TxType::AMM_CREATE => {
-            if !protocol::amm_enabled(rules) {
-                return Ter::TEM_DISABLED;
-            }
             let amount = get_field_by_symbol("sfAmount");
             let amount2 = get_field_by_symbol("sfAmount2");
             if tx.is_field_present(amount)
@@ -466,7 +455,6 @@ fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
                 tx.is_field_present(field) && tx.get_field_amount(field).holds_mpt_issue()
             };
             if !crate::amm_withdraw_check_extra_features(
-                protocol::amm_enabled(rules),
                 rules.enabled(&protocol::feature_id("MPTokensV2")),
                 matches!(asset, Asset::MPTIssue(_)),
                 matches!(asset2, Asset::MPTIssue(_)),
@@ -479,7 +467,6 @@ fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
         TxType::AMM_VOTE => {
             let (asset, asset2) = amm_pair(tx);
             if !crate::amm_vote_check_extra_features(
-                protocol::amm_enabled(rules),
                 rules.enabled(&protocol::feature_id("MPTokensV2")),
                 matches!(asset, Asset::MPTIssue(_)),
                 matches!(asset2, Asset::MPTIssue(_)),
@@ -494,7 +481,6 @@ fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
                 tx.is_field_present(field) && tx.get_field_amount(field).holds_mpt_issue()
             };
             if !crate::amm_deposit_check_extra_features(
-                protocol::amm_enabled(rules),
                 rules.enabled(&protocol::feature_id("MPTokensV2")),
                 matches!(asset, Asset::MPTIssue(_)),
                 matches!(asset2, Asset::MPTIssue(_)),
@@ -507,7 +493,6 @@ fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
         TxType::AMM_BID => {
             let (asset, asset2) = amm_pair(tx);
             if !crate::amm_bid_check_extra_features(
-                protocol::amm_enabled(rules),
                 rules.enabled(&protocol::feature_id("MPTokensV2")),
                 matches!(asset, Asset::MPTIssue(_)) || matches!(asset2, Asset::MPTIssue(_)),
             ) {
@@ -517,7 +502,6 @@ fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
         TxType::AMM_DELETE => {
             let (asset, asset2) = amm_pair(tx);
             if !crate::amm_delete_check_extra_features(
-                protocol::amm_enabled(rules),
                 rules.enabled(&protocol::feature_id("MPTokensV2")),
                 matches!(asset, Asset::MPTIssue(_)) || matches!(asset2, Asset::MPTIssue(_)),
             ) {
@@ -1013,14 +997,6 @@ fn validate_sttx_typed_semantic_preflight(
                 > 0,
             tx_specific_flags: tx.get_flags() & protocol::LOAN_PAY_FLAGS,
         }),
-        TxType::XCHAIN_CREATE_BRIDGE
-        | TxType::XCHAIN_MODIFY_BRIDGE
-        | TxType::XCHAIN_CREATE_CLAIM_ID
-        | TxType::XCHAIN_COMMIT
-        | TxType::XCHAIN_CLAIM
-        | TxType::XCHAIN_ACCOUNT_CREATE_COMMIT
-        | TxType::XCHAIN_ADD_CLAIM_ATTESTATION
-        | TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION => validate_xchain_preflight(tx, txn_type),
         // These are never ordinary typed-preflight routes. Change is handled
         // before Transactor::preflight1, while Batch owns the inner catalog.
         TxType::BATCH => crate::validate_sttx_batch_preflight_with_rules_and_network_id(
@@ -1029,9 +1005,6 @@ fn validate_sttx_typed_semantic_preflight(
             node_network_id,
         ),
         TxType::AMENDMENT | TxType::FEE | TxType::UNL_MODIFY => Ter::TES_SUCCESS,
-        // The Rust tx crate does not yet expose the reference attestation and
-        // lending STTx adapters. Fail closed rather than silently accepting
-        // malformed transactions through the former dispatchable wildcard.
         TxType::LOAN_SET => validate_loan_set_preflight(tx, rules),
         TxType::SPONSORSHIP_TRANSFER => validate_sponsorship_transfer_preflight(tx, rules),
         TxType::SPONSORSHIP_SET => validate_sponsorship_set_preflight(tx),
@@ -1346,14 +1319,6 @@ fn has_explicit_typed_preflight_route(txn_type: TxType) -> bool {
             | TxType::AMM_VOTE
             | TxType::AMM_BID
             | TxType::AMM_DELETE
-            | TxType::XCHAIN_CREATE_CLAIM_ID
-            | TxType::XCHAIN_COMMIT
-            | TxType::XCHAIN_CLAIM
-            | TxType::XCHAIN_ACCOUNT_CREATE_COMMIT
-            | TxType::XCHAIN_ADD_CLAIM_ATTESTATION
-            | TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION
-            | TxType::XCHAIN_MODIFY_BRIDGE
-            | TxType::XCHAIN_CREATE_BRIDGE
             | TxType::DID_SET
             | TxType::DID_DELETE
             | TxType::ORACLE_SET
@@ -1644,6 +1609,12 @@ fn validate_vault_preflight(tx: &STTx, rules: &Rules, txn_type: TxType) -> NotTe
                         .is_zero(),
                 is_private: tx.get_flags() & crate::VAULT_PRIVATE_FLAG != 0,
                 assets_maximum_is_negative: optional_number_is_negative(tx, "sfAssetsMaximum"),
+                // rippled #8527 VaultCreate::preflight.
+                assets_maximum_out_of_range: rules.enabled(&protocol::feature_id("fixCleanup3_5_0"))
+                    && present("sfAssetsMaximum")
+                    && !asset.is_representable(
+                        tx.get_field_number(get_field_by_symbol("sfAssetsMaximum")).value(),
+                    ),
                 mptoken_metadata_len: optional_data_len(tx, "sfMPTokenMetadata"),
                 scale: present("sfScale").then(|| tx.get_field_u8(get_field_by_symbol("sfScale"))),
                 asset_is_mpt: matches!(asset, Asset::MPTIssue(_)),
@@ -1732,16 +1703,6 @@ fn validate_vault_preflight(tx: &STTx, rules: &Rules, txn_type: TxType) -> NotTe
             })
         }
         _ => Ter::TEM_UNKNOWN,
-    }
-}
-
-fn xchain_bridge_spec(tx: &STTx) -> crate::XChainBridgeSpec {
-    let bridge = tx.get_field_xchain_bridge(get_field_by_symbol("sfXChainBridge"));
-    crate::XChainBridgeSpec {
-        locking_chain_door: bridge.locking_chain_door(),
-        locking_chain_issue: *bridge.locking_chain_issue().get::<protocol::Issue>(),
-        issuing_chain_door: bridge.issuing_chain_door(),
-        issuing_chain_issue: *bridge.issuing_chain_issue().get::<protocol::Issue>(),
     }
 }
 
@@ -1932,122 +1893,6 @@ fn validate_loan_set_preflight(tx: &STTx, rules: &Rules) -> NotTec {
         |_signature| Ter::TES_SUCCESS,
         || !present("sfLoanBrokerID") || !tx.get_field_h256(field("sfLoanBrokerID")).is_zero(),
     )
-}
-
-fn validate_xchain_attestation_preflight(tx: &STTx, create_account: bool) -> NotTec {
-    if protocol::PublicKey::from_slice(&tx.get_field_vl(get_field_by_symbol("sfPublicKey")))
-        .is_err()
-    {
-        return Ter::TEM_MALFORMED;
-    }
-    let bridge = tx.get_field_xchain_bridge(get_field_by_symbol("sfXChainBridge"));
-    let (verified, valid_amounts, sending_amount, was_locking) = if create_account {
-        let attestation =
-            protocol::attestations::AttestationCreateAccount::from_transaction_st_object(tx);
-        (
-            attestation.verify(&bridge),
-            attestation.valid_amounts(),
-            attestation.base.sending_amount,
-            attestation.base.was_locking_chain_send,
-        )
-    } else {
-        let attestation = protocol::attestations::AttestationClaim::from_transaction_st_object(tx);
-        (
-            attestation.verify(&bridge),
-            attestation.valid_amounts(),
-            attestation.base.sending_amount,
-            attestation.base.was_locking_chain_send,
-        )
-    };
-    if !verified || !valid_amounts || sending_amount.signum() <= 0 {
-        return Ter::TEM_XCHAIN_BAD_PROOF;
-    }
-    let source_chain = protocol::STXChainBridge::src_chain(was_locking);
-    if sending_amount.asset() != bridge.issue(source_chain) {
-        return Ter::TEM_XCHAIN_BAD_PROOF;
-    }
-    Ter::TES_SUCCESS
-}
-
-fn validate_xchain_preflight(tx: &STTx, txn_type: TxType) -> NotTec {
-    let field = get_field_by_symbol;
-    match txn_type {
-        TxType::XCHAIN_CREATE_BRIDGE => {
-            crate::run_xchain_create_bridge_preflight(crate::XChainCreateBridgePreflightFacts {
-                account: tx.get_account_id(field("sfAccount")),
-                reward: tx.get_field_amount(field("sfSignatureReward")),
-                min_account_create: tx
-                    .is_field_present(field("sfMinAccountCreateAmount"))
-                    .then(|| tx.get_field_amount(field("sfMinAccountCreateAmount"))),
-                bridge: xchain_bridge_spec(tx),
-            })
-        }
-        TxType::XCHAIN_MODIFY_BRIDGE => {
-            crate::run_xchain_modify_bridge_preflight(crate::XChainModifyBridgePreflightFacts {
-                account: tx.get_account_id(field("sfAccount")),
-                reward: tx
-                    .is_field_present(field("sfSignatureReward"))
-                    .then(|| tx.get_field_amount(field("sfSignatureReward"))),
-                min_account_create: tx
-                    .is_field_present(field("sfMinAccountCreateAmount"))
-                    .then(|| tx.get_field_amount(field("sfMinAccountCreateAmount"))),
-                clear_account_create: tx.get_flags() & protocol::tfClearAccountCreateAmount != 0,
-                bridge: xchain_bridge_spec(tx),
-            })
-        }
-        TxType::XCHAIN_CREATE_CLAIM_ID => {
-            let reward = tx.get_field_amount(field("sfSignatureReward"));
-            if !reward.native() || reward.signum() < 0 || !reward.is_legal_net() {
-                Ter::TEM_XCHAIN_BRIDGE_BAD_REWARD_AMOUNT
-            } else {
-                Ter::TES_SUCCESS
-            }
-        }
-        TxType::XCHAIN_COMMIT => {
-            let amount = tx.get_field_amount(field("sfAmount"));
-            let bridge = tx.get_field_xchain_bridge(field("sfXChainBridge"));
-            if amount.signum() <= 0 || !amount.is_legal_net() {
-                Ter::TEM_BAD_AMOUNT
-            } else if amount.asset() != bridge.locking_chain_issue()
-                && amount.asset() != bridge.issuing_chain_issue()
-            {
-                Ter::TEM_BAD_ISSUER
-            } else {
-                Ter::TES_SUCCESS
-            }
-        }
-        TxType::XCHAIN_CLAIM => {
-            let amount = tx.get_field_amount(field("sfAmount"));
-            let bridge = tx.get_field_xchain_bridge(field("sfXChainBridge"));
-            if amount.signum() <= 0
-                || (amount.asset() != bridge.locking_chain_issue()
-                    && amount.asset() != bridge.issuing_chain_issue())
-            {
-                Ter::TEM_BAD_AMOUNT
-            } else {
-                Ter::TES_SUCCESS
-            }
-        }
-        TxType::XCHAIN_ACCOUNT_CREATE_COMMIT => {
-            let amount = tx.get_field_amount(field("sfAmount"));
-            let reward = tx.get_field_amount(field("sfSignatureReward"));
-            if amount.signum() <= 0
-                || !amount.native()
-                || reward.signum() < 0
-                || !reward.native()
-                || reward.asset() != amount.asset()
-            {
-                Ter::TEM_BAD_AMOUNT
-            } else {
-                Ter::TES_SUCCESS
-            }
-        }
-        TxType::XCHAIN_ADD_CLAIM_ATTESTATION => validate_xchain_attestation_preflight(tx, false),
-        TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION => {
-            validate_xchain_attestation_preflight(tx, true)
-        }
-        _ => Ter::TEM_UNKNOWN,
-    }
 }
 
 fn validate_trust_set_preflight(tx: &STTx, rules: &Rules) -> NotTec {
@@ -2281,7 +2126,6 @@ fn validate_amm_vote_preflight(tx: &STTx, rules: &Rules) -> NotTec {
     }
     let (asset, asset2) = amm_pair(tx);
     if !crate::amm_vote_check_extra_features(
-        protocol::amm_enabled(rules),
         rules.enabled(&protocol::feature_id("MPTokensV2")),
         matches!(asset, Asset::MPTIssue(_)),
         matches!(asset2, Asset::MPTIssue(_)),
@@ -2310,7 +2154,6 @@ fn validate_amm_withdraw_preflight(tx: &STTx, rules: &Rules) -> NotTec {
     let e_price = optional_amount("sfEPrice");
     let lp_token_in = optional_amount("sfLPTokenIn");
     if !crate::amm_withdraw_check_extra_features(
-        protocol::amm_enabled(rules),
         rules.enabled(&protocol::feature_id("MPTokensV2")),
         matches!(asset, Asset::MPTIssue(_)),
         matches!(asset2, Asset::MPTIssue(_)),
@@ -2530,7 +2373,6 @@ fn validate_amm_create_preflight(tx: &STTx, rules: &Rules) -> NotTec {
     let amount = tx.get_field_amount(amount_field);
     let amount2 = tx.get_field_amount(amount2_field);
     if !crate::amm_create_check_extra_features(
-        protocol::amm_enabled(rules),
         rules.enabled(&protocol::feature_id("MPTokensV2")),
         amount.holds_mpt_issue(),
         amount2.holds_mpt_issue(),

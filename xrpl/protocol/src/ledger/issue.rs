@@ -253,6 +253,45 @@ impl Asset {
         }
     }
 
+    /// rippled `isRepresentable(asset, value)` (#8527): whether
+    /// `STAmount{asset, value}` can be built without exceeding the asset's
+    /// range (XRP above `kMaxNativeN`, an MPT above `kMaxMPTokenAmount`, or
+    /// an IOU exponent overflow).
+    pub fn is_representable(&self, number: RuntimeNumber) -> bool {
+        match *self {
+            Self::Issue(issue) if issue.native() => crate::XRPAmount::from_number(number)
+                .is_ok_and(|amount| {
+                    amount.drops().unsigned_abs() <= crate::ST_AMOUNT_MAX_NATIVE_NETWORK
+                }),
+            Self::Issue(_) => crate::IOUAmount::from_number(number).is_ok(),
+            Self::MPTIssue(_) => crate::MPTAmount::from_number(number).is_ok_and(|amount| {
+                amount.value().unsigned_abs() <= crate::MAX_MP_TOKEN_AMOUNT as u64
+            }),
+        }
+    }
+
+    /// rippled `STAmount{asset, value} == value`: the value survives
+    /// conversion to this asset unchanged. Like rippled it throws (panics,
+    /// mapped to tefEXCEPTION at the transaction boundary) when the value is
+    /// out of range; callers that must not throw check `is_representable`
+    /// first.
+    pub fn round_trips(&self, number: RuntimeNumber) -> bool {
+        if !self.is_representable(number) {
+            basics::contract::throw_overflow(format!("{number} is out of range for the asset"));
+        }
+        let amount = self
+            .amount(number)
+            .expect("representable value converts to the asset");
+        let converted = if amount.native() {
+            RuntimeNumber::from(amount.xrp())
+        } else if amount.holds_mpt_issue() {
+            RuntimeNumber::from(amount.mpt())
+        } else {
+            RuntimeNumber::from(amount.iou())
+        };
+        converted == number
+    }
+
     pub fn get_amount_type(&self) -> AssetAmountType {
         match self {
             Self::Issue(issue) if issue.native() => AssetAmountType::XRP,
@@ -455,5 +494,37 @@ mod tests {
     fn issue_from_json_rejects_special_non_xrp_issuers() {
         assert!(issue_from_json(&issue_json(to_base58(no_account()))).is_err());
         assert!(issue_from_json(&issue_json(to_base58(xrp_account()))).is_err());
+    }
+
+    /// rippled #8527 `isRepresentable`: XRP is capped at kMaxNativeN, an
+    /// MPT at kMaxMPTokenAmount, an IOU at its exponent range.
+    #[test]
+    fn asset_representability_matches_rippled_ranges() {
+        use basics::number::{NumberParts, get_mantissa_scale};
+
+        use crate::{Asset, Issue, MPTIssue, currency_from_string, make_mpt_id, xrp_issue};
+
+        let xrp = Asset::Issue(xrp_issue());
+        let iou = Asset::Issue(Issue::new(
+            currency_from_string("USD"),
+            crate::AccountID::from_array([7; 20]),
+        ));
+        let mpt = Asset::MPTIssue(MPTIssue::new(make_mpt_id(1, crate::AccountID::from_array([8; 20]))));
+        let n = |m: i64, e: i32| NumberParts::try_from_external_parts(m, e, get_mantissa_scale()).unwrap();
+
+        assert!(xrp.is_representable(n(1, 17)));
+        assert!(!xrp.is_representable(n(1, 17) + n(1, 0)));
+        assert!(mpt.is_representable(n(i64::MAX, 0)));
+        assert!(!mpt.is_representable(n(1, 19)));
+        assert!(iou.is_representable(n(1, 80)));
+        assert!(!iou.is_representable(n(1, 200)));
+
+        // STAmount{asset, v} == v: XRP and MPT are whole units.
+        assert!(xrp.round_trips(n(42, 0)));
+        assert!(!xrp.round_trips(n(65, -1)));
+        assert!(!mpt.round_trips(n(65, -1)));
+        assert!(iou.round_trips(n(65, -1)));
+        // Out of range throws, like rippled's STAmount constructor.
+        assert!(std::panic::catch_unwind(|| xrp.round_trips(n(1, 18))).is_err());
     }
 }

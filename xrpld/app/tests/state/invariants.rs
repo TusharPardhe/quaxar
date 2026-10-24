@@ -4524,3 +4524,39 @@ fn cleanup_3_5_allows_vault_pseudo_account_holding_its_vault_asset() {
         Ter::TES_SUCCESS
     );
 }
+
+/// rippled #8475: IOU balances keep 16 significant digits, so clawing back 0.1
+/// from 10^16 leaves the balance unchanged. The invariant compares with the
+/// same rounded subtraction instead of requiring before - after == amount.
+#[test]
+fn clawback_invariant_accepts_an_iou_balance_change_lost_to_rounding() {
+    let mut parent = Sandbox::new(Arc::new(mpt_v2_without_cleanup_ledger()), ApplyFlags::default());
+    let issuer = acct(0x55);
+    let holder = acct(0x56);
+    let big = 10_000_000_000_000_000_i64;
+    parent
+        .insert(Arc::new(ripple_state_balance_entry(holder, issuer, big)))
+        .expect("insert parent trustline");
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.update(Arc::new(ripple_state_balance_entry(holder, issuer, big)))
+        .expect("rounded clawback leaves the balance unchanged");
+    let tx = STTx::new(TxType::CLAWBACK, |object| {
+        object.set_account_id(sf("sfAccount"), issuer);
+        object.set_field_amount(sf("sfFee"), STAmount::from_xrp_amount(XRPAmount::from_drops(10)));
+        object.set_field_amount(
+            sf("sfAmount"),
+            STAmount::from_iou_amount(
+                sf("sfAmount"),
+                IOUAmount::from_parts(1, -1).expect("0.1"),
+                Issue {
+                    currency: iou_currency(b"USD"),
+                    account: holder,
+                },
+            ),
+        );
+    });
+    assert_eq!(
+        check_invariants_for_tx(&flow, &tx, Ter::TES_SUCCESS, XRPAmount::from_drops(10)),
+        Ter::TES_SUCCESS
+    );
+}

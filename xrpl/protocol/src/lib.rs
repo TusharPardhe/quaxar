@@ -15,7 +15,6 @@ pub mod transactions;
 
 pub use amounts::amount_conversions;
 pub use amounts::amount_support;
-pub use amounts::fees;
 pub use amounts::iou_amount;
 pub use amounts::mpt_amount;
 pub use amounts::mpt_issue;
@@ -113,7 +112,6 @@ macro_rules! json {
 pub use transactions::amm_core;
 pub use transactions::st_tx;
 pub use transactions::st_validation;
-pub use transactions::st_xchain_bridge;
 pub use transactions::sttx_multi_sign;
 pub use transactions::sttx_multi_sign_check;
 pub use transactions::sttx_single_sign;
@@ -124,7 +122,6 @@ pub use transactions::transaction_runtime;
 pub use transactions::tx_formats;
 pub use transactions::tx_meta;
 pub use transactions::tx_searched;
-pub use transactions::xchain_attestations;
 
 pub use account_id::{
     AccountID, AccountId, AccountIdTag, calc_account_id, no_account, parse_base58_account_id,
@@ -134,7 +131,7 @@ pub use amm_core::{
     AUCTION_SLOT_DISCOUNTED_FEE_FRACTION, AUCTION_SLOT_FEE_SCALE_FACTOR,
     AUCTION_SLOT_INTERVAL_DURATION, AUCTION_SLOT_MAX_AUTH_ACCOUNTS, AUCTION_SLOT_MIN_FEE_FRACTION,
     AUCTION_SLOT_TIME_INTERVALS, TOTAL_TIME_SLOT_SECS, TRADING_FEE_THRESHOLD, VOTE_MAX_SLOTS,
-    VOTE_WEIGHT_SCALE_FACTOR, amm_auction_min_slot_price, amm_auction_time_slot, amm_enabled,
+    VOTE_WEIGHT_SCALE_FACTOR, amm_auction_min_slot_price, amm_auction_time_slot,
     amm_lpt_currency, amm_lpt_currency_from_assets, amm_lpt_issue, amm_lpt_issue_from_assets,
     fee_mult, fee_mult_half, get_fee, invalid_amm_amount, invalid_amm_asset,
     invalid_amm_asset_pair,
@@ -214,8 +211,8 @@ pub use feature::{
     FEATURE_CONFIDENTIAL_TRANSFER_NAME, FEATURE_LENDING_PROTOCOL_NAME,
     FEATURE_LENDING_PROTOCOL_V1_1_NAME, FEATURE_LENDING_PROTOCOL_V1_2_NAME,
     FEATURE_SINGLE_ASSET_VAULT_NAME, FEATURE_SMART_ESCROW_NAME, FEATURE_CONFIDENTIAL_MPT_KEY_ROTATION_NAME, FEATURE_SPONSOR_NAME,
-    FEATURE_TOKEN_ESCROW_NAME, FEATURE_UNIVERSAL_NUMBER_NAME, FEATURE_XCHAIN_BRIDGE_NAME,
-    FEATURE_XRP_FEES_NAME, FIX_AMMV1_1_NAME, FIX_AMMV1_3_NAME, FIX_BATCH_INNER_SIGS_NAME,
+    FEATURE_TOKEN_ESCROW_NAME, FEATURE_UNIVERSAL_NUMBER_NAME,
+    FEATURE_XRP_FEES_NAME, FIX_AMMV1_1_NAME, FIX_AMMV1_3_NAME,
     FIX_CLEANUP_3_2_0_NAME, FIX_CLEANUP_3_3_0_NAME, FIX_CLEANUP_3_4_0_NAME, FIX_CLEANUP_3_5_0_NAME,
     FIX_INNER_OBJ_TEMPLATE_NAME, FIX_INNER_OBJ_TEMPLATE2_NAME, FIX_MPT_DELIVERED_AMOUNT_NAME,
     FIX_PREVIOUS_TXN_ID_NAME, FeatureSet, REGISTERED_FEATURES, RegisteredFeature,
@@ -224,14 +221,13 @@ pub use feature::{
     feature_lending_protocol_v1_1, feature_lending_protocol_v1_2, feature_mp_tokens_v1,
     feature_name, feature_nftoken_mint_offer, feature_permissioned_domains,
     feature_single_asset_vault, feature_smart_escrow, feature_confidential_mpt_key_rotation, feature_sponsor, feature_token_escrow,
-    feature_universal_number, feature_xchain_bridge, feature_xrp_fees, fix_ammv1_1, fix_ammv1_3,
-    fix_batch_inner_sigs, fix_cleanup_3_1_3, fix_cleanup_3_2_0, fix_cleanup_3_3_0,
+    feature_universal_number, feature_xrp_fees, fix_ammv1_1, fix_ammv1_3,
+    fix_cleanup_3_1_3, fix_cleanup_3_2_0, fix_cleanup_3_3_0,
     fix_batch_v1_2, fix_cleanup_3_4_0, fix_cleanup_3_5_0, fix_enforce_nftoken_trustline_v2, fix_inner_obj_template,
     fix_inner_obj_template2, fix_mpt_delivered_amount, fix_nftoken_page_links, fix_previous_txn_id,
     fix_token_escrow_v1, registered_feature, registered_feature_supported,
     registered_feature_supported_with_confidential_crypto,
 };
-pub use fees::{calculate_base_fee, calculate_reserve};
 pub use genesis_identity::{
     GENESIS_PASSPHRASE, derive_secp256k1_account_id_from_passphrase,
     derive_secp256k1_public_key_from_passphrase, genesis_account_id, genesis_public_key,
@@ -256,7 +252,7 @@ pub use key_type::KeyType;
 pub use keylet::{
     DIRECT_ACCOUNT_KEYLETS, DirectAccountKeyletDesc, Keylet, LedgerEntryType, account_keylet,
     account_root_key, amendments_key, amendments_keylet, amm, amm_keylet, book_keylet,
-    bridge_keylet, bridge_keylet_from_door_issue, check_keylet, check_keylet_from_key,
+    check_keylet, check_keylet_from_key,
     child_keylet, credential_keylet, credential_keylet_from_key, delegate_keylet,
     deposit_preauth_credentials_keylet, deposit_preauth_keylet, deposit_preauth_keylet_from_key,
     did_keylet, directory_node_keylet, escrow_keylet, escrow_keylet_from_key, fee_settings_keylet,
@@ -272,10 +268,7 @@ pub use keylet::{
     signers_keylet_for_page, skip_keylet, skip_keylet_for_ledger, sponsorship_keylet,
     sponsorship_keylet_from_key, ticket_index, ticket_index_from_seq_proxy, ticket_keylet,
     ticket_keylet_from_key, ticket_keylet_from_seq_proxy, unchecked_keylet, vault_keylet,
-    vault_keylet_from_key, xchain_owned_claim_id_keylet, xchain_owned_claim_id_keylet_from_bridge,
-    xchain_owned_create_account_claim_id_keylet,
-    xchain_owned_create_account_claim_id_keylet_from_bridge,
-};
+    vault_keylet_from_key, };
 pub use known_formats::{KnownFormatItem, KnownFormats, KnownFormatsError};
 #[allow(ambiguous_glob_reexports)]
 pub use ledger_entries::*;
@@ -440,7 +433,6 @@ pub use st_validation::{
 };
 pub use st_var::{STVAR_MAX_NESTING_DEPTH, STVar};
 pub use st_vector256::STVector256;
-pub use st_xchain_bridge::{ChainType as XChainBridgeChainType, STXChainBridge};
 pub use stbase::{
     JsonOptions, JsonValue, RawJson, StBase, StBaseCore, ValidationError, downcast_stbase_mut,
     downcast_stbase_ref, st_base_eq, st_base_ne, to_json,
@@ -482,9 +474,5 @@ pub use tx_type::{TxType, dispatchable_tx_types};
 pub use units::{
     Bips, Bips16, Bips32, FeeLevel, FeeLevel64, FeeLevelDouble, TenthBips, TenthBips16,
     TenthBips32, ValueUnit, scalar, unit,
-};
-pub use xchain_attestations::{
-    AttestationMatch, XChainAttestationsBase, XChainClaimAttestation, XChainClaimAttestations,
-    XChainCreateAccountAttestation, XChainCreateAccountAttestations, attestations,
 };
 pub use xrp_amount::{DROPS_PER_XRP, XRPAmount};

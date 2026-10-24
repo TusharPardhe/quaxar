@@ -126,7 +126,6 @@ fn ledger_load_immutable_with_family_and_setup_marks_failed_setup_ctor() {
                     reserve: 20,
                     increment: 30,
                 },
-                false,
             ),
         ),
         0,
@@ -180,7 +179,6 @@ fn ledger_load_immutable_with_family_and_setup_marks_failed_setup_ctor() {
             reserve: 2,
             increment: 3,
         },
-        &feature_xrp_fees(),
         &family,
     )
     .expect("setup-aware immutable load should keep bool failure semantics");
@@ -275,7 +273,6 @@ fn ledger_load_immutable_with_family_and_setup_decodes_typed_singleton_payloads(
             reserve: 2,
             increment: 3,
         },
-        &feature_xrp_fees(),
         &family,
     )
     .expect("typed singleton setup should decode");

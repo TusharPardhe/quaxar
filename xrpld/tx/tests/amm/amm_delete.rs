@@ -62,10 +62,9 @@ impl AMMDeleteApplySink for Sink {
 
 #[test]
 fn amm_delete_check_extra_features_matches_cpp_mpt_gate() {
-    assert!(amm_delete_check_extra_features(true, false, false));
-    assert!(amm_delete_check_extra_features(true, true, true));
-    assert!(!amm_delete_check_extra_features(true, false, true));
-    assert!(!amm_delete_check_extra_features(false, true, false));
+    assert!(amm_delete_check_extra_features(false, false));
+    assert!(amm_delete_check_extra_features(true, true));
+    assert!(!amm_delete_check_extra_features(false, true));
 }
 
 #[test]

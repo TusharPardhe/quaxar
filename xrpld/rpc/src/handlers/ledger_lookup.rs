@@ -290,6 +290,43 @@ fn resolve_ledger<S: LedgerLookupSource>(
     }
 }
 
+/// Format-only checks of the ledger selector (`ledger`, `ledger_hash`,
+/// `ledger_index`), without any ledger lookup. rippled's rpc-spec handlers
+/// validate these fields before the handler's own required fields, so an
+/// invalid ledger selector is reported before a missing or malformed
+/// `account` (rippled #8561, #8573).
+pub fn validate_ledger_selector(params: &JsonValue) -> Result<(), RpcStatus> {
+    let JsonValue::Object(object) = params else {
+        return Ok(());
+    };
+    let count = ["ledger", "ledger_hash", "ledger_index"]
+        .iter()
+        .filter(|key| object.contains_key(**key))
+        .count();
+    if count > 1 {
+        return Err(RpcStatus::make_param_error(if object.contains_key("ledger") {
+            "Exactly one of 'ledger', 'ledger_hash', or 'ledger_index' can be specified."
+        } else {
+            "Exactly one of 'ledger_hash' or 'ledger_index' can be specified."
+        }));
+    }
+    if let Some(legacy) = object.get("ledger") {
+        return parse_legacy_request(legacy).map(|_| ());
+    }
+    if let Some(hash) = object.get("ledger_hash") {
+        let JsonValue::String(hash) = hash else {
+            return Err(RpcStatus::expected_field_error("ledger_hash", "hex string"));
+        };
+        return Uint256::from_hex(hash)
+            .map(|_| ())
+            .map_err(|_| RpcStatus::expected_field_error("ledger_hash", "hex string"));
+    }
+    if let Some(index) = object.get("ledger_index") {
+        return parse_index_request(index).map(|_| ());
+    }
+    Ok(())
+}
+
 pub fn lookup_ledger_with_result<S: LedgerLookupSource>(
     context: &LedgerLookupContext<'_, S>,
 ) -> Result<(LedgerLookupLedger, JsonValue), RpcStatus> {

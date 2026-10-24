@@ -10,17 +10,12 @@ use protocol::get_field_by_symbol;
 use protocol::{NotTec, Ter, feature_batch, is_tes_success};
 
 pub const fn amm_withdraw_check_extra_features(
-    amm_enabled: bool,
     mptokens_v2_enabled: bool,
     asset_holds_mpt: bool,
     asset2_holds_mpt: bool,
     amount_holds_mpt: bool,
     amount2_holds_mpt: bool,
 ) -> bool {
-    if !amm_enabled {
-        return false;
-    }
-
     if (asset_holds_mpt || asset2_holds_mpt || amount_holds_mpt || amount2_holds_mpt)
         && !mptokens_v2_enabled
     {

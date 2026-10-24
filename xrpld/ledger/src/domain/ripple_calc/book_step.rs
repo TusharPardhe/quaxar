@@ -509,6 +509,31 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             }
         }};
     }
+    // rippled #8468 `tryConsumeOffer`: under MPTokensV2 an overflow while
+    // consuming an offer fails the strand with FlowException(tecINTERNAL);
+    // without it the exception propagates as before.
+    let consume_overflow_is_flow_error =
+        view.rules().enabled(&protocol::feature_id("MPTokensV2"));
+    macro_rules! try_consume_offer {
+        ($body:expr) => {{
+            match basics::contract::try_catch(|| $body) {
+                Ok(ter) => ter,
+                Err(payload) => {
+                    if consume_overflow_is_flow_error
+                        && basics::contract::exception_kind(payload.as_ref()).is_overflow()
+                    {
+                        return BookStepResult {
+                            amount_in: total_in,
+                            amount_out: total_out,
+                            offers_consumed,
+                            ter: Ter::TEC_INTERNAL,
+                        };
+                    }
+                    basics::contract::rethrow(payload)
+                }
+            }
+        }};
+    }
     // rippled FlowException(tecPATH_DRY) from checkedStepAdd on overflow.
     macro_rules! sum_or_dry {
         ($amounts:expr, $zero:expr) => {{
@@ -892,14 +917,14 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                         ter: Ter::TEC_INVARIANT_FAILED,
                     };
                 }
-                let res = execute_amm_trade(
+                let res = try_consume_offer!(execute_amm_trade(
                     view,
                     &amm_offer.account,
                     &book.r#in,
                     &book.out,
                     &consumption.offer_in,
                     &consumption.owner_gives,
-                );
+                ));
                 if res == Ter::TES_SUCCESS {
                     amm_context.set_amm_used();
                     if reconciled_to_reverse_cache {
@@ -1425,7 +1450,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             // Execute trade: transfer assets between offer owner and issuers
             //   offer.send(sb, book_.in.getIssuer(), offer.owner(), ofrAmt.in) — owner receives offer input
             //   offer.send(sb, offer.owner(), book_.out.getIssuer(), ownerGives) — owner pays ownerGives
-            let res = execute_offer_trade(
+            let res = try_consume_offer!(execute_offer_trade(
                 view,
                 &offer_owner,
                 &book.r#in,
@@ -1433,7 +1458,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 &consumption.offer_in,
                 &consumption.owner_gives,
                 &consumption.offer_out,
-            );
+            ));
             if res != Ter::TES_SUCCESS {
                 remove_offer_or_return!(&offer_sle);
                 offers_consumed += 1;

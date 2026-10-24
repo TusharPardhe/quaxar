@@ -215,7 +215,6 @@ pub struct TrustSetPreclaimFacts {
     pub account_requires_auth: bool,
     pub destination_is_source: bool,
     pub destination_exists: bool,
-    pub amm_or_single_asset_vault_enabled: bool,
     pub destination_account_flags: u32,
     pub trustline_exists: bool,
     pub destination_is_pseudo_account: bool,
@@ -247,7 +246,7 @@ pub fn run_trust_set_preclaim_with_facts(facts: TrustSetPreclaimFacts) -> Ter {
     if facts.destination_is_source {
         return Ter::TEM_DST_IS_SRC;
     }
-    if facts.amm_or_single_asset_vault_enabled && !facts.destination_exists {
+    if !facts.destination_exists {
         return Ter::TEC_NO_DST;
     }
 

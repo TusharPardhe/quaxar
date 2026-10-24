@@ -464,3 +464,112 @@ fn account_lines_quality_fields_present_for_non_default() {
         "quality_out should be present and non-zero"
     );
 }
+
+/// rippled #8274 `testMarkerNewObjectTypes`: pagination must not reject a
+/// marker that lands on a Credential (or any owner-directory entry without
+/// `sfAccount`). One trust line plus four credentials walk in five pages.
+#[test]
+fn account_lines_marker_may_land_on_a_credential() {
+    let account = sample_account(0x31);
+    let issuer = sample_account(0x32);
+    let line = make_trust_line(account, issuer, "USD", 10, false, lsfLowReserve, 0, 0);
+    let credentials: Vec<STLedgerEntry> = (0..4u8)
+        .map(|i| {
+            let mut sle = STLedgerEntry::from_type_and_key(
+                protocol::LedgerEntryType::Credential,
+                sample_hash(0x40 + i),
+            );
+            sle.set_account_id(get_field_by_symbol("sfSubject"), account);
+            sle.set_account_id(get_field_by_symbol("sfIssuer"), issuer);
+            sle.set_field_u64(get_field_by_symbol("sfSubjectNode"), 0);
+            sle.set_field_u64(get_field_by_symbol("sfIssuerNode"), 0);
+            sle
+        })
+        .collect();
+    let mut keys = vec![*line.key()];
+    keys.extend(credentials.iter().map(|sle| *sle.key()));
+    let mut children = BTreeMap::from([(*line.key(), line.clone())]);
+    children.extend(credentials.iter().map(|sle| (*sle.key(), sle.clone())));
+    let source = FakeSource {
+        ledger: Some(closed_ledger()),
+        account_roots: BTreeMap::from([(account, make_account_root(account))]),
+        owner_pages: BTreeMap::from([((account, 0), make_owner_page(account, 0, &keys, 0))]),
+        children,
+    };
+
+    let mut marker: Option<String> = None;
+    let mut iterations = 0;
+    for _ in 0..20 {
+        let mut params = vec![
+            ("account", JsonValue::String(to_base58(account))),
+            ("limit", JsonValue::Unsigned(1)),
+        ];
+        if let Some(marker) = &marker {
+            params.push(("marker", JsonValue::String(marker.clone())));
+        }
+        let JsonValue::Object(result) = do_account_lines(
+            &AccountLinesRequest {
+                params: &object(params),
+                api_version: 1,
+                role: Role::Admin,
+            },
+            &source,
+        ) else {
+            panic!("result must be an object");
+        };
+        iterations += 1;
+        assert_eq!(result.get("error"), None, "page {iterations}: {result:?}");
+        match result.get("marker") {
+            Some(JsonValue::String(next)) => marker = Some(next.clone()),
+            _ => break,
+        }
+    }
+    assert_eq!(iterations, 5);
+}
+
+/// rippled #8573: request validation (ledger selector, limit, marker format)
+/// precedes the ledger lookup and actNotFound.
+#[test]
+fn account_lines_request_errors_precede_account_not_found() {
+    let unfunded = sample_account(0x77);
+    let source = FakeSource {
+        ledger: Some(closed_ledger()),
+        ..Default::default()
+    };
+    let run = |params: JsonValue| {
+        let JsonValue::Object(result) = do_account_lines(
+            &AccountLinesRequest {
+                params: &params,
+                api_version: 1,
+                role: Role::Admin,
+            },
+            &source,
+        ) else {
+            panic!("result must be an object");
+        };
+        result.get("error_message").cloned()
+    };
+    let msg = |text: &str| Some(JsonValue::String(text.to_owned()));
+    assert_eq!(
+        run(object([("ledger_hash", JsonValue::Unsigned(1))])),
+        msg("Invalid field 'ledger_hash', not hex string.")
+    );
+    assert_eq!(
+        run(object([
+            ("account", JsonValue::String(to_base58(unfunded))),
+            ("limit", JsonValue::Signed(-1)),
+        ])),
+        msg("Invalid field 'limit', not unsigned integer.")
+    );
+    assert_eq!(
+        run(object([
+            ("account", JsonValue::String(to_base58(unfunded))),
+            ("marker", JsonValue::String("NOT_A_MARKER".to_owned())),
+        ])),
+        msg("Invalid parameters.")
+    );
+    assert_eq!(
+        run(object([("account", JsonValue::String(to_base58(unfunded)))])),
+        msg("Account not found.")
+    );
+}
