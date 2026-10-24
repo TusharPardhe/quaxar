@@ -285,6 +285,18 @@ fn sparse_testnet_21632948_escrow_iou_precision_matches_network_metadata() {
     );
 }
 
+/// Mainnet fork at 107858924 (2026-10-23): IOU EscrowFinish submitted by the
+/// escrow's destination into an existing trust line with limit 0. rippled's
+/// `createAsset = destID == accountID_` skips the line-limit check; quaxar
+/// skipped it only when it had just created the line and returned
+/// tecLIMIT_EXCEEDED. Trimmed to the one transaction (TransactionIndex 0).
+#[test]
+fn sparse_mainnet_107858924_escrow_finish_destination_skips_line_limit() {
+    run_sparse_replay(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "tests/fixtures/sparse_replay/mainnet_107858924_escrow_finish_destination_limit.jsonl",
+    ));
+}
+
 /// Testnet fork at 21633206 (2026-10-18): AMMDeposit by LPTokenOut far
 /// beyond the depositor's IOU balances. rippled's AMMDeposit::deposit checks
 /// accountFunds before each send (tecUNFUNDED_AMM); quaxar only checked XRP,
