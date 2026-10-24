@@ -440,6 +440,9 @@ fn application_root_does_not_renormalize_fully_wired_ledger_with_shared_family()
     let mut ledger = Ledger::from_ledger_seq_and_close_time(102, 1_020, true);
     ledger.set_node_fetcher(Arc::new(|_| None));
     ledger.set_node_writer_result(Arc::new(|_, _, _, _| Ok(())));
+    // "Fully wired" includes the batch writer, which ledger_with_node_fetcher
+    // also requires before returning the ledger unchanged.
+    ledger.set_node_batch_writer_result(Arc::new(|_| Ok(())));
     let ledger = Arc::new(ledger);
 
     let normalized = root.ledger_with_node_fetcher(Arc::clone(&ledger));
