@@ -19,20 +19,15 @@ part 2), plus an audit of 2026-10-01..10-16 for items earlier syncs missed.
 | #7366 `025aa71930` | Retire fixFillOrKill | retired | Flow and OfferCreate FillOrKill checks are unconditional. Enabled on both networks. |
 | #7357 `3fa2accfdf` | Retire AMM and fixAMMOverflowOffer | retired | `amm_enabled` and its parameter removed; AMM tx types no longer name an amendment; TrustSet `tecNO_DST` unconditional. |
 | #7349 `a818f25203` | Retire XRPFees | retired | New ledgers and Fee pseudo-txs always use the drops fields; legacy fee voting, `fee_ref`, legacy validation fields removed. Legacy FeeSettings are still decoded for old ledgers. |
-| #8255 `ef5064eeb9` (registry part) | XChainBridge, fixXChainRewardRounding obsolete | registry | Vote behavior set to Obsolete. |
+| #8255 `ef5064eeb9` | Remove XChainBridge | never enabled | 8 tx types (41–48 reserved), 3 ledger entry types, 21 fields, STI 25 (reserved), keylets, flags, transactors, preclaim/preflight, `ledger_entry`/`account_objects`/`ledger_data` selectors and `server_definitions` entries removed. XChainBridge and fixXChainRewardRounding stay registered as Obsolete. |
+| #8561, #8573, #8613, #8620 | rpc-spec request validation | RPC | Ledger-selector format errors precede account errors in account_channels/currencies/info/lines/nfts/offers; limit and marker format precede the ledger lookup (account_lines/channels); `queue` and `ignore_default` read as bools; account_info reports actNotFound before queue/signer_lists errors and keeps account_data on the v2 signer_lists error. nft_buy/sell_offers and deposit_authorized already matched rippled's new tests. |
+| #6446 `86d8b244d6` (missed, July) | Batch inner transactions are never validly signed | ungated | `checkValidity` returns SigBad and caches it for any tfInnerBatchTxn; the fixBatchInnerSigs-era branch is removed. |
+| (registry audit) | Amendment registry matches rippled develop | registry | All retired amendments Obsolete; Cosign registered unsupported; seven quaxar-only entries rippled no longer knows removed (113 names, same as rippled). |
+| (missed) | SponsorshipSet / SponsorshipTransfer flag maps | definitions | Added to the transaction flag catalog. |
+| (missed) | MantissaScale names | basics | `Small`, `LargeLegacy`, `Large320`, `Large330`, as rippled `to_string`. |
 
-Registry changes are limited to amendments retired or made obsolete in this range. Older
-retirements (Clawback, fixUniversalNumber, …) and the July `checkValidity` inner-batch
-change are left for a separate pass.
+## Not ported
 
-## Not yet ported
-
-- **#8255 XChainBridge removal** (types, SFields, ledger entries, transactors, RPC; ~17k
-  lines removed upstream). Not enabled on any network; affects `server_definitions` and
-  parsing of XChain transactions.
-- **rpc-spec (D) #8573, (E) #8613, #8620**: rippled's handler migrations for
-  account_channels, account_info, account_lines, deposit_authorized and nft_buy/sell_offers
-  come with new error-message and precedence tests. Each needs a case-by-case comparison.
 - Supported::No features: Cosign invariants (#8130), SmartEscrow transactors (#8215).
 - C++-only: Number layout (#8550), CI/build/chore commits.
 
@@ -42,5 +37,7 @@ change are left for a separate pass.
   fix), asset representability, LoanSet/LoanBrokerSet/VaultSet/VaultCreate range checks,
   clawback rounding (fails before the fix), vault-share freeze inheritance (SAV gate and
   legacy fallback), issuer-first MPT book loop.
-- protocol 750, ledger 684, tx 4016, rpc 646, app lib 824, app all 7567, replay
-  fixtures 18: all pass. All 58 repaired mainnet/testnet captures replay byte-exact.
+- Full workspace: 16,721 passed, 0 failed. All 58 repaired mainnet/testnet captures
+  replay byte-exact.
+- Three tests that also failed on `main` are fixed: two app fixtures behind current ledger
+  wiring, and a basics test that ignored the `jemalloc` feature enabled by workspace builds.
