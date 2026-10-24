@@ -17,7 +17,6 @@ pub const FEATURE_CLAWBACK_NAME: &str = "Clawback";
 pub const FEATURE_TOKEN_ESCROW_NAME: &str = "TokenEscrow";
 pub const FEATURE_CONFIDENTIAL_TRANSFER_NAME: &str = "ConfidentialTransfer";
 pub const FEATURE_CONFIDENTIAL_MPT_KEY_ROTATION_NAME: &str = "ConfidentialMPTKeyRotation";
-pub const FIX_BATCH_INNER_SIGS_NAME: &str = "fixBatchInnerSigs";
 pub const FIX_BATCH_V1_2_NAME: &str = "fixBatchV1_2";
 pub const FIX_INNER_OBJ_TEMPLATE_NAME: &str = "fixInnerObjTemplate";
 pub const FIX_INNER_OBJ_TEMPLATE2_NAME: &str = "fixInnerObjTemplate2";
@@ -137,14 +136,8 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
         true,
         RegisteredFeatureVote::DefaultNo,
     ),
+    RegisteredFeature::new("Cosign", false, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("MPTokensV2", false, RegisteredFeatureVote::DefaultNo),
-    RegisteredFeature::new("fixSecurity3_1_3", false, RegisteredFeatureVote::DefaultNo),
-    RegisteredFeature::new(
-        "fixPermissionedDomainInvariant",
-        false,
-        RegisteredFeatureVote::DefaultNo,
-    ),
-    RegisteredFeature::new("fixBatchInnerSigs", false, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("LendingProtocol", true, RegisteredFeatureVote::DefaultNo),
     // Closed-ended Vault/Lending V1.1 lifecycle parity is implemented and
     // differentially covered with the corresponding cleanup-era rules.
@@ -212,7 +205,6 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     RegisteredFeature::new("AMMClawback", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("fixAMMv1_2", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("MPTokensV1", true, RegisteredFeatureVote::DefaultNo),
-    RegisteredFeature::new("InvariantsV1_1", false, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new(
         "fixNFTokenPageLinks",
         true,
@@ -241,20 +233,20 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     RegisteredFeature::new(
         "fixInnerObjTemplate",
         true,
-        RegisteredFeatureVote::DefaultNo,
+        RegisteredFeatureVote::Obsolete,
     ),
-    RegisteredFeature::new("fixNFTokenReserve", true, RegisteredFeatureVote::DefaultNo),
+    RegisteredFeature::new("fixNFTokenReserve", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new("fixFillOrKill", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new("DID", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new(
         "fixDisallowIncomingV1",
         true,
-        RegisteredFeatureVote::DefaultNo,
+        RegisteredFeatureVote::Obsolete,
     ),
     RegisteredFeature::new("XChainBridge", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new("AMM", true, RegisteredFeatureVote::Obsolete),
-    RegisteredFeature::new("Clawback", true, RegisteredFeatureVote::DefaultNo),
-    RegisteredFeature::new("fixUniversalNumber", true, RegisteredFeatureVote::DefaultNo),
+    RegisteredFeature::new("Clawback", true, RegisteredFeatureVote::Obsolete),
+    RegisteredFeature::new("fixUniversalNumber", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new("XRPFees", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new(
         "fixRemoveNFTokenAutoTrustLine",
@@ -356,9 +348,6 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     RegisteredFeature::new("MultiSign", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new("MultiSignReserve", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new("NegativeUNL", true, RegisteredFeatureVote::Obsolete),
-    RegisteredFeature::new("NonFungibleTokensV1", true, RegisteredFeatureVote::Obsolete),
-    RegisteredFeature::new("fixNFTokenDirV1", true, RegisteredFeatureVote::Obsolete),
-    RegisteredFeature::new("fixNFTokenNegOffer", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new(
         "NonFungibleTokensV1_1",
         true,
@@ -420,10 +409,6 @@ pub fn feature_token_escrow() -> Uint256 {
 
 pub fn feature_confidential_transfer() -> Uint256 {
     feature_id(FEATURE_CONFIDENTIAL_TRANSFER_NAME)
-}
-
-pub fn fix_batch_inner_sigs() -> Uint256 {
-    feature_id(FIX_BATCH_INNER_SIGS_NAME)
 }
 
 pub fn fix_inner_obj_template() -> Uint256 {
@@ -594,13 +579,13 @@ mod tests {
         FEATURE_CONFIDENTIAL_TRANSFER_NAME, FEATURE_LENDING_PROTOCOL_NAME,
         FEATURE_SINGLE_ASSET_VAULT_NAME, FEATURE_SPONSOR_NAME, FEATURE_TOKEN_ESCROW_NAME,
         FEATURE_UNIVERSAL_NUMBER_NAME, FEATURE_XCHAIN_BRIDGE_NAME, FEATURE_XRP_FEES_NAME,
-        FIX_AMMV1_1_NAME, FIX_AMMV1_3_NAME, FIX_BATCH_INNER_SIGS_NAME, FIX_CLEANUP_3_4_0_NAME,
+        FIX_AMMV1_1_NAME, FIX_AMMV1_3_NAME, FIX_CLEANUP_3_4_0_NAME,
         FIX_INNER_OBJ_TEMPLATE_NAME, FIX_INNER_OBJ_TEMPLATE2_NAME, FIX_MPT_DELIVERED_AMOUNT_NAME,
         FIX_PREVIOUS_TXN_ID_NAME, FeatureSet, REGISTERED_FEATURES, RegisteredFeature,
         RegisteredFeatureVote, feature_amm, feature_batch, feature_clawback, feature_id,
         feature_lending_protocol, feature_name, feature_single_asset_vault, feature_token_escrow,
         feature_universal_number, feature_xchain_bridge, feature_xrp_fees, fix_ammv1_1,
-        fix_ammv1_3, fix_batch_inner_sigs, fix_inner_obj_template, fix_inner_obj_template2,
+        fix_ammv1_3, fix_inner_obj_template, fix_inner_obj_template2,
         fix_mpt_delivered_amount, fix_previous_txn_id,
         registered_feature_supported_with_confidential_crypto,
     };
@@ -620,10 +605,6 @@ mod tests {
     fn feature_id_sha512_half_registration_rule() {
         assert_eq!(feature_id(FEATURE_BATCH_V1_1_NAME), feature_batch());
         assert_eq!(feature_id(FEATURE_CLAWBACK_NAME), feature_clawback());
-        assert_eq!(
-            feature_id(FIX_BATCH_INNER_SIGS_NAME),
-            fix_batch_inner_sigs()
-        );
         assert_eq!(
             feature_id(FEATURE_TOKEN_ESCROW_NAME),
             feature_token_escrow()
@@ -722,9 +703,6 @@ mod tests {
         let token_escrow =
             Uint256::from_hex("138B968F25822EFBF54C00F97031221C47B1EAB8321D93C7C2AEAF85F04EC5DF")
                 .expect("expected token escrow hex should parse");
-        let fix_inner_sigs =
-            Uint256::from_hex("267624F8F744C4A4F1B5821A7D54410BCEBABE987F0172EE89E5FC4B6EDBC18A")
-                .expect("expected inner-batch signature fix hex should parse");
         let fix_inner_obj =
             Uint256::from_hex("C393B3AEEBF575E475F0C60D5E4241B2070CC4D0EB6C4846B1A07508FAEFC485")
                 .expect("expected inner object template hex should parse");
@@ -748,11 +726,6 @@ mod tests {
         assert_eq!(feature_name(&clawback), Some(FEATURE_CLAWBACK_NAME));
         assert_eq!(feature_token_escrow(), token_escrow);
         assert_eq!(feature_name(&token_escrow), Some(FEATURE_TOKEN_ESCROW_NAME));
-        assert_eq!(fix_batch_inner_sigs(), fix_inner_sigs);
-        assert_eq!(
-            feature_name(&fix_inner_sigs),
-            Some(FIX_BATCH_INNER_SIGS_NAME)
-        );
         assert_eq!(fix_inner_obj_template(), fix_inner_obj);
         assert_eq!(
             feature_name(&fix_inner_obj),

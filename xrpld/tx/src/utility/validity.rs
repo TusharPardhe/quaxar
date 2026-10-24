@@ -3,7 +3,7 @@
 //! This ports the deterministic control flow around `checkValidity(...)` and
 //! the flag-promotion logic used by `forceValidity(...)`.
 
-use protocol::{Rules, feature_batch, feature_batch_v1_1, fix_batch_inner_sigs, fix_cleanup_3_4_0};
+use protocol::{Rules, fix_cleanup_3_4_0};
 use xrpl_core::{HashRouterFlags, any, merge_set_flags};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,17 +22,14 @@ const SF_LOCALGOOD: HashRouterFlags = HashRouterFlags::PRIVATE4;
 const SF_OLD_PREFIX_SIGBAD: HashRouterFlags = HashRouterFlags::PRIVATE7;
 const SF_OLD_PREFIX_SIGGOOD: HashRouterFlags = HashRouterFlags::PRIVATE8;
 
-pub const INVALID_INNER_BATCH_TRANSACTION_REASON: &str =
-    "Malformed: Invalid inner batch transaction.";
+pub const INNER_BATCH_SIGNATURE_REASON: &str =
+    "Batch inner transactions are never considered validly signed.";
 pub const BAD_SIGNATURE_REASON: &str = "Transaction has bad signature.";
 pub const LOCAL_CHECKS_FAILED_REASON: &str = "Local checks failed.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CheckValidityFacts {
     pub inner_batch_flag_set: bool,
-    pub txn_signature_present: bool,
-    pub signing_pub_key_empty: bool,
-    pub signers_present: bool,
     pub alternate_signature_present: bool,
 }
 
@@ -60,23 +57,11 @@ pub fn run_check_validity(
     check_sign: impl FnOnce() -> Result<(), String>,
     passes_local_checks: impl FnOnce() -> Result<(), String>,
 ) -> CheckValidityResult {
-    if facts.inner_batch_flag_set
-        && (rules.enabled(&feature_batch()) || rules.enabled(&feature_batch_v1_1()))
-    {
-        if facts.txn_signature_present || !facts.signing_pub_key_empty || facts.signers_present {
-            return CheckValidityResult::new(
-                Validity::SigBad,
-                INVALID_INNER_BATCH_TRANSACTION_REASON,
-                HashRouterFlags::UNDEFINED,
-            );
-        }
-
-        if !rules.enabled(&fix_batch_inner_sigs()) {
-            return match passes_local_checks() {
-                Ok(()) => CheckValidityResult::new(Validity::Valid, "", SF_SIGGOOD),
-                Err(reason) => CheckValidityResult::new(Validity::SigGoodOnly, reason, SF_LOCALBAD),
-            };
-        }
+    // rippled apply.cpp checkValidity (#6446): batch inner transactions are
+    // applied within their batch, never through checkValidity, so one that
+    // arrives on its own is marked bad regardless of amendments.
+    if facts.inner_batch_flag_set {
+        return CheckValidityResult::new(Validity::SigBad, INNER_BATCH_SIGNATURE_REASON, SF_SIGBAD);
     }
 
     let mut flags_to_set = HashRouterFlags::UNDEFINED;
@@ -181,11 +166,11 @@ pub fn merge_forced_validity(
 mod tests {
     use super::{
         BAD_SIGNATURE_REASON, CheckValidityFacts, CheckValidityResult,
-        INVALID_INNER_BATCH_TRANSACTION_REASON, LOCAL_CHECKS_FAILED_REASON, Validity,
+        INNER_BATCH_SIGNATURE_REASON, LOCAL_CHECKS_FAILED_REASON, SF_SIGBAD, Validity,
         forced_validity_flags, merge_forced_validity, run_check_validity,
         run_check_validity_with_flag_cache, run_force_validity,
     };
-    use protocol::{Rules, feature_batch, fix_batch_inner_sigs};
+    use protocol::Rules;
     use std::cell::Cell;
     use xrpl_core::HashRouterFlags;
 
@@ -311,82 +296,20 @@ mod tests {
     }
 
     #[test]
-    fn check_validity_rejects_signed_inner_batch_transactions_before_cache_checks() {
-        let result = run_check_validity(
-            HashRouterFlags::PRIVATE1,
-            CheckValidityFacts {
-                inner_batch_flag_set: true,
-                txn_signature_present: true,
-                signing_pub_key_empty: true,
-                signers_present: false,
-                alternate_signature_present: false,
-            },
-            &Rules::new([feature_batch()]),
-            || Ok(()),
-            || Ok(()),
-        );
-
-        assert_eq!(
-            result,
-            CheckValidityResult::new(
-                Validity::SigBad,
-                INVALID_INNER_BATCH_TRANSACTION_REASON,
-                HashRouterFlags::UNDEFINED
-            )
-        );
-    }
-
-    #[test]
-    fn check_validity_inner_batch_before_fix_skips_signature_check_and_returns_valid() {
-        let sign_checked = Cell::new(false);
-
+    fn inner_batch_transaction_is_always_sigbad_and_cached() {
         let result = run_check_validity(
             HashRouterFlags::UNDEFINED,
             CheckValidityFacts {
                 inner_batch_flag_set: true,
-                txn_signature_present: false,
-                signing_pub_key_empty: true,
-                signers_present: false,
-                alternate_signature_present: false,
+                ..CheckValidityFacts::default()
             },
-            &Rules::new([feature_batch()]),
-            || {
-                sign_checked.set(true);
-                Ok(())
-            },
-            || Ok(()),
+            &Rules::new([]),
+            || panic!("signature must not be checked"),
+            || panic!("local checks must not run"),
         );
-
         assert_eq!(
             result,
-            CheckValidityResult::new(Validity::Valid, "", HashRouterFlags::PRIVATE2)
-        );
-        assert!(!sign_checked.get());
-    }
-
-    #[test]
-    fn check_validity_inner_batch_before_fix_returns_local_failure_without_siggood() {
-        let result = run_check_validity(
-            HashRouterFlags::UNDEFINED,
-            CheckValidityFacts {
-                inner_batch_flag_set: true,
-                txn_signature_present: false,
-                signing_pub_key_empty: true,
-                signers_present: false,
-                alternate_signature_present: false,
-            },
-            &Rules::new([feature_batch()]),
-            || Ok(()),
-            || Err("inner local checks failed".to_owned()),
-        );
-
-        assert_eq!(
-            result,
-            CheckValidityResult::new(
-                Validity::SigGoodOnly,
-                "inner local checks failed",
-                HashRouterFlags::PRIVATE3
-            )
+            CheckValidityResult::new(Validity::SigBad, INNER_BATCH_SIGNATURE_REASON, SF_SIGBAD)
         );
     }
 
@@ -398,7 +321,7 @@ mod tests {
         let result = run_check_validity(
             HashRouterFlags::PRIVATE1,
             CheckValidityFacts::default(),
-            &Rules::new([feature_batch(), fix_batch_inner_sigs()]),
+            &Rules::new([]),
             || {
                 sign_checked.set(true);
                 Ok(())
@@ -446,7 +369,7 @@ mod tests {
         let result = run_check_validity(
             HashRouterFlags::UNDEFINED,
             CheckValidityFacts::default(),
-            &Rules::new([feature_batch(), fix_batch_inner_sigs()]),
+            &Rules::new([]),
             || Err("bad signature from callback".to_owned()),
             || Ok(()),
         );
