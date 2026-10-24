@@ -1059,7 +1059,12 @@ fn unlock_escrow_iou<V: ledger::ApplyView>(
         Ok(exists) => exists,
         Err(_) => return Ter::TEF_BAD_LEDGER,
     };
-    let receiver_created_line = !line_exists && receiver == submitter;
+    // rippled EscrowFinish: `createAsset = destID == accountID_`. It gates both
+    // creating a missing line and skipping the line-limit check below, so a
+    // destination finishing its own escrow ignores its limit even when the
+    // line already exists (mainnet 107858924).
+    let create_asset = receiver == submitter;
+    let receiver_created_line = !line_exists && create_asset;
     if receiver_created_line {
         let destination_keylet = protocol::account_keylet(Uint160::from_void(receiver.data()));
         let destination_sle = match view.peek(destination_keylet) {
@@ -1111,7 +1116,7 @@ fn unlock_escrow_iou<V: ledger::ApplyView>(
         Ok(amount) => amount,
         Err(ter) => return ter,
     };
-    if !receiver_created_line {
+    if !create_asset {
         let line = match view.peek(line_keylet) {
             Ok(Some(sle)) => sle,
             Ok(None) => return Ter::TEC_INTERNAL,
