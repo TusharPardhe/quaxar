@@ -14247,3 +14247,121 @@ fn crafted_offer_payment_case(features: &[&str]) {
         "the crafted offer must not be removed ({features:?})"
     );
 }
+
+/// Mainnet 107899967 (Payment CF1A9DFF...): on the final liquidity pass every
+/// strand is dry, but rippled's OfferStream still `permRmOffer`s a found
+/// unfunded offer met in a strand's reverse pass before that strand dries at
+/// its DirectStep, and StrandFlow deletes `ofrsToRm` after the pass.
+#[test]
+fn fp_dry_strand_still_removes_found_unfunded_offer() {
+    let sender = acct(0x11);
+    let dest = acct(0x22);
+    let gw = acct(0x33);
+    let m1 = acct(0x44);
+    let m3 = acct(0x55);
+    let m2 = acct(0x66);
+    let m4 = acct(0x77);
+    let u = usd_currency();
+    let e = eur_currency();
+    let usd = |v: i64| iou(gw, u, v);
+    let eur = |v: i64| iou(gw, e, v);
+    const LSF_DEFAULT_RIPPLE: u32 = 0x0080_0000;
+    let l = build_ledger_with_features(
+        vec![
+            account_root(sender, 100_000_000, 1, 0),
+            account_root(dest, 100_000_000, 0, 0),
+            account_root(gw, 100_000_000, 0, LSF_DEFAULT_RIPPLE),
+            account_root(m1, 1_000_000_000, 1, 0),
+            account_root(m3, 100_000_000, 1, 0),
+            account_root(m2, 100_000_000, 2, 0),
+            account_root(m4, 1_000_000_000, 1, 0),
+            // sender holds 10 USD (sender is low).
+            trust_line(sender, gw, u, 10, 1_000, 0),
+            // gw is low for every maker: negative balance = maker holds.
+            trust_line(gw, m1, u, 0, 0, 1_000),
+            trust_line(gw, m3, e, -10, 0, 1_000),
+            trust_line(gw, m3, u, 0, 0, 1_000),
+            trust_line(gw, m2, e, -100, 0, 1_000),
+            trust_line(gw, m2, u, 0, 0, 1_000),
+            trust_line(gw, m4, e, 0, 0, 1_000),
+        ],
+        vec![
+            "Flow",
+            "FlowCross",
+            "fix1578",
+            "fixReducedOffersV1",
+            "fixReducedOffersV2",
+            "fixRmSmallIncreasedQOffers",
+            "fixTakerDryOfferRemoval",
+        ],
+    );
+    let mut v = new_view(l);
+    let offer = |v: &mut ledger::ApplyViewImpl<ledger::Ledger>,
+                 owner: AccountID,
+                 seq: u32,
+                 pays: STAmount,
+                 gets: STAmount| {
+        let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
+            tx.set_account_id(sf("sfAccount"), owner);
+            tx.set_field_amount(sf("sfTakerPays"), pays);
+            tx.set_field_amount(sf("sfTakerGets"), gets);
+            tx.set_field_amount(sf("sfFee"), xrp(10));
+            tx.set_field_u32(sf("sfSequence"), seq);
+        });
+        assert_eq!(
+            handle_real_dispatch(v, &tx, TxType::OFFER_CREATE, None),
+            Ter::TES_SUCCESS
+        );
+    };
+    // Strand A, USD -> XRP at 10 XRP per USD (best quality, tried first).
+    offer(&mut v, m1, 1, usd(10), xrp(100_000_000));
+    // Strand B, USD -> EUR -> XRP: tip m3 (1:1, later unfunded), then m2.
+    offer(&mut v, m3, 1, usd(10), eur(10));
+    offer(&mut v, m2, 1, usd(60), eur(50));
+    offer(&mut v, m4, 1, eur(100), xrp(400_000_000));
+    // m3 redeems its EUR: its offer is now unfunded but still at the tip.
+    let redeem = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(sf("sfAccount"), m3);
+        tx.set_account_id(sf("sfDestination"), gw);
+        tx.set_field_amount(sf("sfAmount"), eur(10));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 2);
+    });
+    assert_eq!(
+        handle_real_dispatch(&mut v, &redeem, TxType::PAYMENT, None),
+        Ter::TES_SUCCESS
+    );
+    let m3_offer = protocol::offer_keylet(Uint160::from_void(m3.data()), 1);
+    assert!(v.read(m3_offer).expect("read").is_some());
+
+    // Pass 1 spends all 10 USD on strand A. Pass 2: strand A is dry; strand
+    // B meets m3's unfunded offer, uses m2, then dries at the sender's
+    // DirectStep. rippled deletes m3's offer after that all-dry pass.
+    let mut paths = protocol::STPathSet::new(sf("sfPaths"));
+    let mut path = protocol::STPath::new();
+    path.push_back(protocol::STPathElement::from_optionals(None, Some(e.into()), Some(gw)));
+    paths.push_back(path);
+    let payment = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(sf("sfAccount"), sender);
+        tx.set_account_id(sf("sfDestination"), dest);
+        tx.set_field_amount(sf("sfAmount"), xrp(1_000_000_000));
+        tx.set_field_amount(sf("sfSendMax"), usd(1_000));
+        tx.set_field_path_set(sf("sfPaths"), paths.clone());
+        tx.set_field_u32(sf("sfFlags"), 0x0002_0000);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    let rules = v.rules().clone();
+    let result = tx::with_transaction_apply_runtime(&rules, || {
+        handle_real_dispatch(&mut v, &payment, TxType::PAYMENT, None)
+    });
+    assert_eq!(result, Ter::TES_SUCCESS);
+    let m1_offer = protocol::offer_keylet(Uint160::from_void(m1.data()), 1);
+    assert!(v.read(m1_offer).expect("read").is_none(), "strand A consumed m1");
+    assert!(
+        v.read(m3_offer).expect("read").is_none(),
+        "rippled removes the found-unfunded offer met by the dry strand"
+    );
+    let m2_offer = protocol::offer_keylet(Uint160::from_void(m2.data()), 1);
+    assert!(v.read(m2_offer).expect("read").is_some(), "dry strand changes nothing else");
+}
