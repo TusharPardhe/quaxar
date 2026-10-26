@@ -451,7 +451,7 @@ fn execute_single_strand<V: ApplyView>(
         is_last_step: Rc::new(Cell::new(false)),
     };
 
-    let Some(probe) = ({
+    let probe = {
         let mut dry_sandbox = FlowSandbox::new(parent);
         reverse_probe(
             &mut dry_sandbox,
@@ -461,21 +461,25 @@ fn execute_single_strand<V: ApplyView>(
             &context,
             &preceding_contexts,
         )?
-    }) else {
-        return Ok(SingleStrandResult {
-            amounts: None,
-            offers_used: offer_usage.get(),
-        });
     };
     // `dry_sandbox` was deliberately dropped without `apply`.
 
     // rippled compares owner funds against `afView`, this strand's parent.
+    // OfferStream decides `permRmOffer` inline while the strand runs, so a
+    // found-unfunded offer joins `ofrsToRm` even when the strand later
+    // proves dry (mainnet 107899967: 3485735D... in a dry DCHAMP/XRP strand).
     if let Some(cancellation) = context.self_cross_cancellation.as_ref() {
         let ter = cancellation.resolve_funding_against(parent);
         if ter != Ter::TES_SUCCESS {
             return Err(ter);
         }
     }
+    let Some(probe) = probe else {
+        return Ok(SingleStrandResult {
+            amounts: None,
+            offers_used: offer_usage.get(),
+        });
+    };
     // The replay steps the same offers; its observations were resolved above.
     struct ClearOnExit(Option<SelfCrossCancellation>);
     impl Drop for ClearOnExit {
