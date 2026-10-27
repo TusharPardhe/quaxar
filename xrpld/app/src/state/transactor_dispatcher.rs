@@ -280,6 +280,32 @@ fn account_holds_amm_asset<V: ledger::ApplyView>(
     }
 }
 
+/// rippled `ammHolds` asset ordering: both optional assets as given; one
+/// asset first with the pool's other asset second; neither, the AMM entry's
+/// own `sfAsset`/`sfAsset2` order. A withdraw-all or LP-token deposit names
+/// no amount, so the pool order (not the transaction's Asset order) decides
+/// which asset moves first and therefore which reserve check sees the first
+/// transfer (mainnet 107939175: XRP before the new XRPP line).
+fn amm_holds_asset_order(
+    amm_sle: &STLedgerEntry,
+    opt_asset1: Option<Asset>,
+    opt_asset2: Option<Asset>,
+) -> (Asset, Asset) {
+    let sle_asset1 = amm_sle.get_field_issue(sf("sfAsset")).asset();
+    let sle_asset2 = amm_sle.get_field_issue(sf("sfAsset2")).asset();
+    match (opt_asset1, opt_asset2) {
+        (Some(asset1), Some(asset2)) => (asset1, asset2),
+        (Some(single), None) | (None, Some(single)) => {
+            if single == sle_asset2 {
+                (sle_asset2, sle_asset1)
+            } else {
+                (sle_asset1, sle_asset2)
+            }
+        }
+        (None, None) => (sle_asset1, sle_asset2),
+    }
+}
+
 macro_rules! amm_holds_or_return {
     ($view:expr, $account:expr, $asset:expr, $field:expr) => {
         match account_holds_amm_asset($view, $account, $asset, $field) {
@@ -5907,8 +5933,11 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 }
                 let lp_tokens = amm_sle.get_field_amount(sf("sfLPTokenBalance"));
                 let lp_issue = lp_tokens.issue();
-                let pool_asset1 = amount.as_ref().map(STAmount::asset).unwrap_or(asset1);
-                let pool_asset2 = amount2.as_ref().map(STAmount::asset).unwrap_or(asset2);
+                let (pool_asset1, pool_asset2) = amm_holds_asset_order(
+                    &amm_sle,
+                    amount.as_ref().map(STAmount::asset),
+                    amount2.as_ref().map(STAmount::asset),
+                );
                 let pool1 = amm_holds_or_return!(view, &amm_account, pool_asset1, sf("sfAmount"));
                 let pool2 = amm_holds_or_return!(view, &amm_account, pool_asset2, sf("sfAmount2"));
                 let trading_fee = if lp_tokens.signum() == 0 {
@@ -6146,8 +6175,11 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 let lp_total = amm_sle.get_field_amount(sf("sfLPTokenBalance"));
                 let lp_issue = lp_total.issue();
                 let trading_fee = ledger::get_trading_fee(view, &amm_sle, account);
-                let pool_asset1 = amount.as_ref().map(STAmount::asset).unwrap_or(asset1);
-                let pool_asset2 = amount2.as_ref().map(STAmount::asset).unwrap_or(asset2);
+                let (pool_asset1, pool_asset2) = amm_holds_asset_order(
+                    &amm_sle,
+                    amount.as_ref().map(STAmount::asset),
+                    amount2.as_ref().map(STAmount::asset),
+                );
                 let pool1 = amm_holds_or_return!(view, &amm_account, pool_asset1, sf("sfAmount"));
                 let pool2 = amm_holds_or_return!(view, &amm_account, pool_asset2, sf("sfAmount2"));
                 let math_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
