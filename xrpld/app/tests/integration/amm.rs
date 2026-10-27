@@ -692,3 +692,77 @@ fn amm_withdraw_all_deletes_empty_pool_and_pseudo_account() {
         "redeemIOU must delete the holder's default zero-balance LP trust line"
     );
 }
+
+/// Mainnet 107939175 (AMMWithdraw DFCE1649..., inner of Batch 999A3431...):
+/// a withdraw-all names no amounts, so rippled's `ammHolds` uses the AMM
+/// entry's asset order (XRP, then USD) even though the transaction lists
+/// USD first. XRP arrives before the new USD trust line's reserve check, so
+/// an account just under that reserve still withdraws successfully.
+#[test]
+fn amm_withdraw_all_uses_pool_asset_order_for_new_line_reserve() {
+    let alice = acct(0x41);
+    let gw = acct(0x42);
+    let bob = acct(0x43);
+    let usd = Issue::new(protocol::currency_from_string("USD"), gw);
+    let mut ledger = make_ledger(vec![
+        account_root(alice, 100_000_000_000, 0, 0),
+        account_root(gw, 100_000_000_000, 0, 0),
+        // One pre-existing owned object; the LP line makes it two.
+        account_root(bob, 2_500_000, 1, 0),
+        trust_line_local(alice, gw, usd.currency, 50_000, 100_000, 0),
+    ]);
+    ledger.set_fees(ledger::Fees {
+        base: 10,
+        reserve: 1_000_000,
+        increment: 200_000,
+    });
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("fixAMMv1_2"),
+        protocol::feature_id("fixAMMv1_3"),
+    ]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    let create = amm_create_tx(alice, xrp(10_000_000), iou(gw, "USD", 10_000), 0, 1);
+    assert_eq!(full_apply(&mut view, &create, TxType::AMM_CREATE), Ter::TES_SUCCESS);
+
+    let issue_field = |tx: &mut protocol::STObject, name: &str, asset: Asset| {
+        tx.set_field_issue(sf(name), STIssue::new_with_asset(sf(name), asset));
+    };
+    // Bob adds 1 XRP single-sided: he holds LP tokens but no USD line.
+    let deposit = STTx::new(TxType::AMM_DEPOSIT, |tx| {
+        tx.set_account_id(sf("sfAccount"), bob);
+        issue_field(tx, "sfAsset", Asset::Issue(protocol::xrp_issue()));
+        issue_field(tx, "sfAsset2", Asset::Issue(usd));
+        tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
+        tx.set_field_u32(sf("sfFlags"), protocol::AMM_SINGLE_ASSET_FLAG);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(full_apply(&mut view, &deposit, TxType::AMM_DEPOSIT), Ter::TES_SUCCESS);
+    let bob_root = view
+        .read(account_keylet(acct_id(bob)))
+        .expect("read")
+        .expect("bob");
+    assert_eq!(bob_root.get_field_u32(sf("sfOwnerCount")), 2);
+    let bob_balance = bob_root.get_field_amount(sf("sfBalance")).xrp().drops();
+    assert!(bob_balance < 1_600_000, "below the 3-object reserve: {bob_balance}");
+
+    // Transaction asset order is USD, XRP (reverse of the pool's order).
+    let withdraw = STTx::new(TxType::AMM_WITHDRAW, |tx| {
+        tx.set_account_id(sf("sfAccount"), bob);
+        issue_field(tx, "sfAsset", Asset::Issue(usd));
+        issue_field(tx, "sfAsset2", Asset::Issue(protocol::xrp_issue()));
+        tx.set_field_u32(sf("sfFlags"), protocol::AMM_WITHDRAW_ALL_FLAG);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 2);
+    });
+    assert_eq!(
+        full_apply(&mut view, &withdraw, TxType::AMM_WITHDRAW),
+        Ter::TES_SUCCESS,
+        "rippled sends XRP (pool asset 1) before checking the new USD line's reserve"
+    );
+    assert!(view
+        .read(protocol::line(bob, gw, usd.currency))
+        .expect("read")
+        .is_some());
+}
