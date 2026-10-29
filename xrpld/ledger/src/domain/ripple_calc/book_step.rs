@@ -1917,12 +1917,14 @@ fn amm_offer_invariant_holds(
         )
 }
 
+/// rippled `AMMLiquidity.cpp` `maxOut`: `out * Number{99, -2}` runs under
+/// the caller's current rounding mode (ToNearest in flow), and only the
+/// conversion `toAmount(..., Downward)` rounds down. Forcing Downward on the
+/// multiplication drops one unit when the 17th digit is 5 or more
+/// (mainnet 107966155: 1.772719852108420e-4 * 0.99 = ...3358e-4 -> ...336).
 fn amm_max_output(pool_out: &STAmount) -> Option<STAmount> {
-    let max_out = {
-        let _rounding = NumberRoundModeGuard::new(RoundingMode::Downward);
-        crate::domain::amm_helpers::stamount_as_number(pool_out)
-            * RuntimeNumber::from_i64_and_exponent(99, -2)
-    };
+    let max_out = crate::domain::amm_helpers::stamount_as_number(pool_out)
+        * RuntimeNumber::from_i64_and_exponent(99, -2);
     number_to_amount(pool_out.asset(), max_out, RoundingMode::Downward)
         .filter(|amount| amount.signum() > 0 && amount < pool_out)
 }
@@ -4364,6 +4366,33 @@ mod tests {
         context.update();
         assert_eq!(context.iterations(), 1);
         assert_eq!(context.account(), account);
+    }
+
+    #[test]
+    fn amm_max_output_multiplies_under_the_current_rounding_mode() {
+        // Mainnet runs under the Small mantissa scale (SingleAssetVault,
+        // LendingProtocol and MPTokensV2 are not enabled).
+        let _scale =
+            basics::number::NumberMantissaScaleGuard::new(basics::number::MantissaScale::Small);
+        // Mainnet 107966155 (Payment 3FADB4E3...): the GLDX pool held
+        // 1.772719852108420e-4. rippled's maxOut computes `out * 0.99` under
+        // the caller's ToNearest mode (1.75499265358733580e-4 -> ...336e-4)
+        // and only the toAmount conversion rounds down. Rounding the product
+        // Downward yields ...335e-4, one unit short.
+        let gldx = protocol::Issue::new(
+            protocol::currency_from_string("GLD"),
+            AccountID::from_array([0xA6; 20]),
+        );
+        let pool_out = STAmount::from_iou_amount(
+            sf("sfAmount"),
+            protocol::IOUAmount::from_parts(1_772_719_852_108_420, -19).expect("pool amount"),
+            gldx,
+        );
+        let max_out = amm_max_output(&pool_out).expect("non-empty pool has a max offer");
+        assert_eq!(
+            max_out.iou(),
+            protocol::IOUAmount::from_parts(1_754_992_653_587_336, -19).expect("canonical maxOut")
+        );
     }
 
     #[test]
