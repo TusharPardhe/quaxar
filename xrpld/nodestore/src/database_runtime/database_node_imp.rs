@@ -259,6 +259,9 @@ impl DatabaseNodeImp {
 
     pub fn add_counts_json(&self, obj: &mut BTreeMap<String, JsonValue>) {
         self.database.add_counts_json(obj);
+        for (name, value) in self.backend.counters() {
+            obj.insert(name.to_owned(), JsonValue::Unsigned(value));
+        }
     }
 
     pub fn get_counts_json(&self) -> JsonValue {

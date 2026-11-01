@@ -9,6 +9,18 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Fixed
 
+- Pruned fjall stores no longer fill with tombstones and stall writes. A
+  `compaction_base_mb` that is small next to the live node data left the
+  next-to-last level under its target, so deletes never reached the bottom
+  level where fjall drops them. The mainnet validator (base 64 MB, live
+  8 GB) grew to 46 GB with 575 million tombstones and missed ledgers every
+  ~30 minutes. The default is now 4096, the accepted range is 16-65536, and
+  docs/CONFIGURATION.md gives the sizing formula
+  (`≈ (state + online_delete × ledger) ÷ 2`; 256 for full history). Pruned
+  stores warn hourly when the base is under a quarter of the live data, and
+  `get_counts` reports `fjall_effective_base_mb`, `fjall_live_mb`,
+  `fjall_recommended_base_mb`, `fjall_l0_tables` and `fjall_base_undersized`.
+  The value is fixed at store creation, so existing stores need a rebuild.
 - The consensus accept passes `roundTime > 5s` to the TxQ as `timeLeap`, like
   rippled `doAccept`. It always passed `false`, so slow rounds never cut the
   expected ledger size; the open ledger grew to ~1800 transactions while
@@ -163,9 +175,8 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
   reference counts and self-validating death-sequence records drive deletion
   once nodes fall more than `online_delete` ledgers behind, with incremental
   and full-window verification that halts pruning on any inconsistency.
-- Added `[node_db] compaction_base_mb` (16-4096, default 256) to size the
-  first leveled-compaction level of the node keyspace, bounding peak space
-  amplification. Testnet and devnet default to 64.
+- Added `[node_db] compaction_base_mb` to size the first leveled-compaction
+  level of the node keyspace (range and default revised; see Fixed above).
 - Added a disk-full ballast (`reserve_mb`), pruned-aware snapshot load with
   anchor adoption, and pruned-store health in `server_info` and `get_counts`.
 

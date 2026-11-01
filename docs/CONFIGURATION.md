@@ -127,9 +127,71 @@ Configures persistent ledger object storage.
 | `advisory_delete` | When enabled, pruning pauses at the advisory `can_delete` boundary. |
 | `cache_mb` | Block-cache budget for the fjall store, in MB. Defaults from `node_size`. |
 | `reserve_mb` | Disk-full ballast reserved at open, in MB; default `1024`, `0` disables. Released under disk pressure so compaction and deletes have room. |
-| `compaction_base_mb` | Size of the first leveled-compaction level of the node keyspace, in MB (`16`–`4096`, default `256`). Levels grow ×10 from it. Pick it so the live node set sits just under a level target: `256` for mainnet-sized stores, `64` for testnet/devnet. Fixed when the store is created; changing it needs a fresh store. |
+| `compaction_base_mb` | Size of the first leveled-compaction level of the node keyspace, in MB (`16`–`65536`, default `4096`). **Fixed when the store is created.** Pruned nodes must size it from their live data; see [Sizing `compaction_base_mb`](#sizing-compaction_base_mb) below. |
 | `delete_batch` | Relational cleanup batch size; default `100`. |
 | `back_off_milliseconds` | Delay between relational cleanup batches; default `100`. Legacy key `backOff` is also accepted. |
+
+### Sizing `compaction_base_mb`
+
+> **IMPORTANT:** on a pruned node (`online_delete > 0`) a `compaction_base_mb`
+> that is small next to the live data makes the node store fill with deleted
+> entries and stall writes. The node then misses ledgers, every ~30 minutes
+> on mainnet. fjall fixes the value when the store is created, so changing it
+> later needs a fresh store (a clean resync or a snapshot load).
+
+**Why it matters.** The node store is an LSM tree: new writes go to level 0
+and are merged downward into larger levels. A delete writes a tombstone, and
+fjall can drop a tombstone only when it is merged into the bottom level. A
+pruned node deletes every node that leaves the `online_delete` window, millions
+per day. Level targets grow ×10 from `compaction_base_mb`. If the base is
+small, the live data needs many levels, the level above the bottom never
+reaches its target, and tombstones never get there. Measured on the mainnet
+validator (2026-11-01, base 64 MB): 8 GB of live data in a 46 GB store with
+575 million tombstones, and level 0 hitting fjall's 20-table write limit.
+
+**Formula.** Set the first level to about half of the node store's live data:
+
+```
+live_MB            ≈ state_MB + online_delete × ledger_MB
+compaction_base_mb ≈ live_MB ÷ 2, rounded up to a power of two
+```
+
+| Input | Mainnet (2026-11) | How to measure on a running node |
+|---|---|---|
+| `state_MB` (current ledger state) | ≈ 6,500 | `fjall_live_mb` minus `online_delete × ledger_MB` |
+| `ledger_MB` (nodes written per validated ledger) | ≈ 2.7 (≈ 5,500 nodes × 484 B) | Δ`node_written_bytes` ÷ Δ`pruned_claimed_seq` in `get_counts` |
+
+| Network, `online_delete` | live data | `compaction_base_mb` |
+|---|---|---|
+| mainnet, 512 (default) | ≈ 7.9 GB | **4096** (the default) |
+| mainnet, 2,000 | ≈ 11.9 GB | 8192 |
+| mainnet, 10,000 | ≈ 33.5 GB | 32768 |
+| testnet or devnet, 256–512 | ≈ 4–6 GB | 2048–4096 (4096 above 4 GB) |
+| any network, `0` (full history) | grows without bound | **256** |
+
+**Healthy range.** A benchmark of the same write-once, delete-later pattern
+(250 MB live, values scaled) showed the store holding its size and level 0
+staying at 7 tables or fewer when the base was ¼ to 1× the live data. At 1/31
+the store kept growing and level 0 reached 26 tables; at 1/125 (the old 64 MB
+mainnet setting) writes halted. Halving or doubling the formula's value stays
+within the healthy range. A larger base means larger merges out of level 0
+(more disk writes), so do not set it far above the live data.
+
+**Installer.** `install.sh` computes the value from the chosen network and
+`online_delete` with this formula and writes it with an IMPORTANT comment.
+Set `QUAXAR_COMPACTION_BASE_MB` to override it (16–65536).
+
+**Full history (`online_delete = 0`).** Nothing is deleted, so no tombstones
+build up and the ratio does not apply. Keep the base small (`256`): a large
+base would only make each merge rewrite more data.
+
+**Monitoring.** On a pruned node quaxar checks the ratio hourly. `get_counts`
+reports `fjall_effective_base_mb` (the value the store was created with),
+`fjall_live_mb`, `fjall_recommended_base_mb`, `fjall_l0_tables` and
+`fjall_base_undersized`. When the base falls below ¼ of the live data,
+`fjall_base_undersized` becomes `1` and the log warns. That happens as the
+ledger state grows or after `online_delete` is raised. Rebuild the store
+with the recommended value before stalls begin.
 
 When nonzero, `online_delete` must be at least the selected numeric
 `ledger_history`. The fjall store prunes continuously: as each validated

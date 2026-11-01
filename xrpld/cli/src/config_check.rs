@@ -285,15 +285,15 @@ fn validate_node_db_and_history(config: &BasicConfig, report: &mut ConfigValidat
             .push(format!("[node_db] advisory_delete is invalid: {raw}"));
     }
 
-    // Mirrors the fjall backend's accepted range (16..=4096 MB).
+    // Mirrors the fjall backend's accepted range (16..=65536 MB).
     if let Some(raw) = optional_string(node_db, "compaction_base_mb")
         && !raw
             .trim()
             .parse::<u64>()
-            .is_ok_and(|mb| (16..=4096).contains(&mb))
+            .is_ok_and(|mb| (16..=65536).contains(&mb))
     {
         report.errors.push(format!(
-            "[node_db] compaction_base_mb must be between 16 and 4096: {raw}"
+            "[node_db] compaction_base_mb must be between 16 and 65536: {raw}"
         ));
     }
 
@@ -713,7 +713,7 @@ maybe
             "[node_db] missing required field: path",
             "online_delete must be 0 or at least 256",
             "advisory_delete is invalid",
-            "compaction_base_mb must be between 16 and 4096",
+            "compaction_base_mb must be between 16 and 65536",
             "[ledger_history] 256 cannot be greater than online_delete 128",
             "[network_id] invalid",
             "[overlay] ip_limit",

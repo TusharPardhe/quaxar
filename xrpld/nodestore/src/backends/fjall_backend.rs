@@ -56,13 +56,23 @@ fn read_reserve_bytes(section: &Section) -> u64 {
 }
 
 /// Default size of the first leveled-compaction level of the `nodes`
-/// keyspace, in MB (fjall's own default: 64 MiB tables x 4). Level targets grow
-/// x10 from here, and peak space amplification is about
-/// `1 + penultimate_level / live_data`, so the base should put the live node
-/// set just under a level target: 256 suits ~15-25 GB stores (mainnet), 64
-/// suits ~4-6 GB stores (testnet).
-const DEFAULT_COMPACTION_BASE_MB: u64 = 256;
-const COMPACTION_BASE_MB_RANGE: std::ops::RangeInclusive<u64> = 16..=4096;
+/// keyspace, in MB. Sized for a pruned mainnet store (`online_delete = 512`,
+/// live node set ~8 GB in 2026-11): half the live data. See
+/// docs/CONFIGURATION.md for the formula; full-history stores should use 256.
+const DEFAULT_COMPACTION_BASE_MB: u64 = 4096;
+const COMPACTION_BASE_MB_RANGE: std::ops::RangeInclusive<u64> = 16..=65536;
+/// Pruned stores (`online_delete > 0`) delete every node that leaves the
+/// window, and fjall drops those tombstones only when they are merged into
+/// the bottom level. A first level that is small next to the live node set
+/// makes a deep tree whose penultimate level never reaches its target, so
+/// tombstones accumulate and compaction stalls L0 writes (mainnet validator
+/// 2026-10-31: base 64 MB, live ~8 GB, 575M tombstones, 30-minute stalls).
+/// Measured on a write-once/delete-once workload: healthy when the base is
+/// at least a quarter of the live data, failing at 1/31 and below. The
+/// watchdog warns below this ratio so operators rebuild before stalls start.
+const MIN_BASE_TO_LIVE_RATIO: u64 = 4;
+/// How often the watchdog re-checks the base-to-live ratio.
+const SIZING_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 /// L0 tables merged at once; the base level is `L0_THRESHOLD` target tables.
 const L0_THRESHOLD: u8 = 4;
 
@@ -234,6 +244,7 @@ fn spawn_compaction_watchdog(
     open: std::sync::Weak<OpenDb>,
     dir: std::path::PathBuf,
     reserve_bytes: u64,
+    pruned: bool,
 ) {
     let ballast = dir.join(".reserve_ballast");
     let spawned = std::thread::Builder::new()
@@ -242,6 +253,10 @@ fn spawn_compaction_watchdog(
             let mut stuck_since: Option<(std::time::Instant, usize)> = None;
             let mut halted_since: Option<std::time::Instant> = None;
             let mut last_disk_check = std::time::Instant::now();
+            // First check shortly after open, then hourly.
+            let mut last_sizing_check = std::time::Instant::now()
+                .checked_sub(SIZING_CHECK_INTERVAL)
+                .unwrap_or_else(std::time::Instant::now);
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 let Some(open) = open.upgrade() else {
@@ -250,6 +265,23 @@ fn spawn_compaction_watchdog(
                 if last_disk_check.elapsed() >= DISK_CHECK_INTERVAL {
                     last_disk_check = std::time::Instant::now();
                     maintain_ballast(&dir, &ballast, reserve_bytes);
+                }
+                if last_sizing_check.elapsed() >= SIZING_CHECK_INTERVAL {
+                    last_sizing_check = std::time::Instant::now();
+                    let live = bottom_level_bytes(&open.nodes);
+                    if let Some(base) = effective_base_bytes(&open.nodes)
+                        && sizing_warning_applies(pruned, base, live)
+                    {
+                        tracing::warn!(
+                            target: "nodestore",
+                            effective_base_mb = base / (1024 * 1024),
+                            live_mb = live / (1024 * 1024),
+                            recommended_base_mb = recommended_base_mb(live),
+                            "fjall compaction_base_mb is too small for this store's live data; \
+                             tombstones will accumulate and stall writes. Set the recommended \
+                             compaction_base_mb and rebuild the store (the value is fixed at creation)"
+                        );
+                    }
                 }
                 let l0 = open.nodes.l0_table_count();
                 halted_since = if l0 < L0_STALL_RUNS {
@@ -296,6 +328,53 @@ fn spawn_compaction_watchdog(
     }
 }
 
+
+/// The first-level size this store was created with, in bytes. fjall
+/// persists the leveled strategy at keyspace creation and ignores the
+/// configured value on reopen, so this is the effective base.
+fn effective_base_bytes(nodes: &FjallKeyspace) -> Option<u64> {
+    let config = nodes.config.compaction_strategy.get_config();
+    let target = config
+        .iter()
+        .find(|(key, _)| &key[..] == b"leveled_target_size")
+        .and_then(|(_, value)| <[u8; 8]>::try_from(&value[..]).ok())
+        .map(u64::from_le_bytes)?;
+    Some(target.saturating_mul(u64::from(L0_THRESHOLD)))
+}
+
+/// Size of the deepest non-empty level of `nodes`: the live node set once
+/// tombstones have been merged out.
+fn bottom_level_bytes(nodes: &FjallKeyspace) -> u64 {
+    use fjall::AbstractTree;
+    let version = nodes.tree.current_version();
+    version
+        .iter_levels()
+        .filter(|level| !level.is_empty())
+        .last()
+        .map_or(0, |level| level.size())
+}
+
+/// Whether the base is too small for the live data (see
+/// `MIN_BASE_TO_LIVE_RATIO`). An empty or tiny store is never undersized.
+fn base_undersized(base_bytes: u64, live_bytes: u64) -> bool {
+    base_bytes.saturating_mul(MIN_BASE_TO_LIVE_RATIO) < live_bytes
+}
+
+/// The sizing warning applies only to pruned stores: with `online_delete = 0`
+/// nothing is deleted, no tombstones build up, and a small base is correct.
+fn sizing_warning_applies(pruned: bool, base_bytes: u64, live_bytes: u64) -> bool {
+    pruned && base_undersized(base_bytes, live_bytes)
+}
+
+/// `compaction_base_mb` the docs recommend for `live_bytes`: half the live
+/// node set, rounded up to a power of two, within the accepted range.
+fn recommended_base_mb(live_bytes: u64) -> u64 {
+    let half_mb = (live_bytes / 2).div_ceil(1024 * 1024).max(1);
+    half_mb
+        .next_power_of_two()
+        .clamp(*COMPACTION_BASE_MB_RANGE.start(), *COMPACTION_BASE_MB_RANGE.end())
+}
+
 /// The open fjall database and its four keyspace handles, resolved once at
 /// open so every operation is a direct handle call.
 struct OpenDb {
@@ -328,6 +407,9 @@ pub struct FjallBackend {
     reserve_bytes: u64,
     /// Target table size for the `nodes` keyspace (`compaction_base_mb / 4`).
     table_target_bytes: u64,
+    /// `online_delete > 0`: the store deletes nodes, so tombstones must reach
+    /// the bottom level and the base-to-live ratio matters.
+    pruned: bool,
     journal: Arc<dyn NodeStoreJournal>,
     db: Mutex<Option<Arc<OpenDb>>>,
     // When set (via set_delete_path, used by rotation to retire an archive),
@@ -354,6 +436,11 @@ impl FjallBackend {
             cache_bytes: read_cache_bytes(key_values),
             reserve_bytes: read_reserve_bytes(key_values),
             table_target_bytes: read_table_target_bytes(key_values)?,
+            pruned: key_values
+                .get::<u64>("online_delete")
+                .ok()
+                .flatten()
+                .is_some_and(|window| window > 0),
             journal,
             db: Mutex::new(None),
             delete_on_close: std::sync::atomic::AtomicBool::new(false),
@@ -451,6 +538,7 @@ impl Backend for FjallBackend {
             Arc::downgrade(&open),
             std::path::PathBuf::from(&self.path),
             self.reserve_bytes,
+            self.pruned,
         );
         *guard = Some(open);
         drop(guard);
@@ -619,6 +707,26 @@ impl Backend for FjallBackend {
         true
     }
 
+    fn counters(&self) -> Vec<(&'static str, u64)> {
+        let Ok(open) = self.open_db() else {
+            return Vec::new();
+        };
+        let live = bottom_level_bytes(&open.nodes);
+        let mut counters = vec![
+            ("fjall_l0_tables", open.nodes.l0_table_count() as u64),
+            ("fjall_live_mb", live / (1024 * 1024)),
+            ("fjall_disk_mb", open.nodes.disk_space() / (1024 * 1024)),
+            ("fjall_recommended_base_mb", recommended_base_mb(live)),
+        ];
+        if let Some(base) = effective_base_bytes(&open.nodes) {
+            counters.push(("fjall_effective_base_mb", base / (1024 * 1024)));
+            // Full-history stores never delete, so the ratio does not apply.
+            let undersized = sizing_warning_applies(self.pruned, base, live);
+            counters.push(("fjall_base_undersized", u64::from(undersized)));
+        }
+        counters
+    }
+
     fn kv_get(&self, keyspace: Keyspace, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
         let open = self.open_db()?;
         open.handle(keyspace)
@@ -738,7 +846,10 @@ impl Factory for FjallFactory {
 
 #[cfg(test)]
 mod tests {
-    use super::{FjallBackend, FjallFactory, read_table_target_bytes};
+    use super::{
+        FjallBackend, FjallFactory, base_undersized, effective_base_bytes, read_table_target_bytes,
+        recommended_base_mb, sizing_warning_applies,
+    };
     use crate::{Backend, Factory, NodeObject, NodeObjectType, NullJournal};
     use basics::{base_uint::Uint256, basic_config::Section};
     use std::sync::{
@@ -801,7 +912,7 @@ mod tests {
         let path = temp_path("base-parse");
         assert_eq!(
             read_table_target_bytes(&section(&path)).expect("default"),
-            64 * 1024 * 1024
+            1024 * 1024 * 1024
         );
         let mut cfg = section(&path);
         cfg.set("compaction_base_mb", "64");
@@ -809,7 +920,13 @@ mod tests {
             read_table_target_bytes(&cfg).expect("64"),
             16 * 1024 * 1024
         );
-        for bad in ["8", "8192", "abc"] {
+        let mut cfg = section(&path);
+        cfg.set("compaction_base_mb", "8192");
+        assert_eq!(
+            read_table_target_bytes(&cfg).expect("8192 is accepted for large windows"),
+            2048 * 1024 * 1024
+        );
+        for bad in ["8", "131072", "abc"] {
             let mut cfg = section(&path);
             cfg.set("compaction_base_mb", bad);
             assert!(
@@ -853,7 +970,7 @@ mod tests {
 
     #[test]
     fn compaction_base_mb_sizes_node_tables_and_persists_across_reopen() {
-        // Default base (64 MiB tables): the merged L0 fits in one table.
+        // Default base (1 GiB tables): the merged L0 fits in one table.
         let default_path = temp_path("base-default");
         let mut cfg = section(&default_path);
         cfg.set("reserve_mb", "0");
@@ -884,6 +1001,82 @@ mod tests {
         assert!(tables > small_tables, "persisted table size must win, got {tables}");
         let _ = backend.close();
         let _ = std::fs::remove_dir_all(&small_path);
+    }
+
+    #[test]
+    fn base_to_live_ratio_flags_undersized_pruned_stores() {
+        const MB: u64 = 1024 * 1024;
+        // Mainnet validator 2026-10-31: base 64 MB, live ~7.5 GB -> undersized.
+        assert!(base_undersized(64 * MB, 7_500 * MB));
+        // The documented fix: base 4096 MB for that store is healthy.
+        assert!(!base_undersized(4096 * MB, 7_500 * MB));
+        // Boundary: exactly a quarter of the live data is still healthy.
+        assert!(!base_undersized(2000 * MB, 8000 * MB));
+        assert!(base_undersized(1999 * MB, 8000 * MB));
+        // An empty store is never flagged.
+        assert!(!base_undersized(256 * MB, 0));
+    }
+
+    #[test]
+    fn recommended_base_is_half_live_rounded_to_a_power_of_two() {
+        const MB: u64 = 1024 * 1024;
+        assert_eq!(recommended_base_mb(7_700 * MB), 4096); // mainnet, window 512
+        assert_eq!(recommended_base_mb(11_100 * MB), 8192); // window 2000
+        assert_eq!(recommended_base_mb(0), 16); // floor of the accepted range
+        assert_eq!(recommended_base_mb(500_000 * MB), 65536); // ceiling
+    }
+
+    #[test]
+    fn effective_base_is_read_from_the_store_not_the_config() {
+        let path = temp_path("base-effective");
+        let mut cfg = section(&path);
+        cfg.set("reserve_mb", "0");
+        cfg.set("compaction_base_mb", "16");
+        let backend = FjallBackend::new(&cfg, Arc::new(NullJournal)).expect("construct");
+        backend.open(true).expect("open");
+        let open = backend.open_db().expect("open db");
+        assert_eq!(effective_base_bytes(&open.nodes), Some(16 * 1024 * 1024));
+        drop(open);
+        let _ = backend.close();
+
+        // Reopen asking for 4096: fjall keeps the persisted 16 MB, and the
+        // counters report what the store really uses.
+        let mut cfg = section(&path);
+        cfg.set("reserve_mb", "0");
+        cfg.set("compaction_base_mb", "4096");
+        let backend = FjallBackend::new(&cfg, Arc::new(NullJournal)).expect("construct");
+        backend.open(true).expect("reopen");
+        let counters: std::collections::BTreeMap<_, _> = backend.counters().into_iter().collect();
+        assert_eq!(counters.get("fjall_effective_base_mb"), Some(&16));
+        assert_eq!(counters.get("fjall_base_undersized"), Some(&0));
+        assert!(counters.contains_key("fjall_live_mb"));
+        assert!(counters.contains_key("fjall_l0_tables"));
+        let _ = backend.close();
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn full_history_store_is_never_flagged_undersized() {
+        const MB: u64 = 1024 * 1024;
+        // online_delete = 0 never deletes nodes: a 256 MB base over 4 TB of
+        // history is correct and must not warn.
+        assert!(!sizing_warning_applies(false, 256 * MB, 4_000_000 * MB));
+        // The same sizes on a pruned store do warn.
+        assert!(sizing_warning_applies(true, 256 * MB, 4_000_000 * MB));
+        assert!(!sizing_warning_applies(true, 4096 * MB, 7_500 * MB));
+    }
+
+    #[test]
+    fn pruned_flag_follows_online_delete() {
+        for (window, pruned) in [(None, false), (Some("0"), false), (Some("512"), true)] {
+            let path = temp_path("pruned-flag");
+            let mut cfg = section(&path);
+            if let Some(window) = window {
+                cfg.set("online_delete", window);
+            }
+            let backend = FjallBackend::new(&cfg, Arc::new(NullJournal)).expect("construct");
+            assert_eq!(backend.pruned, pruned, "online_delete = {window:?}");
+        }
     }
 
     #[test]

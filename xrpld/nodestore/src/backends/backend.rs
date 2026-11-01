@@ -172,6 +172,11 @@ pub trait Backend: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Backend-specific health counters for `get_counts` (name, value).
+    fn counters(&self) -> Vec<(&'static str, u64)> {
+        Vec::new()
+    }
+
     #[doc(hidden)]
     fn kv_unsupported(&self) -> String {
         format!("backend {} is not key-value capable", self.get_name())
