@@ -297,6 +297,22 @@ fn sparse_mainnet_107858924_escrow_finish_destination_skips_line_limit() {
     ));
 }
 
+/// Mainnet fork at 107998578 (2026-10-30): an all-or-nothing Batch whose
+/// inner Payment 8026A065... sells GALAXY for XRP to its own account with
+/// Amount = 10^17 drops. The XRP endpoint's reverse probe credits the virtual
+/// kMaxNative to that account, so its sandbox balance exceeds the network
+/// maximum; the next leg then debits the same account. rippled's accountSend
+/// reads and writes native balances with the unchecked int64 constructor;
+/// quaxar re-canonicalized the stored balance, threw, and recorded
+/// tecINTERNAL, dropping the whole Batch. Trimmed to the Batch and its two
+/// inner transactions (TransactionIndex 0..2).
+#[test]
+fn sparse_mainnet_107998578_batch_self_payment_survives_virtual_xrp_credit() {
+    run_sparse_replay(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "tests/fixtures/sparse_replay/mainnet_107998578_batch_self_payment_virtual_xrp_credit.jsonl",
+    ));
+}
+
 /// Testnet fork at 21633206 (2026-10-18): AMMDeposit by LPTokenOut far
 /// beyond the depositor's IOU balances. rippled's AMMDeposit::deposit checks
 /// accountFunds before each send (tecUNFUNDED_AMM); quaxar only checked XRP,
