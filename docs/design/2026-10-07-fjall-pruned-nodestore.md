@@ -704,7 +704,7 @@ prune_mode = on           # on | dry_run
 prune_batch = 10000       # notebook rows per prune batch
 verify_interval = 3600    # seconds between sampled verifies
 reserve_mb = 1024         # disk ballast for Case 10
-compaction_base_mb = 256  # first compaction level of `nodes`; 64 on testnet
+compaction_base_mb = 4096 # first compaction level of `nodes`: ≈ live ÷ 2 (§10); 256 for full history
 ```
 
 ## 9. Removal inventory (Stage 7)
@@ -785,6 +785,58 @@ Bloom filters, 4 KiB blocks, LZ4 on deep levels and the 64 MiB memtable stay at
 the fjall defaults. fjall persists the strategy at keyspace creation, so a
 changed `compaction_base_mb` applies only to a new store.
 
+### Correction (2026-11-01): the base must scale with the live data
+
+The analysis above assumed tombstones drain whenever the penultimate level
+merges down, so a small base only cost space amplification. On a pruned
+mainnet store that assumption failed. The validator's store, created
+2026-10-22 with `compaction_base_mb = 64`, began stalling writes on
+2026-10-31. Missed ledgers recurred every ~30 minutes.
+
+Measured on 2026-11-01 (read-only inspector over a hard-link snapshot):
+
+| Level | Size | Entries | Tombstones |
+|---|---|---|---|
+| L0 | 0.06 GB | 0.19 M | 49% |
+| L3 | 1.08 GB | 4.0 M | 51% |
+| L4 | 3.53 GB | 43.4 M | 81% |
+| L5 | 34.43 GB | 587.4 M | 92% |
+| L6 | 7.51 GB | 32.8 M | 0% |
+
+Mainnet writes ≈ 2.7 MB per ledger (≈ 5,500 nodes × 484 B), 17× the 316 nodes
+measured above. lsm-tree 3.1.10 sizes level targets from the top
+(`T = B × 10^(i−1)`, shifted so the deepest used level is canonical L1+) and
+never scores the bottom level. With `B = 64 MB` the targets put L5 at 67 GB.
+L5 held 34 GB, scored 0.51, and never merged into L6, so its tombstones never
+reached the only level where they can be dropped. Compaction above it
+rewrote ~90% tombstones, fell behind, and L0 reached the 20-table write
+throttle.
+
+A sliding-window benchmark (content-addressed keys written once and deleted
+once after a fixed window, 250 MB live) reproduced the failure and found the
+boundary:
+
+| base ÷ live | Disk over time | Worst L0 | Writes |
+|---|---|---|---|
+| 1/125 | — | 30 | halted |
+| 1/31 | grows (833 → 1,159 MB) | 26 | near throttle |
+| 1/4 | flat (265–456 MB) | 7 | fine |
+| ≈ 1 | flat (315–488 MB) | 5 | fine |
+
+Rule, for pruned stores: `compaction_base_mb ≈ live ÷ 2`, where
+`live ≈ state + online_delete × bytes_per_ledger`. Mainnet with window 512:
+6.5 GB + 1.4 GB ≈ 7.9 GB, giving 4096. Full-history stores never delete,
+so this does not apply; they keep 256. The default is 4096 and the accepted
+range is 16–65536. The backend reads the base the store was created with,
+since fjall persists it and ignores a changed value. It warns hourly when
+`base × 4 < live` and reports the inputs in `get_counts`. The formula,
+table and operator guidance are in `docs/CONFIGURATION.md`.
+
+A level-sizing patch (targets derived from the bottom level, as in RocksDB's
+`level_compaction_dynamic_level_bytes`) would remove the need to size the
+base by hand. It was not adopted because lsm-tree's `CompactionStrategy`
+takes types it does not export, so it needs a fork of lsm-tree.
+
 ## 11. Lessons from Xahau PR #728
 
 Source: <https://github.com/Xahau/xahaud/pull/728> (open), the discussion
@@ -859,7 +911,9 @@ Case 17 and the FBC rules unchanged.
   append-only hash store, and per-key deletes leave tombstones until
   compaction removes them. Disk needs headroom for compaction (the ballast
   exists for this) and the deleted space is reclaimed with a delay: the store
-  saw-tooths by up to one penultimate level (§10, `compaction_base_mb`).
+  saw-tooths by up to one penultimate level. Tombstones drain only if
+  `compaction_base_mb` is sized from the live data (§10 correction); an
+  undersized base lets them accumulate until compaction stalls writes.
 - **Index overhead.** The notebook and counts keyspaces add a small amount of
   disk and a few reads and writes per changed node on every claim.
 - **More moving parts.** Correctness depends on an exact claim delta and on

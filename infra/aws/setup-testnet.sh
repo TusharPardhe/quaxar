@@ -153,7 +153,8 @@ type = fjall
 path = /var/lib/quaxar/db/fjall
 online_delete = 256
 advisory_delete = 0
-compaction_base_mb = 64
+# IMPORTANT: ≈ half the live node data; fixed at store creation (docs/CONFIGURATION.md).
+compaction_base_mb = 4096
 
 [database_path]
 /var/lib/quaxar/db
