@@ -9,6 +9,14 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Fixed
 
+- The fjall node keyspace now writes partitioned index and filter blocks at
+  every level and pins only their top-level blocks. With the larger
+  `compaction_base_mb` default, tables are about 1 GiB and their whole-table
+  indexes 10-20 MB. Unpinned, those overflowed the block cache, so each read
+  reloaded them; on the mainnet validator that saturated the host and
+  stalled the pruned claim. Stores created before this change need a
+  `cache_mb` above their index and filter total (about 2.5% of the store)
+  until they are rebuilt.
 - Pruned fjall stores no longer fill with tombstones and stall writes. A
   `compaction_base_mb` that is small next to the live node data left the
   next-to-last level under its target, so deletes never reached the bottom

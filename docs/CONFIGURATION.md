@@ -185,6 +185,16 @@ Set `QUAXAR_COMPACTION_BASE_MB` to override it (16–65536).
 build up and the ratio does not apply. Keep the base small (`256`): a large
 base would only make each merge rewrite more data.
 
+**Table size and the block cache.** fjall sizes each table at
+`compaction_base_mb ÷ 4` (1 GiB at the default). New stores write the node
+keyspace's index and filter blocks partitioned and pin only their small top
+levels, so a point read loads one 4 KiB index piece whatever the table size.
+Stores created before this change have one whole-table index per table, and
+for 1 GiB tables that index is 10–20 MB. Keep `cache_mb` above the total of
+those indexes and filters, or every read reloads them. That is about 2.5% of
+the store's size: `cache_mb = 1024` for a 10 GB mainnet store. Rebuilding the
+store removes the need.
+
 **Monitoring.** On a pruned node quaxar checks the ratio hourly. `get_counts`
 reports `fjall_effective_base_mb` (the value the store was created with),
 `fjall_live_mb`, `fjall_recommended_base_mb`, `fjall_l0_tables` and

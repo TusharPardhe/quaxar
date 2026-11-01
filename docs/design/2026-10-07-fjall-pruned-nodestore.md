@@ -832,6 +832,22 @@ since fjall persists it and ignores a changed value. It warns hourly when
 `base × 4 < live` and reports the inputs in `get_counts`. The formula,
 table and operator guidance are in `docs/CONFIGURATION.md`.
 
+Follow-up (same day): fjall makes each table `base ÷ 4` bytes, so the
+rebuilt store had 0.2–1.07 GB tables. It partitions index and filter blocks
+only from canonical level 3, but the levelled strategy wrote these tables at
+canonical L1–L2. Each table therefore had one unpinned 11–20 MB index and a
+2–6 MB filter, about 230 MB in all against a 256 MB block cache. Profiled on
+the validator: the claim thread spent 85% of its time in `load_block`
+(`volatile::Iter` → `pread`), the claim cursor stalled for 90 minutes, and
+the host ran at 4% idle. The node dropped from `full` about once a minute.
+Raising `cache_mb` to 1024 made the claim catch up (108052192 → 108053487
+within five minutes of the restart), and the host returned to about 90%
+idle. After that, every ledger was signed with no demotions. The node
+keyspace now partitions index and filter blocks at every level and pins only
+their top-level blocks (RocksDB's partitioned index/filters with
+`pin_top_level_index_and_filter`), so index cost no longer grows with table
+size. This applies to stores created from now on.
+
 A level-sizing patch (targets derived from the bottom level, as in RocksDB's
 `level_compaction_dynamic_level_bytes`) would remove the need to size the
 base by hand. It was not adopted because lsm-tree's `CompactionStrategy`
