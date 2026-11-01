@@ -527,22 +527,29 @@ pub fn transfer_xrp<V: ApplyView>(
             Ok(None) => return Ter::TER_NO_ACCOUNT,
             Err(_) => return Ter::TEF_BAD_LEDGER,
         };
-        let from_balance = from_sle.get_field_amount(sf("sfBalance")).xrp().drops();
-        // Safety guard: prevent negative balance. Upstream callers should
-        // validate balances before reaching this point.
+        // rippled accountSend (TokenHelpers.cpp, XRP branch): the hook gets
+        // the stored balance and the debit is native STAmount subtraction,
+        // which builds the result with the unchecked int64 constructor. A
+        // Flow reverse probe may already have credited this account the
+        // virtual kMaxNative amount (sender == destination), so the stored
+        // balance can exceed the network maximum inside the sandbox; it must
+        // not be re-canonicalized here (mainnet 107998578, Batch BCD4A04A...).
+        let stored_balance = from_sle.get_field_amount(sf("sfBalance"));
+        let from_balance = stored_balance.xrp().drops();
         if from_balance < amount.drops() {
             return Ter::TEC_FAILED_PROCESSING;
         }
         view.credit_hook_iou(
             *from,
             protocol::xrp_account(),
-            STAmount::from_xrp_amount(amount),
-            STAmount::from_xrp_amount(XRPAmount::from_drops(from_balance)),
+            STAmount::new_native(amount.drops().unsigned_abs(), amount.drops() < 0),
+            stored_balance,
         );
+        let debited = from_balance - amount.drops();
         let mut from_obj = from_sle.clone_as_object();
         from_obj.set_field_amount(
             sf("sfBalance"),
-            STAmount::from_xrp_amount(XRPAmount::from_drops(from_balance - amount.drops())),
+            STAmount::new_native(debited.unsigned_abs(), debited < 0),
         );
         if view
             .update(Arc::new(STLedgerEntry::from_stobject(
@@ -563,11 +570,13 @@ pub fn transfer_xrp<V: ApplyView>(
             Ok(None) => return Ter::TER_NO_ACCOUNT,
             Err(_) => return Ter::TEF_BAD_LEDGER,
         };
-        let to_balance = to_sle.get_field_amount(sf("sfBalance")).xrp().drops();
+        // rippled: `rcvBal + saAmount` and `creditHookIOU(..., -rcvBal)` use
+        // the stored balance and the unchecked native constructor.
+        let mut pre_credit_balance = to_sle.get_field_amount(sf("sfBalance"));
+        let to_balance = pre_credit_balance.xrp().drops();
         let Some(updated_balance) = to_balance.checked_add(amount.drops()) else {
             return Ter::TEC_FAILED_PROCESSING;
         };
-        let mut pre_credit_balance = STAmount::from_xrp_amount(XRPAmount::from_drops(to_balance));
         pre_credit_balance.negate();
         // XRPEndpointStep's reverse pass uses rippled's internal kMaxNative
         // value as an "unlimited" probe when XRP flows from the virtual XRP
@@ -596,11 +605,7 @@ pub fn transfer_xrp<V: ApplyView>(
         // STAmount.cpp:371-387). Keep ordinary account credits canonicalized,
         // but preserve the virtual-sender intermediate until Flow constrains
         // it and the sandbox is discarded or committed.
-        let updated_amount = if from_is_zero {
-            STAmount::new_native(updated_balance.unsigned_abs(), updated_balance < 0)
-        } else {
-            STAmount::from_xrp_amount(XRPAmount::from_drops(updated_balance))
-        };
+        let updated_amount = STAmount::new_native(updated_balance.unsigned_abs(), updated_balance < 0);
         to_obj.set_field_amount(sf("sfBalance"), updated_amount);
         if view
             .update(Arc::new(STLedgerEntry::from_stobject(
