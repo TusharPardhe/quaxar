@@ -464,12 +464,11 @@ pub fn adjust_asset_out_by_tokens(
     let mut asset_adj = amm_asset_out(balance, lpt_amm_balance, tokens, tfee);
     let mut tokens_adj = tokens.clone();
     if asset_adj > *amount {
-        let adj_amount = protocol::to_amount_from_number(
-            amount.asset(),
-            number_from_i64(2) * stamount_as_number(amount) - stamount_as_number(&asset_adj),
-            get_rounding_mode(),
-        )
-        .expect("AMM adjusted asset amount should remain representable");
+        // rippled: `amount - (assetAdj - amount)` as two STAmount
+        // subtractions, each canonicalized. A single Number expression
+        // `2 * amount - assetAdj` rounds `2 * amount` to 16 digits first and
+        // can lose its last digit (mainnet 108014599: 2 * 9814699.872277027).
+        let adj_amount = amount.clone() - (asset_adj.clone() - amount.clone());
         let t = lp_tokens_in(balance, &adj_amount, lpt_amm_balance, tfee);
         tokens_adj = adjust_lp_tokens(lpt_amm_balance, &t, IsDeposit::No);
         asset_adj = amm_asset_out(balance, lpt_amm_balance, &tokens_adj, tfee);

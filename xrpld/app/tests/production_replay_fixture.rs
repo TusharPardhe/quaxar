@@ -297,6 +297,19 @@ fn sparse_mainnet_107858924_escrow_finish_destination_skips_line_limit() {
     ));
 }
 
+/// Mainnet fork at 108014599 (2026-10-31): single-asset AMMWithdraw
+/// (tfSingleAsset, 9814699.872277027 MILK). adjustAssetOutByTokens computes
+/// `amount - (assetAdj - amount)` as two STAmount subtractions; quaxar used
+/// the Number expression `2 * amount - assetAdj`, which rounds `2 * amount`
+/// to 16 digits first, so the LP tokens burned came out one unit off.
+/// Trimmed to the one transaction (TransactionIndex 0).
+#[test]
+fn sparse_mainnet_108014599_amm_single_withdraw_subtracts_in_two_steps() {
+    run_sparse_replay(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "tests/fixtures/sparse_replay/mainnet_108014599_amm_single_withdraw_adjusted_amount.jsonl",
+    ));
+}
+
 /// Mainnet fork at 107998578 (2026-10-30): an all-or-nothing Batch whose
 /// inner Payment 8026A065... sells GALAXY for XRP to its own account with
 /// Amount = 10^17 drops. The XRP endpoint's reverse probe credits the virtual
