@@ -14,6 +14,7 @@ use basics::{base_uint::Uint256, basic_config::Section};
 use fjall::{
     Database, Keyspace as FjallKeyspace, KeyspaceCreateOptions, PersistMode as FjallPersistMode,
 };
+use fjall::config::{PartitioningPolicy, PinningPolicy};
 use std::sync::{Arc, Mutex};
 
 /// Default block-cache budget when the operator does not size it explicitly.
@@ -99,11 +100,26 @@ fn read_table_target_bytes(section: &Section) -> Result<u64, String> {
 fn keyspace_options(keyspace: Keyspace, table_target_bytes: u64) -> KeyspaceCreateOptions {
     let options = KeyspaceCreateOptions::default();
     match keyspace {
-        Keyspace::Nodes => options.compaction_strategy(Arc::new(
-            fjall::compaction::Leveled::default()
-                .with_l0_threshold(L0_THRESHOLD)
-                .with_table_target_size(table_target_bytes),
-        )),
+        // Tables are `compaction_base_mb / 4` (1 GiB at the 4096 default),
+        // so one whole-table index block is 10-20 MB. fjall partitions
+        // indexes and filters only from canonical level 3, and the levelled
+        // strategy writes our tables at canonical L1-L2, so without this
+        // every point read reloads a 20 MB unpinned index through the block
+        // cache (mainnet validator 2026-11-01: the claim thread spent 85% in
+        // `load_block`, and the host was saturated). Partitioned
+        // index/filter blocks load one 4 KiB piece per read; only the small
+        // top-level index and filter index stay pinned (RocksDB's
+        // partitioned index/filters with pin_top_level_index_and_filter).
+        Keyspace::Nodes => options
+            .compaction_strategy(Arc::new(
+                fjall::compaction::Leveled::default()
+                    .with_l0_threshold(L0_THRESHOLD)
+                    .with_table_target_size(table_target_bytes),
+            ))
+            .index_block_partitioning_policy(PartitioningPolicy::all(true))
+            .filter_block_partitioning_policy(PartitioningPolicy::all(true))
+            .index_block_pinning_policy(PinningPolicy::all(true))
+            .filter_block_pinning_policy(PinningPolicy::all(true)),
         _ => options,
     }
 }
@@ -1077,6 +1093,41 @@ mod tests {
             let backend = FjallBackend::new(&cfg, Arc::new(NullJournal)).expect("construct");
             assert_eq!(backend.pruned, pruned, "online_delete = {window:?}");
         }
+    }
+
+    #[test]
+    fn node_tables_get_partitioned_pinned_top_level_indexes() {
+        // A new store writes two-level (partitioned) index and filter blocks
+        // for `nodes` at every level, so a point read never loads a whole
+        // table's index. Only the small top-level blocks are pinned.
+        use fjall::AbstractTree;
+        let path = temp_path("partitioned-index");
+        let mut cfg = section(&path);
+        cfg.set("reserve_mb", "0");
+        cfg.set("compaction_base_mb", "16");
+        let backend = FjallBackend::new(&cfg, Arc::new(NullJournal)).expect("construct");
+        backend.open(true).expect("open");
+        leveled_nodes_table_count(&backend, 9);
+        let open = backend.open_db().expect("open db");
+        let version = open.nodes.tree.current_version();
+        let tables: Vec<_> = version.iter_tables().collect();
+        assert!(!tables.is_empty());
+        for table in tables {
+            assert!(
+                table.regions.index.is_some(),
+                "table {} must have a partitioned (two-level) index",
+                table.id()
+            );
+            let pinned = table.pinned_block_index_size() as u64;
+            assert!(
+                pinned > 0 && pinned * 50 < table.metadata.file_size,
+                "only the small top-level index is pinned: {pinned} B of {} B",
+                table.metadata.file_size
+            );
+        }
+        drop(open);
+        let _ = backend.close();
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[test]
