@@ -436,12 +436,10 @@ pub fn adjust_asset_in_by_tokens(
     let mut asset_adj = amm_asset_in(balance, lpt_amm_balance, tokens, tfee);
     let mut tokens_adj = tokens.clone();
     if asset_adj > *amount {
-        let adj_amount = protocol::to_amount_from_number(
-            amount.asset(),
-            number_from_i64(2) * stamount_as_number(amount) - stamount_as_number(&asset_adj),
-            get_rounding_mode(),
-        )
-        .expect("AMM adjusted asset amount should remain representable");
+        // rippled: `amount - (assetAdj - amount)` as two STAmount
+        // subtractions, as in `adjust_asset_out_by_tokens` (mainnet 108066553:
+        // AMMDeposit of 555501.0345044557 LUMOS).
+        let adj_amount = amount.clone() - (asset_adj.clone() - amount.clone());
         let t = lp_tokens_out(balance, &adj_amount, lpt_amm_balance, tfee);
         tokens_adj = adjust_lp_tokens(lpt_amm_balance, &t, IsDeposit::Yes);
         asset_adj = amm_asset_in(balance, lpt_amm_balance, &tokens_adj, tfee);
