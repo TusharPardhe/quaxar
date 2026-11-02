@@ -297,6 +297,19 @@ fn sparse_mainnet_107858924_escrow_finish_destination_skips_line_limit() {
     ));
 }
 
+/// Mainnet fork at 108066553 (2026-11-02): single-asset AMMDeposit
+/// (tfSingleAsset, 555501.0345044557 LUMOS). The deposit counterpart of
+/// 108014599: adjustAssetInByTokens computes `amount - (assetAdj - amount)`
+/// as two STAmount subtractions, and quaxar's Number expression
+/// `2 * amount - assetAdj` minted LP tokens one unit off. Trimmed to the one
+/// transaction (TransactionIndex 0).
+#[test]
+fn sparse_mainnet_108066553_amm_single_deposit_subtracts_in_two_steps() {
+    run_sparse_replay(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "tests/fixtures/sparse_replay/mainnet_108066553_amm_single_deposit_adjusted_amount.jsonl",
+    ));
+}
+
 /// Mainnet fork at 108014599 (2026-10-31): single-asset AMMWithdraw
 /// (tfSingleAsset, 9814699.872277027 MILK). adjustAssetOutByTokens computes
 /// `amount - (assetAdj - amount)` as two STAmount subtractions; quaxar used
