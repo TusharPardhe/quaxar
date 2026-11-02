@@ -2306,7 +2306,12 @@ fn get_amm_offer<V: ApplyView>(
         },
     ));
     match generated {
-        Ok(offer) => Ok(offer),
+        // rippled `AMMLiquidity::getOffer`: a generated offer is returned
+        // only when `offer->amount().in > 0 && offer->amount().out > 0`. A
+        // tiny pool can round a multi-path Fibonacci slice to zero output;
+        // that offer's quality is 0 (rate 0), which orders as the BEST
+        // quality and would put a dead strand first (mainnet 108071418).
+        Ok(offer) => Ok(offer.filter(amm_offer_has_positive_amounts)),
         Err(panic) => {
             let message = panic
                 .downcast_ref::<String>()
@@ -2317,6 +2322,10 @@ fn get_amm_offer<V: ApplyView>(
             Ok(None)
         }
     }
+}
+
+fn amm_offer_has_positive_amounts(offer: &SyntheticAmmOffer) -> bool {
+    offer.amount_in.signum() > 0 && offer.amount_out.signum() > 0
 }
 
 /// Non-mutating liquidity ordering key used by flow's ActiveStrands.  This is

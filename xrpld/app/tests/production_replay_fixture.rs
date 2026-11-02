@@ -297,6 +297,23 @@ fn sparse_mainnet_107858924_escrow_finish_destination_skips_line_limit() {
     ));
 }
 
+/// Mainnet fork at 108071418 (2026-11-02): an all-or-nothing Batch whose
+/// second inner Payment (E04EE641..., XZBCN to XRP to self, two strands) runs
+/// while the XRP/XPR AMM holds only 1014 drops. The multi-path Fibonacci slice
+/// from that pool rounds to zero output. rippled's AMMLiquidity::getOffer
+/// returns an AMM offer only when both amounts are positive; quaxar returned
+/// the zero offer, whose rate-0 quality ranks best, so the dead XPR strand sat
+/// first and dropped out on its first pass. The payment then switched to a
+/// single path one pass early and delivered 68337 drops instead of 68334.
+/// Trimmed to the Batch and its two inner transactions (TransactionIndex 0..2),
+/// starting from the state just before the Batch.
+#[test]
+fn sparse_mainnet_108071418_batch_amm_zero_fib_offer_is_not_liquidity() {
+    run_sparse_replay(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "tests/fixtures/sparse_replay/mainnet_108071418_batch_amm_zero_fib_offer.jsonl",
+    ));
+}
+
 /// Mainnet fork at 108066553 (2026-11-02): single-asset AMMDeposit
 /// (tfSingleAsset, 555501.0345044557 LUMOS). The deposit counterpart of
 /// 108014599: adjustAssetInByTokens computes `amount - (assetAdj - amount)`
