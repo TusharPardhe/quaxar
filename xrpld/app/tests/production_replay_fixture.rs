@@ -297,6 +297,20 @@ fn sparse_mainnet_107858924_escrow_finish_destination_skips_line_limit() {
     ));
 }
 
+/// Mainnet fork at 108115745 (2026-11-04), the first after fixCleanup3_4_0
+/// was enabled: EscrowFinish 6653DA5D... finishes a 100 XRP escrow whose
+/// owner is also its destination. With fixCleanup3_4_0 the owner count is
+/// decremented before the XRP credit (recycleReserve). In rippled the owner
+/// and destination are the same peeked SLE, so the credit keeps the
+/// decrement; quaxar credited a stale copy of the destination and wrote
+/// OwnerCount back to 2. Trimmed to the one transaction (TransactionIndex 0).
+#[test]
+fn sparse_mainnet_108115745_escrow_finish_self_escrow_keeps_recycled_owner_count() {
+    run_sparse_replay(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "tests/fixtures/sparse_replay/mainnet_108115745_escrow_finish_self_recycle_reserve.jsonl",
+    ));
+}
+
 /// Mainnet fork at 108108176 (2026-11-04): NFTokenAcceptOffer 3D751F3F...
 /// pays a buy offer of 808.019389960004 SOLO; the issuer charges a 0.01%
 /// transfer rate. rippled's accountSend computes the sender's cost as
