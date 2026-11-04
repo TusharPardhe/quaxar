@@ -4376,6 +4376,19 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             {
                 return Ter::TEF_BAD_LEDGER;
             }
+            // rippled's `sled` and the owner SLE are the same peeked object
+            // for a self-escrow, so the early decrement is visible to the
+            // XRP credit. Here the decrement replaces the AccountRoot; re-read
+            // the destination so the credit keeps the recycled owner count
+            // (mainnet fork 108115745).
+            let destination_sle = if recycle_reserve {
+                match view.peek(destination_keylet) {
+                    Ok(Some(destination_sle)) => destination_sle,
+                    _ => return Ter::TEF_BAD_LEDGER,
+                }
+            } else {
+                destination_sle
+            };
 
             let amount = escrow_sle.get_field_amount(sf("sfAmount"));
             if amount.native() {
