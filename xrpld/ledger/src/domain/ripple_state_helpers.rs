@@ -687,18 +687,7 @@ fn account_send_with_options<V: ApplyView>(
         Ok(rate) => rate,
         Err(_) => return Ter::TEF_BAD_LEDGER,
     };
-    let actual_cost = if rate == 1_000_000_000 {
-        amount.clone()
-    } else {
-        let iou = amount.iou();
-        let adjusted = crate::domain::mul_ratio::mul_ratio(
-            iou,
-            rate,
-            crate::domain::mul_ratio::QUALITY_ONE,
-            true,
-        );
-        STAmount::from_iou_amount(sf("sfAmount"), adjusted, issue)
-    };
+    let actual_cost = transit_cost_with_transfer_fee(amount, rate);
 
     // Send from issuer to receiver (no transfer fee applies)
     let res = direct_send_no_fee_iou(view, &issue.account, to, amount, true);
@@ -707,6 +696,17 @@ fn account_send_with_options<V: ApplyView>(
     }
     // Send actual cost from sender back to issuer
     direct_send_no_fee_iou(view, from, &issue.account, &actual_cost, true)
+}
+
+/// rippled `directSendNoLimitIOU` / `directSendNoLimitMultiIOU`:
+/// `saActual = multiply(saAmount, transferRate(view, issuer))`. That is the
+/// plain STAmount multiply, which rounds to nearest under the ambient Number
+/// mode. Only the payment engine's DirectStep rounds the fee up (mulRatio
+/// with roundUp). Rounding up here charged the sender one unit in the last
+/// digit too much (mainnet fork 108108176: 808.019389960004 SOLO at a 0.01%
+/// rate cost 808.1001918990001 instead of 808.100191899).
+fn transit_cost_with_transfer_fee(amount: &STAmount, rate: u32) -> STAmount {
+    protocol::multiply_rate(amount, protocol::Rate::new(rate))
 }
 
 /// Canonical `accountSend(..., WaiveTransferFee::Yes)`.
@@ -1356,19 +1356,7 @@ pub fn account_send_with_fee<V: ApplyView>(
         Ok(rate) => rate,
         Err(_) => return Ter::TEF_BAD_LEDGER,
     };
-    let actual_cost = if rate == 1_000_000_000 {
-        amount.clone()
-    } else {
-        // mulRatio(amount.mantissa, rate, QUALITY_ONE, roundUp=true)
-        let iou = amount.iou();
-        let adjusted = crate::domain::mul_ratio::mul_ratio(
-            iou,
-            rate,
-            crate::domain::mul_ratio::QUALITY_ONE,
-            true,
-        );
-        STAmount::from_iou_amount(sf("sfAmount"), adjusted, issue)
-    };
+    let actual_cost = transit_cost_with_transfer_fee(amount, rate);
 
     // Issue to receiver (amount they receive)
     let res = issue_iou(view, to, amount, &issue);
