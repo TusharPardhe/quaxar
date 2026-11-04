@@ -297,6 +297,20 @@ fn sparse_mainnet_107858924_escrow_finish_destination_skips_line_limit() {
     ));
 }
 
+/// Mainnet fork at 108108176 (2026-11-04): NFTokenAcceptOffer 3D751F3F...
+/// pays a buy offer of 808.019389960004 SOLO; the issuer charges a 0.01%
+/// transfer rate. rippled's accountSend computes the sender's cost as
+/// `multiply(amount, transferRate)`, rounded to nearest (808.100191899).
+/// quaxar rounded it up (mulRatio roundUp, as in the payment engine's
+/// DirectStep) and debited 808.1001918990001. Trimmed to the one
+/// transaction (TransactionIndex 0) from the state just before it.
+#[test]
+fn sparse_mainnet_108108176_account_send_transfer_fee_rounds_to_nearest() {
+    run_sparse_replay(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "tests/fixtures/sparse_replay/mainnet_108108176_nft_accept_iou_transfer_fee.jsonl",
+    ));
+}
+
 /// Mainnet fork at 108071418 (2026-11-02): an all-or-nothing Batch whose
 /// second inner Payment (E04EE641..., XZBCN to XRP to self, two strands) runs
 /// while the XRP/XPR AMM holds only 1014 drops. The multi-path Fibonacci slice
