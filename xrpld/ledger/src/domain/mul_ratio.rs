@@ -110,8 +110,17 @@ pub fn mul_ratio(amt: IOUAmount, num: u32, den: u32, round_up: bool) -> IOUAmoun
         mantissa = -mantissa;
     }
 
-    // Normalize
-    let result = IOUAmount::from_parts(mantissa, exponent).unwrap_or_default();
+    // Normalize. rippled's `IOUAmount(mantissa, exponent)` throws
+    // std::overflow_error("value overflow") past the maximum exponent, and
+    // RippleCalc turns that into tecINTERNAL. Swallowing it here returned
+    // zero, which the round-up branch below turned into the smallest positive
+    // amount: 1e96 ETH at a 0.3% transfer rate cost 1e-81 ETH (mainnet fork
+    // 108127746). Underflow still becomes zero, as in rippled.
+    let result = match IOUAmount::from_parts(mantissa, exponent) {
+        Ok(result) => result,
+        Err(basics::math::number::NumberArithmeticError::Overflow) => panic!("value overflow"),
+        Err(_) => IOUAmount::new(),
+    };
 
     if has_rem {
         // Handle rounding
@@ -157,6 +166,15 @@ pub fn mul_ratio_xrp(drops: i64, num: u32, den: u32, round_up: bool) -> i64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// rippled `mulRatio` throws when the result exceeds the IOU range; it
+    /// never rounds an overflow up to the smallest positive amount.
+    #[test]
+    #[should_panic(expected = "value overflow")]
+    fn mul_ratio_overflow_panics_like_rippled() {
+        let max = IOUAmount::from_parts(9_999_999_999_999_999, 80).expect("max IOU");
+        let _ = mul_ratio(max, 1_003_000_000, QUALITY_ONE, true);
+    }
     use super::*;
 
     #[test]
