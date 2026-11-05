@@ -1040,6 +1040,85 @@ fn permissioned_dex_payment_source_expired_preclaim_then_apply_cleanup() {
     );
 }
 
+/// rippled `Payment::doApply` (fixCleanup3_4_0) runs `verifyValidDomain`
+/// directly on the transaction view. It deletes every expired credential
+/// and still returns tesSUCCESS when another accepted credential admits the
+/// account. Those deletions are part of the successful payment: the expired
+/// credentials are gone and each owner's OwnerCount drops by one. The
+/// destination's AccountRoot must be read after the cleanup, or its stale
+/// OwnerCount is written back.
+#[test]
+fn permissioned_dex_payment_success_keeps_expired_credential_cleanup() {
+    let issuer = sample_account(0xC1);
+    let source = sample_account(0xC2);
+    let destination = sample_account(0xC3);
+    let (expired_type, valid_type): (&[u8], &[u8]) = (b"pdex-old", b"pdex-new");
+    let domain = permissioned_domain_entry(
+        issuer,
+        1,
+        0,
+        &[(issuer, expired_type), (issuer, valid_type)],
+    );
+    let domain_id = domain.key().to_owned();
+    let cred = |subject, kind| credential_keylet(subject, issuer, kind);
+    let (src_old, src_new) = (cred(source, expired_type), cred(source, valid_type));
+    let (dst_old, dst_new) = (cred(destination, expired_type), cred(destination, valid_type));
+    let entry = |subject, kind, expiration| {
+        credential_entry(subject, issuer, kind, 0, Some(0), protocol::lsfAccepted, expiration)
+    };
+    let mut ledger = ledger_with_header(
+        LedgerHeader {
+            seq: 1,
+            parent_close_time: 100,
+            ..LedgerHeader::default()
+        },
+        vec![
+            account_root(issuer, 1, 0),
+            account_root(source, 2, 0),
+            account_root(destination, 2, 0),
+            owner_dir_root_with_children(
+                issuer,
+                vec![src_old.key, src_new.key, dst_old.key, dst_new.key],
+            ),
+            owner_dir_root_with_children(source, vec![src_old.key, src_new.key]),
+            owner_dir_root_with_children(destination, vec![dst_old.key, dst_new.key]),
+            entry(source, expired_type, Some(99)),
+            entry(source, valid_type, None),
+            entry(destination, expired_type, Some(99)),
+            entry(destination, valid_type, None),
+            domain,
+        ],
+    );
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("Credentials"),
+        protocol::feature_id("PermissionedDEX"),
+        protocol::fix_cleanup_3_1_3(),
+        protocol::fix_cleanup_3_4_0(),
+    ]));
+    let mut tx = direct_xrp_payment_tx(source, destination, 100, 10);
+    tx.set_field_h256(sf("sfDomainID"), domain_id);
+
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &tx, TxType::PAYMENT),
+        Ter::TES_SUCCESS
+    );
+    for (credential, present) in [(src_old, false), (src_new, true), (dst_old, false), (dst_new, true)] {
+        assert_credential_present(&view, credential, present);
+    }
+    for account in [source, destination] {
+        let root = view
+            .read(protocol::account_keylet(raw_account_id(account)))
+            .expect("account read")
+            .expect("account exists");
+        assert_eq!(
+            root.get_field_u32(sf("sfOwnerCount")),
+            1,
+            "the expired credential's owner count must stay released"
+        );
+    }
+}
+
 #[test]
 fn permissioned_dex_payment_destination_expired_cleanup() {
     let fixture = permissioned_dex_payment_fixture(false, Some(true), true);
