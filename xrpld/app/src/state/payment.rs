@@ -271,7 +271,20 @@ pub fn do_payment<V: ledger::ApplyView>(
             }
             return result;
         }
+        // verifyValidDomain can delete an expired credential and still
+        // succeed when another accepted credential admits the account.
+        // rippled runs it on the transaction view, so those deletions are
+        // part of the successful payment.
+        if cleanup.apply().is_err() {
+            return Ter::TEF_BAD_LEDGER;
+        }
     }
+    // A deleted credential lowers its owner's OwnerCount, and the owner may
+    // be the destination. Re-read it so later writes keep that change.
+    let dst_exists = match view.peek(dst_keylet) {
+        Ok(destination) => destination,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    };
 
     // Determine if this is a "ripple" payment (IOU/path) or direct XRP.
     // In C++, MPTokensV1 direct payments bypass RippleCalc and are handled by
