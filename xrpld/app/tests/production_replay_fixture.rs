@@ -297,6 +297,22 @@ fn sparse_mainnet_107858924_escrow_finish_destination_skips_line_limit() {
     ));
 }
 
+/// Mainnet fork at 108127746 (2026-11-05): an all-or-nothing Batch
+/// (D8C5350D...) sets a 1e96 ETH trust line, then self-pays 1e96 ETH with
+/// SendMax 883 drops through CHROOPS and PLX. ETH's issuer charges 0.3%, so
+/// the last DirectStep needs 1e96 * 1.003 ETH, past the IOU range. rippled's
+/// mulRatio throws, RippleCalc returns tecINTERNAL and the Batch fails, so no
+/// inner transaction is included. quaxar's mul_ratio swallowed the overflow,
+/// rounded the zero up to 1e-81, and 1 drop bought 1e96 ETH: three extra inner
+/// transactions entered the ledger. Trimmed to the Batch (TransactionIndex 0)
+/// from the state just before it.
+#[test]
+fn sparse_mainnet_108127746_direct_step_overflow_fails_the_batch() {
+    run_sparse_replay(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "tests/fixtures/sparse_replay/mainnet_108127746_batch_direct_step_overflow.jsonl",
+    ));
+}
+
 /// Mainnet fork at 108115745 (2026-11-04), the first after fixCleanup3_4_0
 /// was enabled: EscrowFinish 6653DA5D... finishes a 100 XRP escrow whose
 /// owner is also its destination. With fixCleanup3_4_0 the owner count is
