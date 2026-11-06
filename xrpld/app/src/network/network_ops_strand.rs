@@ -583,6 +583,14 @@ fn strand_loop(
     // validated-seq input has changed since the last reconciliation (a
     // registry completion still forces a pass below).
     let mut last_reconcile_signal: Option<(Uint256, u32)> = None;
+    // rippled feeds peer counts and the heartbeat to NetworkOPs from
+    // `processHeartbeatTimer`, once per `ledgerGranularity` (1 s). The strand
+    // wakes every 50 ms and on every proposal/validation, and each coordinator
+    // report re-snapshots peers and republishes the coordinator mirror. Doing
+    // that on every wake took ~22% of this thread on mainnet (perf, Nov 6),
+    // time the consensus round needs. Report only when the active-peer set
+    // changes or the 1 s heartbeat interval has elapsed.
+    let mut coordinator_peer_report = CoordinatorPeerReportCadence::default();
     // Emit at most one restart-gate diagnostic per closed ledger. Accepted
     // phase maintenance runs every strand tick, so per-pass INFO events turn
     // a stalled restart gate into an operator-hostile log flood.
@@ -894,12 +902,19 @@ fn strand_loop(
                     // current while making it phase-neutral: start-valid
                     // consensus remains operational without overlay peers.
                     // Positive thresholds use the ordinary phase-bearing fact.
-                    if min_peers == 0 {
-                        shared_inbound.coordinator_report_transport_availability(&active_peer_ids);
-                    } else {
-                        shared_inbound.coordinator_report_peer_availability(&active_peer_ids);
+                    let (report_peers, heartbeat) =
+                        coordinator_peer_report.due(&active_peer_ids, Instant::now());
+                    if report_peers {
+                        if min_peers == 0 {
+                            shared_inbound
+                                .coordinator_report_transport_availability(&active_peer_ids);
+                        } else {
+                            shared_inbound.coordinator_report_peer_availability(&active_peer_ids);
+                        }
                     }
-                    shared_inbound.coordinator_heartbeat();
+                    if heartbeat {
+                        shared_inbound.coordinator_heartbeat();
+                    }
                     if root.network_ops_state().is_blocked()
                         && shared_inbound
                             .coordinator_snapshot()
@@ -1325,6 +1340,35 @@ fn strand_loop(
     }
 
     tracing::info!(target: "consensus", "NetworkOPs strand stopped");
+}
+
+/// Cadence for the strand's coordinator peer-availability report and
+/// heartbeat fact. rippled runs both from `processHeartbeatTimer` once per
+/// `ledgerGranularity`; a changed peer set is reported at once so mode and
+/// acquisition transport stay current.
+#[derive(Debug, Default)]
+struct CoordinatorPeerReportCadence {
+    last_peers: Option<Vec<overlay::PeerId>>,
+    last_heartbeat: Option<Instant>,
+}
+
+impl CoordinatorPeerReportCadence {
+    const INTERVAL: Duration = Duration::from_secs(1);
+
+    /// Returns `(report_peers, heartbeat)` for this strand wake.
+    fn due(&mut self, active_peers: &[overlay::PeerId], now: Instant) -> (bool, bool) {
+        let heartbeat = self
+            .last_heartbeat
+            .is_none_or(|last| now.saturating_duration_since(last) >= Self::INTERVAL);
+        let changed = self.last_peers.as_deref() != Some(active_peers);
+        if heartbeat {
+            self.last_heartbeat = Some(now);
+        }
+        if changed {
+            self.last_peers = Some(active_peers.to_vec());
+        }
+        (changed || heartbeat, heartbeat)
+    }
 }
 
 // ─── checkLastClosedLedger / switchLastClosedLedger ─────────────────────────
@@ -3475,6 +3519,20 @@ fn should_acquire_history(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn coordinator_peer_report_runs_once_per_second_or_on_peer_change() {
+        let mut cadence = super::CoordinatorPeerReportCadence::default();
+        let start = std::time::Instant::now();
+        let ms = |n| start + std::time::Duration::from_millis(n);
+        assert_eq!(cadence.due(&[1, 2], ms(0)), (true, true), "first wake reports and beats");
+        assert_eq!(cadence.due(&[1, 2], ms(50)), (false, false), "an ordinary 50 ms wake does nothing");
+        assert_eq!(cadence.due(&[1, 2], ms(999)), (false, false));
+        assert_eq!(cadence.due(&[1], ms(1_000)), (true, true), "the 1 s heartbeat is due");
+        assert_eq!(cadence.due(&[1, 3], ms(1_200)), (true, false), "a changed peer set is reported at once");
+        assert_eq!(cadence.due(&[1, 3], ms(1_300)), (false, false));
+        assert_eq!(cadence.due(&[1, 3], ms(2_000)), (true, true));
+    }
     use super::{
         ConsensusJobScheduler, CoordinatorHandoffDedup, LclAuditSampler, MAX_COMMANDS_PER_TURN,
         MAX_COORDINATOR_HANDOFF_DEDUP, MAX_LEDGER_COMPLETIONS_PER_TURN, PendingDurableAckGate,
