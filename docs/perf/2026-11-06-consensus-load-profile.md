@@ -94,15 +94,49 @@ mirror. rippled does the equivalent once per `ledgerGranularity` (1 s) in
    connect or disconnect is reported at once; otherwise the report and the
    heartbeat go out once per second. The below-quorum gate still runs on every
    wake. Test: `coordinator_peer_report_runs_once_per_second_or_on_peer_change`.
-2. **A, rebuild through a snapshot.** Export a snapshot of the validated state
-   while the node runs, wipe the store, and import the snapshot with
-   `load-snapshot`. The import writes into a new store, so the current
-   keyspace options (#135) apply, and it anchors the pruned store at the
-   snapshot ledger. The node then only acquires the ledgers since the
-   snapshot instead of the whole state.
+2. **A, done by an offline store rebuild** (2026-11-06 02:27–02:35 UTC,
+   8 minutes out of service). See "Store rebuild" below.
 3. **C and D:** decide after a busy-period profile on the rebuilt store
    (`~/busyprof.sh` on the validator records 90 s when 3 of 5 ledgers carry
    ≥1,500 transactions).
+
+## Store rebuild (A)
+
+**Snapshot route abandoned.** The online `export-snapshot` walks the state
+tree with point reads on the old store, so it hit the same whole-table index
+reads: 4 export threads at about 1.1 GB/s each and 70% CPU, 100 MB of output
+after 15 minutes. At that rate the export would have taken hours and loaded
+the validator, so I stopped it.
+
+**Offline copy instead** (`tools/fjall-rebuild`):
+
+1. Stop quaxar.
+2. Read every live key of the old store in key order and bulk-ingest it into
+   a new store created with quaxar's keyspace options (partitioned, pinned
+   index and filter blocks; 1 GiB tables). Tombstones are not copied.
+3. Ingestion writes uncompressed 64 MB tables at canonical level 1, so major-
+   compact `nodes` into the last level with 1 GiB tables, which applies the
+   last-level LZ4 policy (28 GB → 16.5 GB).
+4. Move the old store aside, put the new one in place, start quaxar.
+
+All state, including the pruned-store bookkeeping (`notebook`, `counts`,
+`meta`), carries over, so nothing is re-downloaded. SQLite is unchanged and
+consistent with it. A dry run on a hard-linked snapshot took 6 + 5 minutes at
+idle priority before the real run.
+
+| | Old store | Rebuilt store |
+|---|---|---|
+| `nodes` | L5 3.9 GB (76% tombstones) + L6 12.4 GB | L6 16.5 GB, 59.5M entries, 0 tombstones |
+| Index per table | one ~20 MB block (`index_region None`) | partitioned: 361 KB pinned top level (`index_region Some`) on all 16 tables |
+| Probe on a snapshot, 1 GiB cache | 0.14 MB read per point read | 0.01 MB read per point read |
+| `pruned-store` thread, live | 80% CPU, 1,232 MB/s read | **4.5% CPU, 2.4 MB/s read** |
+| Copy time | | 191 s ingest + 160 s compaction |
+| Back to `proposing` | | 40 s after start |
+
+**IMPORTANT:** fjall persists keyspace options when a keyspace is created, so
+a changed option in `keyspace_options` reaches an existing store only through
+a rebuild like this one. The old store is kept at
+`/srv/quaxar/fjall.old-20261106` until the rebuilt one has run cleanly.
 
 ## How to reproduce the measurements
 
