@@ -1,0 +1,13 @@
+[package]
+name = "fjall-rebuild"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone operator tool, not a workspace member. Pin to the fjall and
+# lsm-tree versions in the quaxar Cargo.lock.
+[workspace]
+
+[dependencies]
+fjall = "=3.1.12"
+lsm-tree = "=3.1.10"

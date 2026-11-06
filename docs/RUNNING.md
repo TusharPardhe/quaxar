@@ -481,6 +481,35 @@ quaxar log-level debug
 `quaxar log-rotate` is currently a compatibility no-op because the runtime
 does not own a logfile; use the systemd/Docker supervisor's rotation policy.
 
+## Rebuilding the NodeStore with Current Options
+
+**IMPORTANT:** fjall saves each keyspace's options when the keyspace is
+created and reuses them on every open. A change to the nodes keyspace options
+(for example partitioned indexes, #135) applies only to stores created after
+it. Check with `fjall-inspect` on a hard-linked snapshot: `index_region None`
+means whole-table indexes.
+
+`tools/fjall-rebuild` rewrites a stopped store into a new one with the current
+options, keeping all data and pruning bookkeeping, so nothing is downloaded
+again. Measured on mainnet (2026-11-06, 59.5M nodes, 4-core ARM): 191 s copy
+plus 160 s compaction.
+
+```bash
+cargo build --release --manifest-path tools/fjall-rebuild/Cargo.toml
+sudo systemctl stop quaxar
+sudo ./tools/fjall-rebuild/target/release/fjall-rebuild \
+    /srv/quaxar/rippled/db/fjall /srv/quaxar/rippled/db/fjall.new
+sudo mv /srv/quaxar/rippled/db/fjall /srv/quaxar/fjall.old
+sudo mv /srv/quaxar/rippled/db/fjall.new /srv/quaxar/rippled/db/fjall
+sudo chown -R rippled:rippled /srv/quaxar/rippled/db/fjall
+sudo systemctl start quaxar
+```
+
+The tool's nodes options must match `keyspace_options` in
+`xrpld/nodestore/src/backends/fjall_backend.rs` (including
+`compaction_base_mb`). Keep the old directory until the node has run cleanly.
+Needs free disk of about twice the store size during compaction.
+
 ## Priming the NodeStore from a Snapshot
 
 A snapshot transfers immutable node objects from an existing node. Importing
