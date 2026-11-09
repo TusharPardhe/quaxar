@@ -112,6 +112,14 @@ impl Backend for FaultBackend {
         self.inner.fd_required()
     }
 
+    fn set_fresh_write_tracking(&self, enabled: bool) {
+        self.inner.set_fresh_write_tracking(enabled);
+    }
+
+    fn take_fresh_writes(&self) -> Vec<Uint256> {
+        self.inner.take_fresh_writes()
+    }
+
     fn supports_kv(&self) -> bool {
         self.inner.supports_kv()
     }

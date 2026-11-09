@@ -172,6 +172,20 @@ pub trait Backend: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Start (or stop) recording the hashes of nodes that `store` /
+    /// `store_batch_result` insert for the first time, i.e. that were absent
+    /// before the write. The pruned store turns this on once it is anchored:
+    /// such a node is not part of any claimed tree, so it must be tracked as
+    /// unclaimed until a claim adopts it or the orphan sweep retires it.
+    /// Backends without the pruned store ignore it.
+    fn set_fresh_write_tracking(&self, _enabled: bool) {}
+
+    /// Take the hashes recorded since the last call (see
+    /// `set_fresh_write_tracking`).
+    fn take_fresh_writes(&self) -> Vec<Uint256> {
+        Vec::new()
+    }
+
     /// Backend-specific health counters for `get_counts` (name, value).
     fn counters(&self) -> Vec<(&'static str, u64)> {
         Vec::new()

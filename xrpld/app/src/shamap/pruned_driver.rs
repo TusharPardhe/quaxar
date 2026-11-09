@@ -66,11 +66,39 @@ pub struct PrunedDriver {
     /// pinned ledger's tree straight from the backend. Pruning never drops a
     /// held ledger; `u32::MAX` entries are absent.
     holds: Arc<Mutex<Vec<u32>>>,
-    /// Newest validated ledger waiting for the worker (latest wins).
-    pending: Mutex<Option<Arc<Ledger>>>,
+    /// Validated ledgers waiting for the worker, oldest first.
+    pending: Mutex<PendingClaims>,
     wake: Condvar,
     stopping: AtomicBool,
     worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// Ordered queue of validated ledgers for the claim worker. Bounded so a
+/// stalled worker cannot pin unbounded ledger trees in memory; when full the
+/// oldest is dropped (the next claim then diffs across the gap, and the
+/// fresh-write tracking in the store still retires what that gap hid).
+#[derive(Default)]
+struct PendingClaims {
+    ledgers: std::collections::VecDeque<Arc<Ledger>>,
+}
+
+impl PendingClaims {
+    /// About two minutes of mainnet ledgers.
+    const LIMIT: usize = 32;
+
+    /// Queue `ledger`; returns the sequence of a ledger dropped to make room.
+    fn push(&mut self, ledger: Arc<Ledger>) -> Option<u32> {
+        self.ledgers.push_back(ledger);
+        if self.ledgers.len() > Self::LIMIT {
+            self.ledgers.pop_front().map(|dropped| dropped.header().seq)
+        } else {
+            None
+        }
+    }
+
+    fn pop(&mut self) -> Option<Arc<Ledger>> {
+        self.ledgers.pop_front()
+    }
 }
 
 impl PrunedDriver {
@@ -86,7 +114,7 @@ impl PrunedDriver {
             last_verify: Mutex::new(None),
             can_delete: Arc::new(AtomicU32::new(u32::MAX)),
             holds: Arc::new(Mutex::new(Vec::new())),
-            pending: Mutex::new(None),
+            pending: Mutex::new(PendingClaims::default()),
             wake: Condvar::new(),
             stopping: AtomicBool::new(false),
             worker: Mutex::new(None),
@@ -203,10 +231,23 @@ impl PrunedDriver {
         }
     }
 
-    /// Hand a validated ledger to the worker. Never blocks on store I/O: it
-    /// replaces any ledger the worker has not picked up yet.
+    /// Hand a validated ledger to the worker. Never blocks on store I/O.
+    /// Ledgers are claimed one by one in order: a claim that skips a ledger
+    /// diffs across the gap and never sees nodes that lived only inside it.
     pub fn submit(&self, ledger: Arc<Ledger>) {
-        *self.pending.lock().expect("pruned driver pending mutex") = Some(ledger);
+        let dropped = self
+            .pending
+            .lock()
+            .expect("pruned driver pending mutex")
+            .push(ledger);
+        if let Some(seq) = dropped {
+            tracing::warn!(
+                target: "nodestore",
+                seq,
+                limit = PendingClaims::LIMIT,
+                "pruned store claim queue full; skipping the oldest queued ledger"
+            );
+        }
         self.wake.notify_one();
     }
 
@@ -225,7 +266,7 @@ impl PrunedDriver {
                     if self.stopping.load(Ordering::Acquire) {
                         return;
                     }
-                    if let Some(ledger) = pending.take() {
+                    if let Some(ledger) = pending.pop() {
                         break ledger;
                     }
                     pending = self
@@ -432,6 +473,24 @@ pub fn pruned_config(online_delete: u32, can_delete: u32) -> PrunedConfig {
 
 #[cfg(test)]
 mod tests {
+
+    /// The claim worker gets every validated ledger, oldest first; only a
+    /// full queue drops (the oldest) ledger.
+    #[test]
+    fn pending_claims_keep_every_ledger_in_order() {
+        let mut pending = super::PendingClaims::default();
+        let ledgers: Vec<_> = (0..super::PendingClaims::LIMIT + 1)
+            .map(|_| Arc::new(ledger::Ledger::genesis_with_initial_drops(0, false)))
+            .collect();
+        for (index, ledger) in ledgers.iter().enumerate() {
+            let dropped = pending.push(Arc::clone(ledger));
+            assert_eq!(dropped.is_some(), index == super::PendingClaims::LIMIT);
+        }
+        for ledger in &ledgers[1..] {
+            assert!(Arc::ptr_eq(&pending.pop().expect("queued"), ledger));
+        }
+        assert!(pending.pop().is_none());
+    }
     use super::*;
 
     #[test]

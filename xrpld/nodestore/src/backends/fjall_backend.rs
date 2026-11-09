@@ -435,6 +435,9 @@ pub struct FjallBackend {
     /// whether they were written again since. Bounded by the index's
     /// dead-pending set. Prune keeps any node marked `true` (design R3/R5).
     restore_watch: super::restore_watch::RestoreWatch,
+    /// Hashes of nodes first inserted by `store` / `store_batch_result` since
+    /// the pruned store last took them. `None` while tracking is off.
+    fresh_writes: Mutex<Option<Vec<Uint256>>>,
 }
 
 impl FjallBackend {
@@ -461,6 +464,7 @@ impl FjallBackend {
             db: Mutex::new(None),
             delete_on_close: std::sync::atomic::AtomicBool::new(false),
             restore_watch: super::restore_watch::RestoreWatch::new(),
+            fresh_writes: Mutex::new(None),
         })
     }
 
@@ -496,6 +500,40 @@ impl FjallBackend {
             .expect("fjall backend db mutex must not be poisoned")
             .clone()
             .ok_or_else(|| "fjall backend is not open".to_owned())
+    }
+
+    /// Upper bound on recorded fresh writes between two claims. Past it new
+    /// records are dropped: a dropped record can only leave a node unpruned,
+    /// never delete one.
+    const FRESH_WRITE_CAP: usize = 4_000_000;
+
+    fn fresh_write_tracking(&self) -> bool {
+        self.fresh_writes
+            .lock()
+            .expect("fjall fresh-writes mutex must not be poisoned")
+            .is_some()
+    }
+
+    fn node_absent(&self, open: &OpenDb, hash: &Uint256) -> Result<bool, String> {
+        open.nodes
+            .contains_key(hash.as_slice())
+            .map(|present| !present)
+            .map_err(|error| Self::fjall_err("contains_key", error))
+    }
+
+    fn record_fresh_writes(&self, hashes: impl IntoIterator<Item = Uint256>) {
+        let mut fresh = self
+            .fresh_writes
+            .lock()
+            .expect("fjall fresh-writes mutex must not be poisoned");
+        if let Some(fresh) = fresh.as_mut() {
+            for hash in hashes {
+                if fresh.len() >= Self::FRESH_WRITE_CAP {
+                    break;
+                }
+                fresh.push(hash);
+            }
+        }
     }
 
     fn fjall_err(context: &str, error: impl std::fmt::Display) -> String {
@@ -634,11 +672,16 @@ impl Backend for FjallBackend {
     fn store(&self, object: Arc<NodeObject>) -> Result<(), String> {
         let open = self.open_db()?;
         let encoded = EncodedBlob::new(&object);
+        let tracking = self.fresh_write_tracking();
+        let fresh = tracking && self.node_absent(&open, object.hash())?;
         self.restore_watch
             .before_write(object.hash(), || encoded.get_data().to_vec());
         open.nodes
             .insert(object.hash().as_slice(), encoded.get_data())
             .map_err(|error| Self::fjall_err("store", error))?;
+        if fresh {
+            self.record_fresh_writes(std::iter::once(*object.hash()));
+        }
         Ok(())
     }
 
@@ -659,8 +702,13 @@ impl Backend for FjallBackend {
 
     fn store_batch_result(&self, batch: &crate::Batch) -> Result<(), String> {
         let open = self.open_db()?;
+        let tracking = self.fresh_write_tracking();
+        let mut fresh = Vec::new();
         let mut write = open.db.batch();
         for object in batch {
+            if tracking && self.node_absent(&open, object.hash())? {
+                fresh.push(*object.hash());
+            }
             let encoded = EncodedBlob::new(object);
             self.restore_watch
                 .before_write(object.hash(), || encoded.get_data().to_vec());
@@ -669,6 +717,9 @@ impl Backend for FjallBackend {
         write
             .commit()
             .map_err(|error| Self::fjall_err("store_batch", error))?;
+        if !fresh.is_empty() {
+            self.record_fresh_writes(fresh);
+        }
         Ok(())
     }
 
@@ -792,6 +843,27 @@ impl Backend for FjallBackend {
             }
         }
         Ok(())
+    }
+
+    fn set_fresh_write_tracking(&self, enabled: bool) {
+        let mut fresh = self
+            .fresh_writes
+            .lock()
+            .expect("fjall fresh-writes mutex must not be poisoned");
+        match (enabled, fresh.is_some()) {
+            (true, false) => *fresh = Some(Vec::new()),
+            (false, true) => *fresh = None,
+            _ => {}
+        }
+    }
+
+    fn take_fresh_writes(&self) -> Vec<Uint256> {
+        self.fresh_writes
+            .lock()
+            .expect("fjall fresh-writes mutex must not be poisoned")
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     fn watch_restores(&self, hashes: &[Uint256]) {

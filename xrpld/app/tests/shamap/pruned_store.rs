@@ -150,6 +150,88 @@ fn flush_ledger_nodes(driver: &PrunedDriver, ledger: &Ledger) {
     }
 }
 
+/// Write every node of `ledger` through the backend's `store_batch` path,
+/// as ledger building and acquisition do in production.
+fn store_batch_ledger_nodes(backend: &Arc<dyn Backend>, ledger: &Ledger) {
+    let mut batch = Vec::new();
+    for tree in [ledger.state_map(), ledger.tx_map()] {
+        let mut fetch = |_hash| None;
+        tree.visit_nodes(&mut fetch, &mut |node| {
+            if let Ok(bytes) = node.serialize_with_prefix() {
+                batch.push(NodeObject::create_object(
+                    NodeObjectType::AccountNode,
+                    bytes,
+                    *node.get_hash().as_uint256(),
+                ));
+            }
+            true
+        })
+        .expect("visit_nodes should traverse the resident tree");
+    }
+    backend.store_batch_result(&batch).expect("store_batch");
+}
+
+fn tree_hashes(ledger: &Ledger) -> Vec<basics::base_uint::Uint256> {
+    let mut hashes = Vec::new();
+    for tree in [ledger.state_map(), ledger.tx_map()] {
+        let mut fetch = |_hash| None;
+        tree.visit_nodes(&mut fetch, &mut |node| {
+            hashes.push(*node.get_hash().as_uint256());
+            true
+        })
+        .expect("visit_nodes");
+    }
+    hashes
+}
+
+/// Mainnet store growth (2026-11-09): nodes written for a ledger whose claim
+/// was skipped and already replaced by the next claimed ledger were never
+/// deleted (59% of the store). With fresh-write tracking they are pruned,
+/// while the latest claimed ledger's trees stay complete on disk.
+#[test]
+fn skipped_claims_prune_hidden_nodes_and_keep_live_trees() {
+    let (backend, path) = open_fjall_backend("skipped-claims");
+    let config = PrunedConfig {
+        online_delete: 3,
+        can_delete: u32::MAX,
+        prune_mode: PruneMode::On,
+        prune_batch: 64,
+        verify_interval_secs: 0,
+    };
+    let driver = PrunedDriver::open(Arc::clone(&backend), config).expect("driver opens");
+    let skipped = example_ledger(5);
+    let skipped_root = *skipped.state_map().root().get_hash().as_uint256();
+    let mut latest = None;
+    for seq in 1..=16u32 {
+        let ledger = example_ledger(seq);
+        store_batch_ledger_nodes(&backend, &ledger);
+        if seq % 3 == 2 {
+            continue; // this ledger's claim is skipped
+        }
+        let ledger = Arc::new(ledger);
+        driver
+            .on_validated_ledger(Arc::clone(&ledger))
+            .expect("claim + prune");
+        latest = Some(ledger);
+    }
+    let latest = latest.expect("claimed ledgers");
+    for hash in tree_hashes(&latest) {
+        assert!(
+            backend.kv_get(Keyspace::Nodes, hash.as_slice()).expect("read").is_some(),
+            "node {hash} of the latest claimed ledger must be on disk"
+        );
+    }
+    assert!(
+        backend
+            .kv_get(Keyspace::Nodes, skipped_root.as_slice())
+            .expect("read")
+            .is_none(),
+        "the root of the never-claimed ledger 5 must be pruned"
+    );
+    drop(driver);
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 #[test]
 fn pruned_store_dedup_and_retention_without_pruning() {
     // Diagnostic: with an effectively infinite window, nothing is pruned and

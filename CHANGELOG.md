@@ -9,6 +9,16 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Fixed
 
+- Pruned fjall stores no longer keep nodes that only lived in a ledger whose
+  claim was skipped. The claim worker kept only the newest validated ledger,
+  so about 13% of ledgers were never claimed. Nodes created and replaced
+  inside such a gap got no reference count and were never deleted, and the
+  orphan sweep never saw them because ledger building and acquisition
+  bypassed its tracking. On the mainnet validator this was 59% of the store
+  (44M of 74.5M entries), growing about 1.4 GB a day. Every validated ledger
+  is now claimed in order, and nodes first inserted by any write are tracked
+  until a claim adopts them or the orphan sweep retires them. Nodes leaked
+  before this change stay until the store is rebuilt.
 - The fjall node keyspace now writes partitioned index and filter blocks at
   every level and pins only their top-level blocks. With the larger
   `compaction_base_mb` default, tables are about 1 GiB and their whole-table
