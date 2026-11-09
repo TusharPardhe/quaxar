@@ -488,9 +488,15 @@ fn amm_prepare_withdraw_holding<V: ledger::ApplyView>(
         return Ter::TES_SUCCESS;
     }
 
+    // rippled `AMMWithdraw::withdraw` `sufficientReserve`: the holding is
+    // "missing" when `keylet::trustLine(account, issue)` / the MPToken does
+    // not exist, with no issuer exception. An issuer withdrawing its own IOU
+    // has no line to itself, so it is reserve-checked like any holder
+    // (mainnet fork 108184801). Only the MPToken creation skips the issuer.
+    let is_issuer = asset.issuer() == *account;
     let missing = match asset {
         Asset::Issue(issue) => {
-            if issue.native() || issue.issuer() == *account {
+            if issue.native() {
                 return Ter::TES_SUCCESS;
             }
             match view.read(protocol::line(*account, issue.issuer(), issue.currency)) {
@@ -499,9 +505,6 @@ fn amm_prepare_withdraw_holding<V: ledger::ApplyView>(
             }
         }
         Asset::MPTIssue(issue) => {
-            if issue.issuer() == *account {
-                return Ter::TES_SUCCESS;
-            }
             match view.read(protocol::mptoken_keylet_from_mptid(
                 issue.mpt_id(),
                 Uint160::from_void(account.data()),
@@ -538,6 +541,11 @@ fn amm_prepare_withdraw_holding<V: ledger::ApplyView>(
         if adjusted_balance.drops() < reserve {
             return Ter::TEC_INSUFFICIENT_RESERVE;
         }
+    }
+
+    if is_issuer {
+        // rippled createMPToken: `mptokenKey && account != asset.getIssuer()`.
+        return Ter::TES_SUCCESS;
     }
 
     if let Asset::MPTIssue(issue) = asset {
