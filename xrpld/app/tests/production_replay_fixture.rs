@@ -297,6 +297,21 @@ fn sparse_mainnet_107858924_escrow_finish_destination_skips_line_limit() {
     ));
 }
 
+/// Mainnet fork at 108184801 (2026-11-08): AMMWithdraw FF64E0E7... where
+/// the account is the issuer of one pool asset (Xru) and withdraws both
+/// sides. rippled's `sufficientReserve` treats the asset as missing when
+/// `keylet::trustLine(account, issue)` does not exist, with no issuer
+/// exception; the issuer has no line to itself, so it is reserve-checked and
+/// fails tecINSUFFICIENT_RESERVE (2,505,412 drops < 2,600,000). quaxar skipped
+/// the check for the issuer and succeeded. Trimmed to the one transaction
+/// (TransactionIndex 0) from the state just before it.
+#[test]
+fn sparse_mainnet_108184801_amm_withdraw_issuer_is_reserve_checked() {
+    run_sparse_replay(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "tests/fixtures/sparse_replay/mainnet_108184801_amm_withdraw_issuer_reserve.jsonl",
+    ));
+}
+
 /// Mainnet fork at 108127746 (2026-11-05): an all-or-nothing Batch
 /// (D8C5350D...) sets a 1e96 ETH trust line, then self-pays 1e96 ETH with
 /// SendMax 883 drops through CHROOPS and PLX. ETH's issuer charges 0.3%, so
