@@ -86,7 +86,16 @@ pub struct IndexWriter {
     dead_pending: HashMap<Uint256, u32>,
     claimed_seq: Option<u32>,
     pruned_to: u32,
+    /// Nodes adopted (`new_state` and `owned`) by the last few claims. A
+    /// fresh-write record can reach the index just after the claim that
+    /// adopted its node (the write and the claim race); such a record must
+    /// not pin a live node as unclaimed, or the orphan sweep would delete it.
+    recent_claimed: std::collections::VecDeque<std::collections::HashSet<Uint256>>,
 }
+
+/// Claims remembered by `recent_claimed`. A fresh-write record trails its
+/// write by microseconds, while claims are seconds apart.
+const RECENT_CLAIMS: usize = 8;
 
 impl IndexWriter {
     /// Open or initialize the index on `backend`, which must be KV-capable and
@@ -119,6 +128,7 @@ impl IndexWriter {
         let mut writer = Self {
             backend,
             unclaimed: HashMap::new(),
+            recent_claimed: std::collections::VecDeque::new(),
             dead_pending: HashMap::new(),
             claimed_seq,
             pruned_to,
@@ -218,6 +228,23 @@ impl IndexWriter {
         self.unclaimed.entry(hash).or_insert(current_seq);
     }
 
+    /// Track nodes a backend write inserted for the first time (they were
+    /// absent, so no claimed tree holds them) as unclaimed from `seq`. A claim
+    /// that adopts one removes it; otherwise the orphan sweep retires it after
+    /// the window. Nodes a recent claim already adopted are skipped (the record
+    /// lost the race with that claim). Returns how many were noted.
+    pub fn note_fresh_writes(&mut self, hashes: Vec<Uint256>, seq: u32) -> usize {
+        let mut noted = 0;
+        for hash in hashes {
+            if self.recent_claimed.iter().any(|claimed| claimed.contains(&hash)) {
+                continue;
+            }
+            self.unclaimed.entry(hash).or_insert(seq);
+            noted += 1;
+        }
+        noted
+    }
+
     /// Claim a validated ledger. Applies all count/notebook/meta mutations in
     /// one atomic batch, then persists. Idempotent: a seq at or below the last
     /// claim is ignored (safe restart replay).
@@ -301,6 +328,17 @@ impl IndexWriter {
         self.backend.kv_persist(PersistMode::SyncAll)?;
         self.backend.unwatch_restores(&resurrected);
         self.claimed_seq = Some(delta.seq);
+        self.recent_claimed.push_back(
+            delta
+                .new_state
+                .iter()
+                .chain(delta.owned.iter())
+                .copied()
+                .collect(),
+        );
+        while self.recent_claimed.len() > RECENT_CLAIMS {
+            self.recent_claimed.pop_front();
+        }
         Ok(())
     }
 
@@ -337,6 +375,9 @@ impl IndexWriter {
         self.backend.kv_write_batch(&batch)?;
         self.backend.kv_persist(PersistMode::SyncAll)?;
         self.claimed_seq = Some(seq);
+        // Every node present at the anchor is implicitly live-once.
+        self.unclaimed.clear();
+        self.recent_claimed.clear();
         Ok(())
     }
 

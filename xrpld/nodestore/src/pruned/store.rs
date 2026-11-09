@@ -84,6 +84,13 @@ impl PrunedStore {
         };
         metrics.claimed_seq = writer.claimed_seq();
         metrics.pruned_to = writer.pruned_to();
+        // An anchored store tracks nodes that writes insert for the first
+        // time, so a node that no claim ever adopts (it lived only in a
+        // ledger that was never claimed) is still pruned. Before the anchor
+        // every present node becomes implicitly live, so nothing is tracked.
+        if writer.claimed_seq().is_some() && config.online_delete > 0 {
+            backend.set_fresh_write_tracking(true);
+        }
         Ok(Self {
             backend,
             writer: Mutex::new(writer),
@@ -185,6 +192,11 @@ impl PrunedStore {
     /// SHAMap diff). Updates the claimed-seq metric.
     pub fn claim(&self, delta: &ClaimDelta) -> Result<(), String> {
         let mut writer = self.writer.lock().expect("pruned store writer mutex");
+        // Writes recorded before this claim are noted first, so the claim
+        // removes the ones it adopts; the rest stay unclaimed and are
+        // retired by the orphan sweep after the window.
+        let fresh = self.backend.take_fresh_writes();
+        writer.note_fresh_writes(fresh, delta.seq);
         writer.claim(delta)?;
         let mut metrics = self.metrics.lock().expect("pruned store metrics mutex");
         metrics.claimed_seq = writer.claimed_seq();
@@ -322,6 +334,12 @@ impl PrunedStore {
     pub fn anchor(&self, seq: u32, state_root: Uint256) -> Result<(), String> {
         let mut writer = self.writer.lock().expect("pruned store writer mutex");
         writer.adopt_anchor(seq, state_root)?;
+        // Everything written before the anchor is implicitly live; track
+        // fresh writes from here on.
+        let _ = self.backend.take_fresh_writes();
+        if self.config.online_delete > 0 {
+            self.backend.set_fresh_write_tracking(true);
+        }
         self.metrics.lock().expect("metrics mutex").claimed_seq = writer.claimed_seq();
         Ok(())
     }
@@ -709,6 +727,118 @@ mod tests {
                 owned: vec![],
             })
             .expect("claim");
+    }
+
+    fn present(store: &PrunedStore, hash: Uint256) -> bool {
+        store
+            .backend()
+            .kv_get(Keyspace::Nodes, hash.as_slice())
+            .expect("kv_get")
+            .is_some()
+    }
+
+    /// Write `hashes` through the normal node-store path (`store_batch`),
+    /// as ledger building and acquisition do.
+    fn write_nodes(store: &PrunedStore, hashes: &[Uint256]) {
+        let batch: crate::Batch = hashes.iter().map(|hash| node(*hash)).collect();
+        store.backend().store_batch_result(&batch).expect("store_batch");
+    }
+
+    fn fjall_store(tag: &str, online_delete: u32) -> PrunedStore {
+        let config = PrunedConfig {
+            online_delete,
+            prune_mode: PruneMode::On,
+            ..PrunedConfig::default()
+        };
+        let store = PrunedStore::open(open_fjall(tag), config).expect("open");
+        store.anchor(1, hid(1)).expect("anchor");
+        store
+    }
+
+    /// Mainnet store growth (2026-11-09): a node written for a ledger whose
+    /// claim was skipped, and already replaced by the next claimed ledger, is
+    /// in neither tree the claim diffs. It got no count and no death record
+    /// and was never deleted. Tracking it as a fresh write lets the orphan
+    /// sweep retire it after the window.
+    #[test]
+    fn node_hidden_by_a_claim_gap_is_pruned() {
+        let store = fjall_store("gap", 4);
+        let hidden = hid(9_001);
+        write_nodes(&store, &[hidden]);
+        // Ledger 2 (which held `hidden`) is never claimed; 3..=12 are.
+        for seq in 3..=12u32 {
+            churn_one(&store, seq);
+            store.maintain(seq, u32::MAX).expect("maintain");
+        }
+        assert!(!present(&store, hidden), "a node no claim adopted must be pruned");
+        assert!(present(&store, hid(312)), "the live node of the last claim stays");
+    }
+
+    /// The fresh-write record can reach the index after the claim that
+    /// adopted the node. It must not pin that live node as unclaimed, or the
+    /// orphan sweep would delete it.
+    #[test]
+    fn live_node_recorded_after_its_claim_is_never_pruned() {
+        let store = fjall_store("late", 4);
+        let live = hid(9_002);
+        store
+            .claim(&ClaimDelta {
+                seq: 2,
+                state_root: hid(2),
+                new_state: vec![live],
+                dead_state: vec![],
+                owned: vec![],
+            })
+            .expect("claim");
+        write_nodes(&store, &[live]);
+        for seq in 3..=14u32 {
+            churn_one(&store, seq);
+            store.maintain(seq, u32::MAX).expect("maintain");
+        }
+        assert!(present(&store, live), "a claimed, still-live node is kept");
+    }
+
+    /// Re-writing a node that is already stored (a live node) is not a fresh
+    /// write and must not be tracked.
+    #[test]
+    fn rewriting_a_stored_node_is_not_tracked() {
+        let store = fjall_store("rewrite", 4);
+        let live = hid(9_003);
+        write_nodes(&store, &[live]);
+        store
+            .claim(&ClaimDelta {
+                seq: 2,
+                state_root: hid(2),
+                new_state: vec![live],
+                dead_state: vec![],
+                owned: vec![],
+            })
+            .expect("claim");
+        write_nodes(&store, &[live]);
+        assert!(store.backend().take_fresh_writes().is_empty());
+        assert_eq!(store.metrics().unclaimed, 0);
+    }
+
+    /// Before the anchor every present node is implicitly live, so writes
+    /// are not tracked and the anchored tree is never swept.
+    #[test]
+    fn writes_before_the_anchor_are_not_tracked() {
+        let config = PrunedConfig {
+            online_delete: 4,
+            prune_mode: PruneMode::On,
+            ..PrunedConfig::default()
+        };
+        let store = PrunedStore::open(open_fjall("preanchor"), config).expect("open");
+        let anchored = [hid(9_004), hid(9_005)];
+        write_nodes(&store, &anchored);
+        store.anchor(1, hid(1)).expect("anchor");
+        for seq in 2..=14u32 {
+            churn_one(&store, seq);
+            store.maintain(seq, u32::MAX).expect("maintain");
+        }
+        for hash in anchored {
+            assert!(present(&store, hash), "anchored nodes are live");
+        }
     }
 
     /// The window slides one ledger at a time: every validated ledger past
