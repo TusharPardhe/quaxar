@@ -234,6 +234,9 @@ pub struct RclValidationsAdaptor {
     >,
     overlay: parking_lot::Mutex<Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>>,
     job_queue: parking_lot::Mutex<Option<Arc<JobQueue>>>,
+    /// Ledgers trusted validations named that `acquire` could not return
+    /// yet, with when they were first missed (recovery timing diagnostics).
+    missing_since: parking_lot::Mutex<std::collections::HashMap<Uint256, std::time::Instant>>,
 }
 
 impl RclValidationsAdaptor {
@@ -250,6 +253,7 @@ impl RclValidationsAdaptor {
             loaded_ledger_runtime: parking_lot::Mutex::new(None),
             overlay: parking_lot::Mutex::new(None),
             job_queue: parking_lot::Mutex::new(None),
+            missing_since: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -328,6 +332,48 @@ impl consensus::rcl_support::ValidationsAdaptor for RclValidationsAdaptor {
     }
 
     fn acquire(&self, ledger_id: &Uint256) -> Option<RclValidatedLedger> {
+        let found = self.acquire_untimed(ledger_id);
+        self.note_acquire_timing(ledger_id, found.as_ref());
+        found
+    }
+}
+
+impl RclValidationsAdaptor {
+    /// Recovery timing: log when a trusted validation first names a ledger we
+    /// do not have, and how long it took until `acquire` could return it.
+    fn note_acquire_timing(&self, ledger_id: &Uint256, found: Option<&RclValidatedLedger>) {
+        let mut missing = self.missing_since.lock();
+        match found {
+            None => {
+                if !missing.contains_key(ledger_id) {
+                    if missing.len() > 1_000 {
+                        missing.clear();
+                    }
+                    missing.insert(*ledger_id, std::time::Instant::now());
+                    tracing::info!(
+                        target: "consensus",
+                        event = "validated_ledger_missing",
+                        ledger = %ledger_id,
+                        "trusted validation names a ledger we do not have"
+                    );
+                }
+            }
+            Some(ledger) => {
+                if let Some(since) = missing.remove(ledger_id) {
+                    tracing::info!(
+                        target: "consensus",
+                        event = "validated_ledger_available",
+                        ledger = %ledger_id,
+                        seq = TrieLedger::seq(ledger),
+                        waited_ms = since.elapsed().as_millis() as u64,
+                        "ledger named by trusted validations is now available to the trie"
+                    );
+                }
+            }
+        }
+    }
+
+    fn acquire_untimed(&self, ledger_id: &Uint256) -> Option<RclValidatedLedger> {
         if let Some(ledger) = self.ledgers.lock().get(ledger_id).cloned() {
             return Some(ledger);
         }
