@@ -565,6 +565,10 @@ fn try_cli_subcommand() -> Option<ExitCode> {
                 ValidatorKeysAction::Sign { data } => quaxar_cli::validator_keys::run_sign(&data),
                 ValidatorKeysAction::Revoke => quaxar_cli::validator_keys::run_revoke(),
                 ValidatorKeysAction::Show => quaxar_cli::validator_keys::run_show(),
+                ValidatorKeysAction::SetDomain { domain } => {
+                    quaxar_cli::validator_keys::run_set_domain(&domain)
+                }
+                ValidatorKeysAction::AttestDomain => quaxar_cli::validator_keys::run_attest_domain(),
             }
             true
         }

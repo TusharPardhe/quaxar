@@ -7,6 +7,13 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ## [Unreleased]
 
+### Added
+
+- `validator-keys set-domain <domain>` and `validator-keys attest-domain`,
+  matching rippled's validator-keys tool: a new token whose manifest carries
+  sfDomain, and the `xrp-ledger.toml` attestation over
+  `[domain-attestation-blob:<domain>:<master key>]`.
+
 ### Fixed
 
 - Pruned fjall stores no longer keep nodes that only lived in a ledger whose

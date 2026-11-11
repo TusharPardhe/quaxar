@@ -113,14 +113,49 @@ config and that `[validation_seed]` contains the family seed, not the public or
 private key. If the server never reaches `proposing`, resolve synchronization,
 quorum, validator-list, and clock issues before changing keys.
 
+## Domain verification
+
+Explorers and the Validator History Service (VHS) show a domain as verified
+only when two things agree (the same check as rippled's validator-keys tool):
+
+| Where | What | Who signs |
+| --- | --- | --- |
+| Manifest (`[validator_token]`) | `sfDomain = <domain>` | master key |
+| `https://<domain>/.well-known/xrp-ledger.toml` | `[[VALIDATORS]]` with `public_key` and `attestation` | master key |
+
+The attestation is the master key's signature, as upper-case hex, over the
+exact string `[domain-attestation-blob:<domain>:<master public key>]`.
+
+IMPORTANT: a domain can only be carried by a manifest, so the validator must
+run with `[validator_token]` instead of `[validation_seed]`. The master public
+key (the validator identity) does not change. Each `set-domain` raises the
+token sequence; peers keep the highest sequence they have seen.
+
+```bash
+cd <directory holding validator-keys.json>   # ideally an offline machine
+quaxar validator-keys set-domain example.com
+```
+
+The command backs up the key file to `validator-keys.json.bak`, records
+`domain` and `token_sequence`, and prints the attestation and the new token.
+Then:
+
+1. Publish the TOML over HTTPS with `Access-Control-Allow-Origin: *`
+   (`Content-Type: application/toml` is recommended).
+2. Back up the config, remove `[validation_seed]`, add `[validator_token]`,
+   run `quaxar --conf <cfg> config`, and restart.
+3. Check `quaxar validator-info` shows the domain and the new sequence.
+
+Once the token is in place, the master seed no longer needs to be on the
+validator. Keep `validator-keys.json` offline; it is needed for future token
+rotation and for revocation.
+
 ## Key files and backups
 
 Keep at least one encrypted offline backup of `validator-keys.json`. A lost
 root seed cannot be recovered. Do not reuse an identity across simultaneously
 running validators, because they can issue conflicting validations.
 
-The `validator-keys create-token`, `sign`, and `revoke` commands are currently
-experimental developer tooling. Their token/manifest serialization and
-rotation workflow are not documented as `rippled`-compatible for production.
-Use `[validation_seed]` for the supported operational path until that
-compatibility is independently audited.
+`validator-keys create-token` and `set-domain` build manifests the same way as
+rippled's validator-keys tool (`createValidatorToken`). The `sign` and `revoke`
+commands are still experimental developer tooling.
