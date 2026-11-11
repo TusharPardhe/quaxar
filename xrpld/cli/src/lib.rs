@@ -178,6 +178,14 @@ pub enum ValidatorKeysAction {
     Revoke,
     /// Show validator public key and creation date
     Show,
+    /// Associate a domain with the validator key: issues a new token whose
+    /// manifest carries the domain and prints the TOML attestation
+    SetDomain {
+        /// Domain serving /.well-known/xrp-ledger.toml (empty string clears it)
+        domain: String,
+    },
+    /// Print the xrp-ledger.toml attestation for the configured domain
+    AttestDomain,
 }
 
 // ─── UI Helpers (Kiro-style output formatting) ───────────────────────────────

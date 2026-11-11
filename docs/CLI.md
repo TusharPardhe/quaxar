@@ -116,6 +116,8 @@ Features:
 | `validator-keys sign` | Experimental local signing helper |
 | `validator-keys revoke` | Create an experimental revocation payload |
 | `validator-keys show` | Display the saved public key and creation time |
+| `validator-keys set-domain <domain>` | Set the validator domain: new token (manifest with sfDomain) plus the TOML attestation. `""` clears it |
+| `validator-keys attest-domain` | Print the attestation for the domain stored in the key file |
 
 `generate` writes a non-overwriting, mode-`0600` `validator-keys.json` in the
 current directory. The supported server configuration path uses its
