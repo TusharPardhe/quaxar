@@ -344,16 +344,14 @@ fn txq_time_leap(round_time: StdDuration) -> bool {
     round_time > StdDuration::from_secs(5)
 }
 
-fn disputed_relay_envelope(
-    raw_transaction: Vec<u8>,
-    local_timestamp: u64,
-) -> overlay::TmTransaction {
+fn disputed_relay_envelope(raw_transaction: Vec<u8>) -> overlay::TmTransaction {
     overlay::TmTransaction {
         raw_transaction,
         // xrpl.proto TransactionStatus::tsNEW = 1. TmTransaction exposes
         // this generated enum field as an i32 in the current overlay API.
         status: 1,
-        receive_timestamp: Some(local_timestamp),
+        // rippled #8702: receiveTimestamp is no longer sent.
+        receive_timestamp: None,
         deferred: None,
     }
 }
@@ -372,7 +370,6 @@ pub struct AppRclConsensusRelay {
     /// `HashRouter::shouldRelay` allows it (once per relay hold time).
     should_relay: Arc<dyn Fn(Uint256) -> bool + Send + Sync>,
     inbound_transactions: AppInboundTransactions,
-    time_keeper: Arc<TimeKeeper<SystemTimeKeeperClock>>,
     validator_keys: ValidatorKeys,
     journal: Arc<dyn RclConsensusJournal>,
 }
@@ -388,7 +385,6 @@ impl AppRclConsensusRelay {
             overlay: root.overlay_runtime().map(|rt| rt.overlay()),
             should_relay: disputed_tx_relay_gate(root.shared_hash_router()),
             inbound_transactions,
-            time_keeper: root.shared_time_keeper(),
             validator_keys,
             journal: Arc::new(journal),
         }
@@ -473,10 +469,7 @@ impl RclConsensusRelay for AppRclConsensusRelay {
 
         // Disputed transactions are a new local relay, not a replay of the
         // untrusted TMTransaction envelope that originally delivered them.
-        let message = disputed_relay_envelope(
-            tx.item().data().to_vec(),
-            self.time_keeper.now().as_seconds() as u64,
-        );
+        let message = disputed_relay_envelope(tx.item().data().to_vec());
         overlay.relay_transaction(tx.id(), Some(message), &std::collections::BTreeSet::new());
     }
 }
@@ -819,6 +812,13 @@ fn open_ledger_consensus_snapshot(
     {
         let mut editable = set.mutable_view();
         for tx in transactions {
+            // rippled #8645 (RCLConsensus onClose): inner batch txns are
+            // applied only when building from the agreed set, never to the
+            // open ledger, so they cannot leak into the proposal.
+            debug_assert!(
+                !tx.is_flag(protocol::tfInnerBatchTxn),
+                "on_close: no inner batch txn in open ledger"
+            );
             editable.insert(&consensus::RclCxTxRef::from_transaction(tx));
         }
         set = editable.freeze();
@@ -2598,10 +2598,10 @@ mod tests {
     #[test]
     fn disputed_relay_replaces_hostile_inbound_metadata_with_local_new_envelope() {
         let hostile = TransactionRelayMetadata::new(2, Some(1), Some(true));
-        let message = disputed_relay_envelope(vec![0xD0, 0x0D], 9_999);
+        let message = disputed_relay_envelope(vec![0xD0, 0x0D]);
 
         assert_eq!(message.status, 1, "disputed relay must emit tsNEW");
-        assert_eq!(message.receive_timestamp, Some(9_999));
+        assert_eq!(message.receive_timestamp, None, "rippled #8702 stopped sending it");
         assert_eq!(message.deferred, None);
         assert_ne!(message.status, hostile.status);
         assert_ne!(message.receive_timestamp, hostile.receive_timestamp);

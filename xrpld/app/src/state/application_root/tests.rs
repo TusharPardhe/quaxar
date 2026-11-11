@@ -3357,10 +3357,10 @@ fn application_root_queue_relay_envelope_replaces_hostile_inbound_metadata() {
         Some(1),
         Some(false),
     );
-    let message = super::queue_relay_envelope(vec![0xFA, 0xCE], 42_424, true);
+    let message = super::queue_relay_envelope(vec![0xFA, 0xCE], true);
 
     assert_eq!(message.status, 2, "queue relay must emit tsCURRENT");
-    assert_eq!(message.receive_timestamp, Some(42_424));
+    assert_eq!(message.receive_timestamp, None, "rippled #8702 stopped sending it");
     assert_eq!(
         message.deferred,
         Some(true),

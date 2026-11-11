@@ -31,6 +31,7 @@ pub const FIX_AMMV1_3_NAME: &str = "fixAMMv1_3";
 pub const FIX_CLEANUP_3_2_0_NAME: &str = "fixCleanup3_2_0";
 pub const FIX_CLEANUP_3_3_0_NAME: &str = "fixCleanup3_3_0";
 pub const FIX_CLEANUP_3_4_0_NAME: &str = "fixCleanup3_4_0";
+pub const FIX_CLEANUP_3_6_0_NAME: &str = "fixCleanup3_6_0";
 pub const FIX_CLEANUP_3_5_0_NAME: &str = "fixCleanup3_5_0";
 pub const FIX_MPT_DELIVERED_AMOUNT_NAME: &str = "fixMPTDeliveredAmount";
 pub const FEATURE_SPONSOR_NAME: &str = "Sponsor";
@@ -107,6 +108,12 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
         RegisteredFeatureVote::DefaultNo,
     ),
     // Newer amendments are listed first, as in rippled's features.macro.
+    // rippled #8681: placeholder, supported, nothing gated on it yet.
+    RegisteredFeature::new(
+        FIX_CLEANUP_3_6_0_NAME,
+        true,
+        RegisteredFeatureVote::DefaultNo,
+    ),
     // SmartEscrow and LendingProtocolV1_2 remain registered but unsupported:
     // their runtime implementations have not been ported yet.
     RegisteredFeature::new(

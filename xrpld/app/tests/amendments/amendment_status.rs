@@ -205,6 +205,8 @@ fn default_amendment_registry_supports_fixes_rippled_supports() {
         "fixPriceOracleOrder",
         "fixMPTDeliveredAmount",
         "fixAMMClawbackRounding",
+        // rippled #8681
+        "fixCleanup3_6_0",
     ] {
         assert!(table.is_supported(feature_id(name)), "{name}");
     }

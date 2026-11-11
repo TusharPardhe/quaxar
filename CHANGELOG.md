@@ -9,10 +9,19 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Added
 
+- fixCleanup3_6_0 registered as supported (rippled #8681).
 - `validator-keys set-domain <domain>` and `validator-keys attest-domain`,
   matching rippled's validator-keys tool: a new token whose manifest carries
   sfDomain, and the `xrp-ledger.toml` attestation over
   `[domain-attestation-blob:<domain>:<master key>]`.
+
+### Changed
+
+- rippled develop sync to `58b73715c7`: receiveTimestamp is no longer sent
+  (#8702); object-by-hash replies no longer echo nodeID as index (#8701); a
+  repeated single-value config section fails startup (#8669); `log_level`
+  rejects non-string `severity`/`partition` with `invalidParams` (#7595).
+  See `docs/incidents/2026-11-11-rippled-nov-2026-sync.md`.
 
 ### Fixed
 

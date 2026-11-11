@@ -457,13 +457,13 @@ impl FeeChangeReporter {
 
 fn queue_relay_envelope(
     raw_transaction: Vec<u8>,
-    local_timestamp: u64,
     locally_queued: bool,
 ) -> overlay::TmTransaction {
     overlay::TmTransaction {
         raw_transaction,
         status: 2, // tsCURRENT
-        receive_timestamp: Some(local_timestamp),
+        // rippled #8702: receiveTimestamp is no longer sent.
+        receive_timestamp: None,
         deferred: Some(locally_queued),
     }
 }
@@ -5750,12 +5750,10 @@ impl ApplicationRoot {
                 let Some(overlay_rt) = self.overlay_runtime() else {
                     return;
                 };
-                let now = self.shared_time_keeper().now().as_seconds() as u64;
                 overlay_rt.overlay().relay_transaction(
                     tx_id,
                     Some(queue_relay_envelope(
                         tx.get_serializer().data().to_vec(),
-                        now,
                         false,
                     )),
                     &to_skip,
@@ -6061,12 +6059,10 @@ impl ApplicationRoot {
                 let Some(overlay_rt) = self.overlay_runtime() else {
                     return;
                 };
-                let now = self.shared_time_keeper().now().as_seconds() as u64;
                 overlay_rt.overlay().relay_transaction(
                     tx_id,
                     Some(queue_relay_envelope(
                         tx.get_serializer().data().to_vec(),
-                        now,
                         false,
                     )),
                     &to_skip,
@@ -7886,13 +7882,12 @@ impl ApplicationRoot {
                     let stx = guard.get_s_transaction();
                     (guard.get_id(), stx.get_serializer().data().to_vec())
                 };
-                let local_timestamp = self.shared_time_keeper().now().as_seconds() as u64;
                 // `deferred` is produced locally by NetworkOps from the apply
                 // result (`result == terQUEUED`). Never forward wire envelope
                 // metadata retained from the peer that submitted this tx.
                 overlay_rt.overlay().relay_transaction(
                     tx_id,
-                    Some(queue_relay_envelope(raw_bytes, local_timestamp, deferred)),
+                    Some(queue_relay_envelope(raw_bytes, deferred)),
                     &to_skip,
                 );
             },
