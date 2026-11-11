@@ -3980,10 +3980,7 @@ const COST_BAND_MEDIUM: u32 = 100;
 /// Surcharge for large requests (>1024 objects).
 const COST_BAND_LARGE: u32 = 1000;
 
-fn requested_transaction_envelope(
-    transaction: &crate::Transaction,
-    timestamp: u64,
-) -> overlay::TmTransaction {
+fn requested_transaction_envelope(transaction: &crate::Transaction) -> overlay::TmTransaction {
     overlay::TmTransaction {
         raw_transaction: transaction
             .get_s_transaction()
@@ -3997,7 +3994,8 @@ fn requested_transaction_envelope(
         } else {
             1
         },
-        receive_timestamp: Some(timestamp),
+        // rippled #8702: receiveTimestamp is no longer sent.
+        receive_timestamp: None,
         deferred: Some(transaction.get_submit_result().queued),
     }
 }
@@ -4025,7 +4023,6 @@ fn serve_requested_transactions(
         return;
     }
 
-    let timestamp = u64::from(root.current_network_time_seconds());
     let mut transactions = Vec::with_capacity(req.message.objects.len());
     for object in &req.message.objects {
         let hash = Uint256::from_slice(
@@ -4045,7 +4042,7 @@ fn serve_requested_transactions(
         let transaction = transaction
             .lock()
             .expect("canonical transaction mutex must not be poisoned");
-        transactions.push(requested_transaction_envelope(&transaction, timestamp));
+        transactions.push(requested_transaction_envelope(&transaction));
     }
 
     if !transactions.is_empty() {
@@ -4131,7 +4128,8 @@ fn serve_get_object_by_hash_request(
             reply_objects.push(overlay::message::wire::TmIndexedObject {
                 hash: Some(hash.data().to_vec()),
                 node_id: None,
-                index: obj.node_id.clone(),
+                // rippled #8701: the request's nodeID is no longer echoed as index.
+                index: None,
                 data: Some(data),
                 ledger_seq: obj.ledger_seq,
             });
@@ -4644,7 +4642,55 @@ fn node_size_name(raw: &str) -> Option<&'static str> {
 
 /// Startup errors rippled raises from `Config::loadFromString` for values that
 /// quaxar otherwise reads leniently.
+/// Sections rippled `Config::loadFromString` reads with `getSingleSection`.
+const RIPPLED_SINGLE_VALUE_SECTIONS: [&str; 35] = [
+    "database_path",
+    "network_id",
+    "peer_private",
+    "peers_max",
+    "peers_in_max",
+    "peers_out_max",
+    "node_size",
+    "signing_support",
+    "elb_support",
+    "ssl_verify_file",
+    "ssl_verify_dir",
+    "ssl_verify",
+    "relay_validations",
+    "relay_proposals",
+    "network_quorum",
+    "max_subscriptions_per_connection",
+    "fee_default",
+    "ledger_history",
+    "fetch_depth",
+    "path_search_old",
+    "path_search",
+    "path_search_fast",
+    "path_search_max",
+    "debug_logfile",
+    "sweep_interval",
+    "workers",
+    "io_workers",
+    "prefetch_workers",
+    "compression",
+    "ledger_replay",
+    "max_transactions",
+    "server_domain",
+    "amendment_majority_time",
+    "beta_rpc_api",
+    "validators_file",
+];
+
 fn validate_rippled_config_values(config: &BasicConfig) -> Result<(), String> {
+    // rippled #8669 getSingleSection: a repeated single-value section hides
+    // the value the operator meant, so startup fails. An empty section keeps
+    // the default.
+    for section in RIPPLED_SINGLE_VALUE_SECTIONS {
+        let count = config.section(section).values().len();
+        if count > 1 {
+            return Err(format!("[{section}] requires exactly one value, not {count}"));
+        }
+    }
     if let Some(raw) = config_single_legacy(config, "node_size")?
         && node_size_name(&raw).is_none()
     {
@@ -6169,6 +6215,20 @@ mod tests {
         assert!(check(&[("beta_rpc_api", "maybe")]).is_err());
     }
 
+    /// rippled #8669 (Config_test): a repeated single-value section fails.
+    #[test]
+    fn repeated_single_value_section_is_rejected_like_rippled() {
+        let check = |entries: &[(&str, &str)]| super::validate_rippled_config_values(&legacy_config(entries));
+        assert_eq!(
+            check(&[("network_id", "main"), ("network_id", "testnet")]),
+            Err("[network_id] requires exactly one value, not 2".to_owned())
+        );
+        assert!(check(&[("ledger_history", "256"), ("ledger_history", "512")]).is_err());
+        assert!(check(&[("network_id", "main")]).is_ok());
+        // Multi-value sections are unaffected.
+        assert!(check(&[("ips", "a 51235"), ("ips", "b 51235")]).is_ok());
+    }
+
     #[test]
     fn ledger_history_matches_rippled() {
         assert_eq!(super::config_ledger_history(&legacy_config(&[]), false), Ok(256));
@@ -6939,14 +6999,14 @@ mod tests {
         transaction.set_status(crate::TransStatus::INCLUDED);
         transaction.set_queued();
 
-        let envelope = requested_transaction_envelope(&transaction, 123_456);
+        let envelope = requested_transaction_envelope(&transaction);
         assert_eq!(envelope.raw_transaction, st_tx.get_serializer().data());
         assert_eq!(envelope.status, 2, "included transactions use tsCURRENT");
-        assert_eq!(envelope.receive_timestamp, Some(123_456));
+        assert_eq!(envelope.receive_timestamp, None, "rippled #8702 stopped sending it");
         assert_eq!(envelope.deferred, Some(true));
 
         transaction.set_status(crate::TransStatus::HELD);
-        assert_eq!(requested_transaction_envelope(&transaction, 1).status, 1);
+        assert_eq!(requested_transaction_envelope(&transaction).status, 1);
     }
 
     #[test]
