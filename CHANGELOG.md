@@ -43,6 +43,10 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Fixed
 
+- `manifest` and `validator_info` RPCs read the validator manifest cache, as
+  rippled `doManifest`/`doValidatorInfo` do; they returned no manifest, `seq`
+  or `domain` before. A `manifests_sent` log line shows whether the local
+  validator's manifest goes to each new peer.
 - `[validator_token]` is read with `lines()`, as rippled ValidatorKeys does.
   A token line ending in base64 `=` padding parsed as `key=value` and was
   missing from `values()`, so the node refused to start ("invalid
