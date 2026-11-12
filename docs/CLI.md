@@ -102,7 +102,9 @@ Features:
 | `validator-keys` | Key management (see below) |
 | `cli` | Open the interactive operator shell |
 | `export-snapshot` | Export node store to snapshot file (admin RPC) |
-| `load-snapshot` | Import snapshot into node store (offline) |
+| `load-snapshot` | Import snapshot into node store (offline); optional signature and ledger checks |
+| `sign-snapshot` | Sign a snapshot file (writes `<file>.sig`) |
+| `snapshot-keygen` | Create an Ed25519 snapshot-signing key |
 | `doctor` | Diagnose common configuration issues |
 | `stop` | Graceful shutdown |
 | `version` | Build version, commit hash, and build time |
@@ -238,6 +240,9 @@ quaxar load-snapshot --input /path/to/snapshot.xrpls --conf /etc/quaxar/quaxar.c
 |------|----------|-------------|
 | `--input` | Yes | Path to snapshot file |
 | `--conf` | No | Config path determining the NodeStore; defaults to `/etc/quaxar/quaxar.cfg` |
+| `--trusted-key` | No | Ed25519 key (`n...`) whose `<input>.sig` is accepted; repeatable. Implies a signature check |
+| `--require-signature` | No | Refuse to load without a valid signature by a trusted key |
+| `--check-ledger` | No | JSON-RPC URL (e.g. `https://s2.ripple.com:51234`) that must report the snapshot's ledger as validated with the same hash |
 
 The import writes nodes in bulk batches, verifies both SHAMap roots, and then
 adopts the snapshot ledger as the pruned store's anchor, reclaiming any nodes
@@ -245,6 +250,27 @@ outside the snapshot. Load into an empty fjall store; a store that already has
 claimed history is refused before anything is deleted. The CLI shows a spinner throughout the synchronous import and reports success only
 after the loader has verified every chunk and the final file hash. Runtime
 depends on snapshot size, storage, CPU, and available memory.
+
+### Signed snapshots
+
+A snapshot already proves it is internally consistent (chunk and file SHA-256,
+rebuilt SHAMap roots, recomputed ledger hash). A signature proves who made it.
+
+```bash
+# once, on the publisher
+quaxar snapshot-keygen --output /etc/quaxar/snapshot-key.json   # prints the public key
+# after each export
+quaxar sign-snapshot --input snap.xrpls --key-file /etc/quaxar/snapshot-key.json
+# on the new node (both checks run before anything is imported)
+quaxar load-snapshot --input snap.xrpls --conf /etc/quaxar/quaxar.cfg \
+  --trusted-key nH... --require-signature --check-ledger https://s2.ripple.com:51234
+```
+
+`<file>.sig` is JSON: `ledger_seq`, `ledger_hash`, `file_sha256`, `public_key`
+and an Ed25519 `signature` over
+`quaxar-snapshot-v1:<seq>:<ledger hash>:<file sha256>`, so a signature cannot be
+moved to another file or ledger. Keep the key file private; publish only the
+public key, from somewhere other than where the snapshots are served.
 
 ## Exit Codes
 

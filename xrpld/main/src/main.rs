@@ -573,8 +573,57 @@ fn try_cli_subcommand() -> Option<ExitCode> {
             true
         }
         quaxar_cli::Command::ExportSnapshot { output } => run_export_snapshot(url, &output),
-        quaxar_cli::Command::LoadSnapshot { input } => {
-            run_load_snapshot(&input, parsed.conf.as_deref())
+        quaxar_cli::Command::LoadSnapshot {
+            input,
+            trusted_keys,
+            require_signature,
+            check_ledger,
+        } => {
+            match snapshot_trust::verify_before_load(
+                std::path::Path::new(&input),
+                &trusted_keys,
+                require_signature,
+                check_ledger.as_deref(),
+            ) {
+                Ok(passed) => {
+                    for line in passed {
+                        println!("  ● verified: {line}");
+                    }
+                    run_load_snapshot(&input, parsed.conf.as_deref())
+                }
+                Err(error) => {
+                    eprintln!("  ● snapshot not loaded: {error}");
+                    false
+                }
+            }
+        }
+        quaxar_cli::Command::SignSnapshot { input, key_file } => {
+            match snapshot_trust::read_key_file(std::path::Path::new(&key_file)).and_then(|key| {
+                nodestore::snapshot::signature::sign_file(std::path::Path::new(&input), &key)
+                    .map_err(|e| e.to_string())
+            }) {
+                Ok(path) => {
+                    println!("  ● wrote {}", path.display());
+                    true
+                }
+                Err(error) => {
+                    eprintln!("  ● {error}");
+                    false
+                }
+            }
+        }
+        quaxar_cli::Command::SnapshotKeygen { output } => {
+            match snapshot_trust::keygen(std::path::Path::new(&output)) {
+                Ok(public) => {
+                    println!("  ● wrote {output} (keep it private)");
+                    println!("  ● public key: {public}");
+                    true
+                }
+                Err(error) => {
+                    eprintln!("  ● {error}");
+                    false
+                }
+            }
         }
     };
     Some(if ok {
@@ -1612,6 +1661,7 @@ fn run_rpc_client(options: AppBootstrapOptions) -> ExitCode {
 #[cfg(test)]
 #[path = "main/tests.rs"]
 mod tests;
+mod snapshot_trust;
 
 // ─── Snapshot CLI handlers ───────────────────────────────────────────────────
 

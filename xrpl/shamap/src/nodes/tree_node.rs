@@ -215,6 +215,20 @@ impl TaggedPointer {
         unsafe { (&*self.children().add(index)).is_some() }
     }
 
+    /// Remove the child at `index` and hand it to the caller, so the caller
+    /// decides where the (possibly large) subtree is dropped.
+    fn take_child_at_index(&self, index: usize) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+        debug_assert!(index < self.capacity());
+        unsafe {
+            let slot = &mut *self.children().add(index);
+            let taken = slot.take();
+            if taken.is_some() {
+                LOADED_CHILD_LINKS.fetch_sub(1, Ordering::Relaxed);
+            }
+            taken
+        }
+    }
+
     fn set_child_at_index(&self, index: usize, child: Option<SharedIntrusive<SHAMapTreeNode>>) {
         debug_assert!(index < self.capacity());
         unsafe {
@@ -857,6 +871,21 @@ impl SHAMapTreeNode {
         let b = i.is_branch.load(Ordering::Relaxed);
         i.tagged()
             .iter_non_empty_child_indexes(b, |_, n| i.tagged().set_child_at_index(n, None));
+    }
+    /// Like `release_loaded_children`, but moves the children into `out`
+    /// instead of dropping them here.
+    pub fn take_loaded_children(&self, out: &mut Vec<SharedIntrusive<Self>>) {
+        if !self.is_inner() {
+            return;
+        }
+        let i = self.inner();
+        let _l = i.lock();
+        let b = i.is_branch.load(Ordering::Relaxed);
+        i.tagged().iter_non_empty_child_indexes(b, |_, n| {
+            if let Some(child) = i.tagged().take_child_at_index(n) {
+                out.push(child);
+            }
+        });
     }
     pub fn has_child(&self, branch: usize) -> bool {
         validate_branch(branch);

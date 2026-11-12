@@ -156,6 +156,34 @@ pub enum Command {
         /// Input snapshot file path
         #[arg(long, short)]
         input: String,
+        /// Ed25519 public key (n...) whose `<input>.sig` signature is
+        /// accepted. Repeat for several keys. Implies a signature check.
+        #[arg(long = "trusted-key")]
+        trusted_keys: Vec<String>,
+        /// Refuse to load without a valid signature by a trusted key
+        #[arg(long)]
+        require_signature: bool,
+        /// JSON-RPC URL (e.g. https://s2.ripple.com:51234) that must report
+        /// the snapshot's ledger as validated with the same hash
+        #[arg(long)]
+        check_ledger: Option<String>,
+    },
+    /// Sign a snapshot file: writes `<input>.sig`
+    #[command(name = "sign-snapshot")]
+    SignSnapshot {
+        /// Snapshot file path
+        #[arg(long, short)]
+        input: String,
+        /// Key file written by `snapshot-keygen`
+        #[arg(long)]
+        key_file: String,
+    },
+    /// Create an Ed25519 key for signing snapshots
+    #[command(name = "snapshot-keygen")]
+    SnapshotKeygen {
+        /// Where to write the key file (created with mode 0600; never overwritten)
+        #[arg(long)]
+        output: String,
     },
 }
 

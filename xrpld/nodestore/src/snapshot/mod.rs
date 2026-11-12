@@ -3,6 +3,7 @@ pub mod error;
 pub mod loader;
 pub mod manifest;
 pub mod scheduler;
+pub mod signature;
 #[cfg(test)]
 mod tests;
 pub mod writer;

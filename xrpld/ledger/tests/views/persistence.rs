@@ -408,3 +408,28 @@ fn durable_graph_release_checks_both_maps_before_releasing_either() {
     );
     assert!(guarded_tx_level_two.get_child(3).is_some());
 }
+
+/// The trim detaches on the consensus thread and frees elsewhere: detaching
+/// must unlink the subtrees from the ledger but keep them alive in `out`, so
+/// no node is freed until the caller drops `out`.
+#[test]
+fn durable_graph_detach_moves_subtrees_out_without_freeing_them() {
+    let (ledger, state_level_two, tx_level_two) = deep_ledger_with_map_backing(92, true, true);
+    let original_state_hash = ledger.state_map().root().get_hash();
+
+    let mut detached = ledger::DetachedGraphs::new();
+    let released = ledger
+        .detach_durable_map_graphs(None, 2, &mut detached)
+        .expect("immutable fetchable backed maps satisfy release guards");
+    assert_eq!(released.state_deep, 1);
+    assert_eq!(released.transaction_deep, 1);
+    assert!(state_level_two.get_child(3).is_none(), "unlinked from the ledger");
+    assert!(tx_level_two.get_child(3).is_none());
+    assert_eq!(detached.len(), 2, "one detached subtree per map");
+    assert!(
+        detached.iter().all(|node| !node.get_hash().is_zero()),
+        "detached subtrees are still alive"
+    );
+    assert_eq!(ledger.state_map().root().get_hash(), original_state_hash);
+    drop(detached);
+}

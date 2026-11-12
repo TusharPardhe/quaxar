@@ -853,3 +853,83 @@ fn migration_snapshot_load_then_adopt_and_claim() {
     let _ = std::fs::remove_dir_all(&src_path);
     let _ = std::fs::remove_dir_all(&dst_path);
 }
+
+// ─── Detached signatures ─────────────────────────────────────────────────────
+
+fn ed25519_secret(byte: u8) -> protocol::SecretKey {
+    protocol::SecretKey::from_slice(&[byte; 32]).expect("ed25519 secret")
+}
+
+fn ed25519_public(secret: &protocol::SecretKey) -> protocol::PublicKey {
+    protocol::derive_public_key(protocol::KeyType::Ed25519, secret).expect("public")
+}
+
+fn signed_snapshot(dir: &std::path::Path, name: &str, n_state: u64) -> std::path::PathBuf {
+    let snap_path = dir.join(name);
+    let src = make_backend(name);
+    let l = ledger(src.as_ref(), n_state, 4);
+    export_snapshot(src.as_ref(), &l.manifest, &snap_path).expect("export");
+    snap_path
+}
+
+#[test]
+fn signed_snapshot_verifies_with_the_trusted_key_and_matches_the_header() {
+    use crate::snapshot::signature::{read_identity, sign_file, verify_file};
+    let dir = tempfile::tempdir().unwrap();
+    let snap = signed_snapshot(dir.path(), "sig-ok.xrpls", 60);
+    let secret = ed25519_secret(7);
+    let sig_path = sign_file(&snap, &secret).expect("sign");
+    assert!(sig_path.to_string_lossy().ends_with("sig-ok.xrpls.sig"));
+
+    let sig = verify_file(&snap, &[ed25519_public(&secret)]).expect("verify");
+    let identity = read_identity(&snap).unwrap();
+    assert_eq!(sig.identity, identity);
+    // The identity read from the header matches what the loader authenticates.
+    let outcome = load_snapshot(make_backend("sig-ok-dst").as_ref(), &snap).expect("load");
+    assert_eq!(outcome.manifest.ledger_seq, identity.ledger_seq);
+    assert_eq!(outcome.manifest.ledger_hash, identity.ledger_hash);
+}
+
+#[test]
+fn snapshot_signature_rejects_untrusted_key_tampering_and_moved_sig() {
+    use crate::snapshot::signature::{
+        SignatureError, sign_file, signature_path, verify_file,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let snap = signed_snapshot(dir.path(), "sig-a.xrpls", 60);
+    let secret = ed25519_secret(7);
+    sign_file(&snap, &secret).expect("sign");
+
+    // A valid signature by a key the operator did not list.
+    assert!(matches!(
+        verify_file(&snap, &[ed25519_public(&ed25519_secret(8))]),
+        Err(SignatureError::UntrustedKey(_))
+    ));
+
+    // The .sig of one snapshot does not cover another snapshot.
+    let other = signed_snapshot(dir.path(), "sig-b.xrpls", 61);
+    std::fs::copy(signature_path(&snap), signature_path(&other)).unwrap();
+    assert!(matches!(
+        verify_file(&other, &[ed25519_public(&secret)]),
+        Err(SignatureError::IdentityMismatch(_))
+    ));
+
+    // Editing the signed fields breaks the signature.
+    let sig_text = std::fs::read_to_string(signature_path(&snap)).unwrap();
+    let mut value: protocol::serde_json::Value = protocol::serde_json::from_str(&sig_text).unwrap();
+    let mut bad = hex::decode(value["signature"].as_str().unwrap()).unwrap();
+    bad[10] ^= 1;
+    value["signature"] = protocol::serde_json::Value::String(hex::encode_upper(bad));
+    std::fs::write(signature_path(&snap), value.to_string()).unwrap();
+    assert!(matches!(
+        verify_file(&snap, &[ed25519_public(&secret)]),
+        Err(SignatureError::BadSignature)
+    ));
+
+    // No .sig at all.
+    std::fs::remove_file(signature_path(&snap)).unwrap();
+    assert!(matches!(
+        verify_file(&snap, &[ed25519_public(&secret)]),
+        Err(SignatureError::Missing(_))
+    ));
+}
