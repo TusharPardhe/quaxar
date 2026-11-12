@@ -3145,7 +3145,24 @@ fn install_trusted_first_manifest_provider(root: &crate::ApplicationRoot) {
                     let manifest = crate::state::manifest::deserialize_manifest(&serialized)?;
                     Some((validators.listed(manifest.master_key), serialized))
                 });
-            let list = trusted_first_manifest_payloads(entries, manifest_limits)
+            let payloads = trusted_first_manifest_payloads(entries, manifest_limits);
+            // Whether our own manifest goes to the new peer: VHS and explorers
+            // learn a validator's manifest (and so its domain) only from peers
+            // that received it.
+            let includes_own = validators.local_public_key().is_some_and(|own| {
+                payloads.iter().any(|serialized| {
+                    crate::state::manifest::deserialize_manifest(serialized)
+                        .is_some_and(|manifest| manifest.master_key == own)
+                })
+            });
+            tracing::info!(
+                target: "overlay",
+                event = "manifests_sent",
+                total = payloads.len(),
+                includes_own,
+                "sending manifests to a newly connected peer"
+            );
+            let list = payloads
                 .into_iter()
                 .map(|stobject| overlay::message::wire::TmManifest { stobject })
                 .collect::<Vec<_>>();
