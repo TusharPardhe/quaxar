@@ -9,6 +9,14 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Added
 
+- `[debug_logfile]` is honoured, as in rippled: the node log goes to that
+  file (relative paths are relative to the config directory), written by a
+  `quaxar-log-writer` thread through a bounded queue (lines are dropped and
+  counted, never blocking), rotated at 256 MB keeping 8 files. Without the
+  section the node logs to stdout as before.
+- Slow-turn host pressure: `strand_turn_slow` carries `host=` with the major
+  page faults and PSI stall milliseconds (memory, io, cpu) during the turn;
+  `strand_step_slow` carries `majflt`.
 - Signed snapshots: `snapshot-keygen`, `sign-snapshot`, and `load-snapshot
   --trusted-key/--require-signature/--check-ledger`. Detached `<file>.sig`
   (Ed25519); the snapshot format is unchanged.
