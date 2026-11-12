@@ -1780,8 +1780,16 @@ impl OverlayImpl {
             .expect("manifest message provider lock")
             .as_ref()
             .map(Arc::clone);
-        if let Some(message) = provider.and_then(|provider| provider()) {
-            peer.send(Message::new(message, None));
+        let has_provider = provider.is_some();
+        match provider.and_then(|provider| provider()) {
+            Some(message) => peer.send(Message::new(message, None)),
+            None => tracing::info!(
+                target: "overlay",
+                event = "manifests_not_sent",
+                peer_id = %peer.id(),
+                has_provider,
+                "no manifests to send to the new peer"
+            ),
         }
     }
 
