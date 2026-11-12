@@ -550,6 +550,19 @@ impl SyncTree {
     /// - `self.backed` must be true (reads after release go to the node store).
     /// - All "full below" nodes must already be persisted to the node store.
     pub fn spill_full_below_subtrees(&self, generation: u32) -> usize {
+        let mut detached = Vec::new();
+        let released = self.detach_full_below_subtrees(generation, &mut detached);
+        drop(detached);
+        released
+    }
+
+    /// `spill_full_below_subtrees`, but the released children are moved into
+    /// `out` so the caller can drop them on another thread.
+    pub fn detach_full_below_subtrees(
+        &self,
+        generation: u32,
+        out: &mut Vec<SharedIntrusive<SHAMapTreeNode>>,
+    ) -> usize {
         if !self.backed {
             return 0;
         }
@@ -597,7 +610,7 @@ impl SyncTree {
         // to_release is already in a reasonable order but we reverse
         // for safety).
         for node in to_release.iter().rev() {
-            node.release_loaded_children();
+            node.take_loaded_children(out);
         }
 
         if released > 0 {
@@ -627,6 +640,19 @@ impl SyncTree {
     /// - `self.backed` must be true (reads after release go to the node store).
     /// - Nodes must already be persisted to the node store before calling this.
     pub fn release_deep_children(&self, keep_depth: usize) -> usize {
+        let mut detached = Vec::new();
+        let released = self.detach_deep_children(keep_depth, &mut detached);
+        drop(detached);
+        released
+    }
+
+    /// `release_deep_children`, but the released children are moved into
+    /// `out` so the caller can drop them on another thread.
+    pub fn detach_deep_children(
+        &self,
+        keep_depth: usize,
+        out: &mut Vec<SharedIntrusive<SHAMapTreeNode>>,
+    ) -> usize {
         if !self.backed {
             return 0;
         }
@@ -646,7 +672,7 @@ impl SyncTree {
             if depth >= keep_depth {
                 // Release this node's children — they can be re-fetched from the node store.
                 if node.has_any_loaded_child() {
-                    node.release_loaded_children();
+                    node.take_loaded_children(out);
                     released += 1;
                 }
                 // Don't descend further — children are now released.

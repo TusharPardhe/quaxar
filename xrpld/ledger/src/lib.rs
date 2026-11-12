@@ -543,6 +543,12 @@ pub struct DurableMapReleaseStats {
     pub transaction_deep: usize,
 }
 
+/// SHAMap subtrees detached from a durable ledger but not yet dropped. Drop
+/// it on a background thread: freeing millions of nodes can take seconds.
+pub type DetachedGraphs = Vec<
+    basics::memory::intrusive_pointer::SharedIntrusive<shamap::nodes::tree_node::SHAMapTreeNode>,
+>;
+
 impl DurableMapReleaseStats {
     pub const fn total(self) -> usize {
         self.state_full_below
@@ -1190,6 +1196,21 @@ impl Ledger {
         full_below_generation: Option<u32>,
         keep_depth: usize,
     ) -> Option<DurableMapReleaseStats> {
+        let mut detached = DetachedGraphs::new();
+        let released =
+            self.detach_durable_map_graphs(full_below_generation, keep_depth, &mut detached);
+        drop(detached);
+        released
+    }
+
+    /// `release_durable_map_graphs`, but the released subtrees are moved into
+    /// `out` instead of being dropped here. Same guards.
+    pub fn detach_durable_map_graphs(
+        &self,
+        full_below_generation: Option<u32>,
+        keep_depth: usize,
+        out: &mut DetachedGraphs,
+    ) -> Option<DurableMapReleaseStats> {
         if !self.is_immutable()
             || !self.has_node_fetcher()
             || !self.state_map.backed()
@@ -1202,11 +1223,14 @@ impl Ledger {
 
         let mut released = DurableMapReleaseStats::default();
         if let Some(generation) = full_below_generation {
-            released.state_full_below = self.state_map.spill_full_below_subtrees(generation);
-            released.transaction_full_below = self.tx_map.spill_full_below_subtrees(generation);
+            released.state_full_below = self
+                .state_map
+                .detach_full_below_subtrees(generation, out);
+            released.transaction_full_below =
+                self.tx_map.detach_full_below_subtrees(generation, out);
         }
-        released.state_deep = self.state_map.release_deep_children(keep_depth);
-        released.transaction_deep = self.tx_map.release_deep_children(keep_depth);
+        released.state_deep = self.state_map.detach_deep_children(keep_depth, out);
+        released.transaction_deep = self.tx_map.detach_deep_children(keep_depth, out);
         Some(released)
     }
 

@@ -847,7 +847,20 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
             return;
         }
 
+        let update_start = std::time::Instant::now();
         self.update_our_positions(adaptor);
+        let update_elapsed = update_start.elapsed();
+        if update_elapsed >= std::time::Duration::from_millis(100) {
+            // The dispute walk and position update run on the consensus
+            // thread; a slow one delays the round.
+            tracing::info!(
+                target: "consensus",
+                event = "update_positions_slow",
+                elapsed_ms = update_elapsed.as_millis() as u64,
+                disputes = self.result.as_ref().map_or(0, |result| result.disputes.len()),
+                "update_our_positions was slow"
+            );
+        }
 
         if self.should_pause(adaptor) || !self.have_consensus(adaptor) {
             return;

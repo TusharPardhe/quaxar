@@ -784,6 +784,9 @@ impl Backend for FjallBackend {
             ("fjall_live_mb", live / (1024 * 1024)),
             ("fjall_disk_mb", open.nodes.disk_space() / (1024 * 1024)),
             ("fjall_recommended_base_mb", recommended_base_mb(live)),
+            // Memory fjall holds: its block cache in use and its memtables.
+            ("fjall_cache_bytes", open.db.cache_size()),
+            ("fjall_write_buffer_bytes", open.db.write_buffer_size()),
         ];
         if let Some(base) = effective_base_bytes(&open.nodes) {
             counters.push(("fjall_effective_base_mb", base / (1024 * 1024)));
@@ -1138,6 +1141,8 @@ mod tests {
         assert_eq!(counters.get("fjall_effective_base_mb"), Some(&16));
         assert_eq!(counters.get("fjall_base_undersized"), Some(&0));
         assert!(counters.contains_key("fjall_live_mb"));
+        assert!(counters.contains_key("fjall_cache_bytes"));
+        assert!(counters.contains_key("fjall_write_buffer_bytes"));
         assert!(counters.contains_key("fjall_l0_tables"));
         let _ = backend.close();
         let _ = std::fs::remove_dir_all(&path);

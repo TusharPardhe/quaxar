@@ -236,8 +236,122 @@ pub fn get_counts_json<S: GetCountsSource>(source: &S, min_count: u32) -> JsonVa
     }
 
     source.add_node_store_counts(&mut result);
+    let memory = memory_section(&result, read_process_rss());
+    result.insert("memory".to_owned(), memory);
 
     JsonValue::Object(result)
+}
+
+/// Resident memory as the kernel reports it (`/proc/self/status`), in bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcessRss {
+    pub rss: u64,
+    pub anon: u64,
+    pub file: u64,
+}
+
+/// Read VmRSS, RssAnon and RssFile from `/proc/self/status` (Linux only).
+pub fn read_process_rss() -> Option<ProcessRss> {
+    parse_proc_status(&std::fs::read_to_string("/proc/self/status").ok()?)
+}
+
+fn parse_proc_status(status: &str) -> Option<ProcessRss> {
+    let field = |name: &str| {
+        status.lines().find_map(|line| {
+            let rest = line.strip_prefix(name)?.strip_prefix(':')?;
+            let kb = rest.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()?;
+            Some(kb * 1024)
+        })
+    };
+    Some(ProcessRss {
+        rss: field("VmRSS")?,
+        anon: field("RssAnon").unwrap_or(0),
+        file: field("RssFile").unwrap_or(0),
+    })
+}
+
+/// Memory components with a known size, as (name in `memory`, counter it
+/// comes from). Each is memory quaxar itself accounts for.
+const CHARGED_COMPONENTS: [(&str, &str); 4] = [
+    ("shamap_nodes", "shamap_structural_bytes"),
+    ("shamap_items", "shamap_allocated_item_bytes"),
+    ("fjall_cache", "fjall_cache_bytes"),
+    ("fjall_memtables", "fjall_write_buffer_bytes"),
+];
+
+fn counter(counts: &BTreeMap<String, JsonValue>, key: &str) -> Option<u64> {
+    match counts.get(key)? {
+        JsonValue::Unsigned(v) => Some(*v),
+        JsonValue::Signed(v) => u64::try_from(*v).ok(),
+        JsonValue::String(v) => v.parse().ok(),
+        _ => None,
+    }
+}
+
+/// The `memory` section: each layer from what quaxar accounts for up to what
+/// the kernel counts, and the gaps between them.
+///
+/// ```text
+/// charged  <=  jemalloc allocated  <=  jemalloc resident  ~  process RSS
+///   gap: untracked_bytes   gap: allocator_overhead   gap: rss_minus_resident
+/// ```
+///
+/// IMPORTANT: `untracked_bytes` is memory in use that no counter explains
+/// (other caches, per-entry overhead, queues). If it grows, look for an
+/// unaccounted structure; if `allocator_overhead_bytes` grows instead, it is
+/// fragmentation or pages not yet returned to the OS.
+pub fn memory_section(
+    counts: &BTreeMap<String, JsonValue>,
+    rss: Option<ProcessRss>,
+) -> JsonValue {
+    let mut memory = BTreeMap::new();
+    let mut components = BTreeMap::new();
+    let mut charged = 0u64;
+    for (name, key) in CHARGED_COMPONENTS {
+        if let Some(bytes) = counter(counts, key) {
+            charged += bytes;
+            components.insert(name.to_owned(), JsonValue::Unsigned(bytes));
+        }
+    }
+    memory.insert("charged_bytes".to_owned(), JsonValue::Unsigned(charged));
+    memory.insert("charged".to_owned(), JsonValue::Object(components));
+
+    let allocated = counter(counts, "jemalloc_allocated_bytes");
+    let resident = counter(counts, "jemalloc_resident_bytes");
+    if let Some(allocated) = allocated {
+        memory.insert("allocated_bytes".to_owned(), JsonValue::Unsigned(allocated));
+        memory.insert(
+            "untracked_bytes".to_owned(),
+            JsonValue::Signed(allocated as i64 - charged as i64),
+        );
+        if charged > 0 {
+            memory.insert(
+                "allocated_per_charged".to_owned(),
+                JsonValue::String(format!("{:.2}", allocated as f64 / charged as f64)),
+            );
+        }
+    }
+    if let Some(resident) = resident {
+        memory.insert("resident_bytes".to_owned(), JsonValue::Unsigned(resident));
+        if let Some(allocated) = allocated {
+            memory.insert(
+                "allocator_overhead_bytes".to_owned(),
+                JsonValue::Signed(resident as i64 - allocated as i64),
+            );
+        }
+    }
+    if let Some(rss) = rss {
+        memory.insert("rss_bytes".to_owned(), JsonValue::Unsigned(rss.rss));
+        memory.insert("rss_anon_bytes".to_owned(), JsonValue::Unsigned(rss.anon));
+        memory.insert("rss_file_bytes".to_owned(), JsonValue::Unsigned(rss.file));
+        if let Some(resident) = resident {
+            memory.insert(
+                "rss_minus_resident_bytes".to_owned(),
+                JsonValue::Signed(rss.rss as i64 - resident as i64),
+            );
+        }
+    }
+    JsonValue::Object(memory)
 }
 
 pub fn do_get_counts<S: GetCountsSource>(params: &JsonValue, source: &S) -> JsonValue {
@@ -252,4 +366,64 @@ pub fn do_get_counts<S: GetCountsSource>(params: &JsonValue, source: &S) -> Json
         object.insert("held_tree_leaf_nodes".to_owned(), JsonValue::Unsigned(leaf));
     }
     result
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    #[test]
+    fn proc_status_rss_fields_are_parsed_in_bytes() {
+        let status = "Name:\tquaxar\nVmRSS:\t  4710000 kB\nRssAnon:\t 4600000 kB\nRssFile:\t  110000 kB\n";
+        assert_eq!(
+            parse_proc_status(status),
+            Some(ProcessRss {
+                rss: 4_710_000 * 1024,
+                anon: 4_600_000 * 1024,
+                file: 110_000 * 1024,
+            })
+        );
+        assert_eq!(parse_proc_status("Name:\tx\n"), None);
+    }
+
+    /// The layers and gaps add up: charged + untracked = allocated,
+    /// allocated + overhead = resident, resident + rss gap = RSS.
+    #[test]
+    fn memory_section_reports_each_layer_and_gap() {
+        let mut counts = BTreeMap::new();
+        for (key, value) in [
+            ("shamap_structural_bytes", 1_000u64),
+            ("shamap_allocated_item_bytes", 200),
+            ("fjall_cache_bytes", 300),
+            ("fjall_write_buffer_bytes", 100),
+            ("jemalloc_allocated_bytes", 2_400),
+            ("jemalloc_resident_bytes", 2_600),
+        ] {
+            counts.insert(key.to_owned(), JsonValue::Unsigned(value));
+        }
+        let rss = ProcessRss { rss: 2_500, anon: 2_450, file: 50 };
+        let JsonValue::Object(memory) = memory_section(&counts, Some(rss)) else {
+            panic!("memory is an object");
+        };
+        let get = |key: &str| memory.get(key).cloned();
+        assert_eq!(get("charged_bytes"), Some(JsonValue::Unsigned(1_600)));
+        assert_eq!(get("untracked_bytes"), Some(JsonValue::Signed(800)));
+        assert_eq!(get("allocated_per_charged"), Some(JsonValue::String("1.50".into())));
+        assert_eq!(get("allocator_overhead_bytes"), Some(JsonValue::Signed(200)));
+        assert_eq!(get("rss_minus_resident_bytes"), Some(JsonValue::Signed(-100)));
+        let Some(JsonValue::Object(charged)) = get("charged") else {
+            panic!("charged components");
+        };
+        assert_eq!(charged.get("fjall_cache"), Some(&JsonValue::Unsigned(300)));
+    }
+
+    #[test]
+    fn memory_section_skips_layers_without_data() {
+        let JsonValue::Object(memory) = memory_section(&BTreeMap::new(), None) else {
+            panic!("memory is an object");
+        };
+        assert_eq!(memory.get("charged_bytes"), Some(&JsonValue::Unsigned(0)));
+        assert!(!memory.contains_key("untracked_bytes"));
+        assert!(!memory.contains_key("rss_bytes"));
+    }
 }

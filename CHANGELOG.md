@@ -9,6 +9,16 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Added
 
+- Signed snapshots: `snapshot-keygen`, `sign-snapshot`, and `load-snapshot
+  --trusted-key/--require-signature/--check-ledger`. Detached `<file>.sig`
+  (Ed25519); the snapshot format is unchanged.
+- `get_counts` `memory` section: charged components (SHAMap nodes and items,
+  fjall cache and memtables), jemalloc allocated/resident, process RSS, and
+  the gaps between them (`untracked_bytes`, `allocator_overhead_bytes`,
+  `rss_minus_resident_bytes`).
+- Consensus-thread timing logs: `strand_step_slow` (a named step >= 250 ms),
+  `strand_turn_slow` (a turn's work >= 1 s, with a per-section breakdown) and
+  `update_positions_slow` (>= 100 ms).
 - fixCleanup3_6_0 registered as supported (rippled #8681).
 - `validator-keys set-domain <domain>` and `validator-keys attest-domain`,
   matching rippled's validator-keys tool: a new token whose manifest carries
@@ -25,6 +35,10 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Fixed
 
+- The resident-tree trim and acquired-graph release no longer free SHAMap
+  subtrees on the consensus thread. They detach the subtrees there and a
+  low-priority `quaxar-graph-drop` thread frees them and purges jemalloc. On
+  mainnet a trim stalled the round for 6.85 s (Nov 12 02:46 UTC).
 - Pruned fjall stores no longer keep nodes that only lived in a ledger whose
   claim was skipped. The claim worker kept only the newest validated ledger,
   so about 13% of ledgers were never claimed. Nodes created and replaced

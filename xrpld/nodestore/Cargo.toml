@@ -23,6 +23,7 @@ dashmap = "6.2.1"
 moka = { version = "=0.12.13", features = ["sync"] }
 shamap = { path = "../../xrpl/shamap" }
 fjall = "=3.1.12"
+hex = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

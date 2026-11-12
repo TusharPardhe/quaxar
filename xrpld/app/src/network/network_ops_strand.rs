@@ -532,6 +532,84 @@ impl Drop for NetworkOpsStrand {
 
 // ─── Strand thread body ──────────────────────────────────────────────────────
 
+/// A strand step at or above this is logged as `strand_step_slow`.
+const SLOW_STEP: Duration = Duration::from_millis(250);
+/// A whole strand turn at or above this is logged as `strand_turn_slow`.
+const SLOW_TURN: Duration = Duration::from_secs(1);
+
+/// Run one strand step and log it by name when it is slow. Every step here
+/// runs on the consensus thread, so a slow one delays the round.
+fn timed_step<R>(step: &'static str, f: impl FnOnce() -> R) -> R {
+    let start = Instant::now();
+    let result = f();
+    let elapsed = start.elapsed();
+    if elapsed >= SLOW_STEP {
+        tracing::info!(
+            target: "consensus",
+            event = "strand_step_slow",
+            step,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow step on the consensus strand"
+        );
+    }
+    result
+}
+
+/// Logs `strand_turn_slow` when a strand turn's work (not its idle wait)
+/// takes at least [`SLOW_TURN`]. A guard, so turns that `continue` count too.
+/// `mark(section)` records where each section of the turn starts, so a slow
+/// turn's log line says which section the time went to.
+struct TurnTimer {
+    start: Instant,
+    marks: Vec<(&'static str, Instant)>,
+}
+
+impl TurnTimer {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            marks: Vec::with_capacity(10),
+        }
+    }
+
+    fn mark(&mut self, section: &'static str) {
+        self.marks.push((section, Instant::now()));
+    }
+
+    /// "section=ms" for every section that took at least 50 ms.
+    fn breakdown(&self, end: Instant) -> String {
+        let mut out = String::new();
+        let mut previous = ("start", self.start);
+        for &(section, at) in self.marks.iter().chain(std::iter::once(&("end", end))) {
+            let ms = at.duration_since(previous.1).as_millis();
+            if ms >= 50 {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(&format!("{}={ms}", previous.0));
+            }
+            previous = (section, at);
+        }
+        out
+    }
+}
+
+impl Drop for TurnTimer {
+    fn drop(&mut self) {
+        let end = Instant::now();
+        let elapsed = end.duration_since(self.start);
+        if elapsed >= SLOW_TURN {
+            tracing::info!(
+                target: "consensus",
+                event = "strand_turn_slow",
+                elapsed_ms = elapsed.as_millis() as u64,
+                sections_ms = %self.breakdown(end),
+                "slow turn on the consensus strand"
+            );
+        }
+    }
+}
+
 fn strand_loop(
     deps: NetworkOpsStrandDeps,
     stop: Arc<AtomicBool>,
@@ -650,6 +728,8 @@ fn strand_loop(
     // MAIN STRAND LOOP — matches rippled's NetworkOPs::heartbeatTimer
     // ═══════════════════════════════════════════════════════════════════════
     while !stop.load(Ordering::Acquire) {
+        let mut turn = TurnTimer::new();
+        turn.mark("pre_commands");
         // Retry retained accept work before doing any fallback that could
         // start a new round. A full command queue delays acceptance but never
         // permits the accepted-phase recovery path to bypass it.
@@ -688,7 +768,9 @@ fn strand_loop(
             }
         }
         if root.network_ops_operating_mode() == NetworkOpsOperatingMode::Full {
-            trim_resident_ledger_tree(&root, &mut last_resident_trim_seq);
+            timed_step("resident_tree_trim", || {
+                trim_resident_ledger_tree(&root, &mut last_resident_trim_seq)
+            });
         }
         if caught_up && !deferred_graph_releases.is_empty() {
             tracing::info!(
@@ -698,13 +780,17 @@ fn strand_loop(
                 "releasing acquired SHAMap graphs retained while catching up"
             );
             for (handoff, session, ledger) in deferred_graph_releases.drain(..) {
-                release_processed_durable_graphs(&root, handoff, session, &ledger);
+                timed_step("acquired_graph_release", || {
+                    release_processed_durable_graphs(&root, handoff, session, &ledger)
+                });
             }
         }
         for (handoff, session) in shared_inbound.take_processed_coordinator_durable_acks() {
             if let Some(ledger) = pending_durable_graphs.take_processed(handoff, session) {
                 if caught_up {
-                    release_processed_durable_graphs(&root, handoff, session, &ledger);
+                    timed_step("acquired_graph_release", || {
+                    release_processed_durable_graphs(&root, handoff, session, &ledger)
+                });
                 } else {
                     deferred_graph_releases.push((handoff, session, ledger));
                 }
@@ -726,6 +812,7 @@ fn strand_loop(
             pending_durable_acks.pop_front();
         }
 
+        turn.mark("commands");
         // ─── 1. Process serialized commands ──────────────────────────────
         // Worker jobs and external callers can enqueue commands, but only this
         // thread owns `runner`, so timer, accept, proposal, and round changes
@@ -755,7 +842,7 @@ fn strand_loop(
                         proposal.suppression,
                         prop,
                     );
-                    if runner.peer_proposal(now, &peer_pos)
+                    if timed_step("peer_proposal", || runner.peer_proposal(now, &peer_pos))
                         && let Some(overlay_runtime) = root.overlay_runtime()
                     {
                         overlay_runtime.overlay().relay_proposal(
@@ -775,7 +862,7 @@ fn strand_loop(
                         set.backed(),
                         0,
                     );
-                    runner.got_tx_set(now, tx_set);
+                    timed_step("got_tx_set", || runner.got_tx_set(now, tx_set));
                     announce_completed_tx_set(&root, hash);
                     consensus_rt.update_phase(runner.phase());
                     tracing::debug!(target: "consensus", %hash, "strand: got_tx_set processed");
@@ -783,7 +870,7 @@ fn strand_loop(
                 ConsensusCommand::Heartbeat => {
                     scheduler.heartbeat_consumed();
                     let now = root.shared_time_keeper().close_time();
-                    if let Some(work) = runner.timer_tick(now)
+                    if let Some(work) = timed_step("timer_tick", || runner.timer_tick(now))
                         && !scheduler.schedule_accept(work)
                     {
                         // A second accept result cannot normally occur before
@@ -802,7 +889,7 @@ fn strand_loop(
                     // drain another command, proposal, tx-set, completion, or
                     // coordinator event, matching rippled's JtAccept closure.
                     let now = root.shared_time_keeper().close_time();
-                    runner.execute_accept(now, *work);
+                    timed_step("execute_accept", || runner.execute_accept(now, *work));
                     scheduler.accept_consumed();
                     consensus_rt.update_phase(runner.phase());
                     consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
@@ -842,7 +929,9 @@ fn strand_loop(
                     if let Some(inbound_tx) = root.inbound_transactions().lock().ok().as_mut() {
                         inbound_tx.new_round(prev_ledger.seq());
                     }
-                    runner.start_round(now, network_closed, prev_ledger, true);
+                    timed_step("start_round", || {
+                        runner.start_round(now, network_closed, prev_ledger, true)
+                    });
                     consensus_rt.update_phase(runner.phase());
                     consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
                     consensus_started = true;
@@ -869,6 +958,7 @@ fn strand_loop(
         // completion handling. Preserve that adjacency on the strand after
         // the owner receives accepted work.
         if !accepted_work_executed {
+            turn.mark("peer_availability");
             // ─── 1b. Peer availability → coordinator owner, or legacy mode demotion
             // (matching rippled processHeartbeatTimer). The coordinator receives
             // the actual active-peer identity snapshot whenever one is usable;
@@ -1020,6 +1110,7 @@ fn strand_loop(
                 return;
             }
 
+            turn.mark("heartbeat_schedule");
             // ─── 2. Schedule the 1s heartbeat after older overflow ingress ──
             // `JtNetopTimer` has the reference priority/limit. The job only
             // hands off a command; `timer_tick` remains serialized on this strand.
@@ -1027,6 +1118,7 @@ fn strand_loop(
                 let _ = scheduler.schedule_heartbeat();
             }
 
+            turn.mark("inbound_completion");
             // ─── 5. Persist inbound completion before LCL reconciliation ────
             // ─── 6a. legacy completion recovery — registry is authoritative ──
             // Coordinator durable handoffs have their own acknowledged channel
@@ -1064,6 +1156,7 @@ fn strand_loop(
                 }
             }
 
+            turn.mark("durable_handoff");
             // ─── 6b. completion wakeups / coordinator durable handoff ────────
             // Registry polling above is the only persistence/checkAccept/ack owner
             // for legacy sessions; those bounded receivers merely wake this turn
@@ -1124,6 +1217,7 @@ fn strand_loop(
                 }
             }
 
+            turn.mark("consensus_acquire");
             // ─── 6c. pending_consensus_ledger → acquire_async ────────────────
             if let Some(lm_rt) = root.ledger_master_runtime() {
                 let pending = lm_rt.take_pending_consensus_ledger();
@@ -1141,6 +1235,7 @@ fn strand_loop(
             }
         }
 
+        turn.mark("end_consensus");
         // ─── 7. endConsensus/checkLastClosedLedger → beginConsensus ────
         // Capture the phase before reconciliation can begin a WrongLedger or
         // replacement round. This is the sole endConsensus cadence token for
@@ -1334,6 +1429,7 @@ fn strand_loop(
         }
 
         // ─── 8. Wait for next event (proposal notify or 50ms timeout) ─────
+        drop(turn);
         if !coordinator_work_remains {
             root.wait_consensus_or_timeout(Duration::from_millis(50));
         }
@@ -2905,17 +3001,36 @@ fn trim_resident_ledger_tree(root: &ApplicationRoot, last_trim_seq: &mut u32) {
     let generation = root
         .node_family_full_below_cache()
         .map(|cache| cache.generation());
-    match ledger.release_durable_map_graphs(generation, 2) {
-        Some(released) => tracing::info!(
-            target: "ledger",
-            event = "resident_tree_trimmed",
-            ledger_seq = target_seq,
-            validated_seq = validated,
-            state_full_below = released.state_full_below,
-            state_deep = released.state_deep,
-            transaction_deep = released.transaction_deep,
-            "released deep SHAMap children of the validated lineage"
-        ),
+    // Only detach here (walk + move child links out); the freeing runs on the
+    // background dropper so the consensus thread never waits for it.
+    let detach_start = std::time::Instant::now();
+    let mut detached = ledger::DetachedGraphs::new();
+    match ledger.detach_durable_map_graphs(generation, 2, &mut detached) {
+        Some(released) => {
+            let detach_ms = detach_start.elapsed().as_millis() as u64;
+            let subtrees = detached.len();
+            let handoff = crate::network::background_dropper::BackgroundDropper::global().submit(
+                crate::network::background_dropper::DropJob {
+                    label: "resident_tree_trim",
+                    items: subtrees,
+                    value: Box::new(detached),
+                    purge: true,
+                },
+            );
+            tracing::info!(
+                target: "ledger",
+                event = "resident_tree_trimmed",
+                ledger_seq = target_seq,
+                validated_seq = validated,
+                state_full_below = released.state_full_below,
+                state_deep = released.state_deep,
+                transaction_deep = released.transaction_deep,
+                subtrees,
+                detach_ms,
+                handoff = ?handoff,
+                "released deep SHAMap children of the validated lineage"
+            );
+        }
         None => tracing::debug!(
             target: "ledger",
             event = "resident_tree_trim_skipped",
@@ -2936,7 +3051,22 @@ fn release_processed_durable_graphs(
     let generation = root
         .node_family_full_below_cache()
         .map(|cache| cache.generation());
-    let graph_release = durable_ledger.release_durable_map_graphs(generation, 2);
+    // Detach on the strand, free on the background dropper (as the trim).
+    let detach_start = std::time::Instant::now();
+    let mut detached = ledger::DetachedGraphs::new();
+    let graph_release = durable_ledger.detach_durable_map_graphs(generation, 2, &mut detached);
+    let detach_ms = detach_start.elapsed().as_millis() as u64;
+    if !detached.is_empty() {
+        let items = detached.len();
+        crate::network::background_dropper::BackgroundDropper::global().submit(
+            crate::network::background_dropper::DropJob {
+                label: "acquired_graph_release",
+                items,
+                value: Box::new(detached),
+                purge: false,
+            },
+        );
+    }
     if let Some(released) = graph_release {
         tracing::info!(
             target: "acquisition_trace",
@@ -2950,6 +3080,7 @@ fn release_processed_durable_graphs(
             transaction_full_below = released.transaction_full_below,
             transaction_deep = released.transaction_deep,
             released_total = released.total(),
+            detach_ms,
             durable_release_count = crate::ledger::inbound_ledgers::durable_release_count(),
             "released durable acquired SHAMap child graphs after coordinator acknowledgement"
         );
@@ -5173,5 +5304,21 @@ mod tests {
                 .get_cached_ledger_by_hash(older.header().hash)
                 .is_some_and(|ledger| ledger.header().hash == older.header().hash)
         );
+    }
+
+    /// A slow strand turn names the section the time went to, and leaves out
+    /// sections under 50 ms.
+    #[test]
+    fn turn_timer_breakdown_names_the_slow_section() {
+        let start = Instant::now();
+        let mut turn = super::TurnTimer {
+            start,
+            marks: Vec::new(),
+        };
+        turn.marks.push(("commands", start + Duration::from_millis(10)));
+        turn.marks.push(("end_consensus", start + Duration::from_millis(30)));
+        let end = start + Duration::from_millis(1_530);
+        assert_eq!(turn.breakdown(end), "end_consensus=1500");
+        std::mem::forget(turn);
     }
 }
