@@ -6980,10 +6980,28 @@ impl ApplicationRoot {
             }
             // rippled 54cfdda00b: trusted manifests are never dropped;
             // max_trusted_count only sizes the largest accepted message.
+            let trusted_count = trusted.len();
             trusted.extend(
                 untrusted
                     .into_iter()
                     .take(manifest_limits.max_untrusted_count),
+            );
+            // Show whether our own manifest goes to the new peer: VHS and
+            // explorers learn a validator's manifest (and so its domain) only
+            // from peers that relay it.
+            let own = validators.local_public_key().filter(|own| {
+                trusted.iter().any(|serialized| {
+                    crate::state::manifest::deserialize_manifest(serialized)
+                        .is_some_and(|manifest| manifest.master_key == *own)
+                })
+            });
+            tracing::info!(
+                target: "overlay",
+                event = "manifests_sent",
+                total = trusted.len(),
+                trusted = trusted_count,
+                includes_own = own.is_some(),
+                "sending manifests to a newly connected peer"
             );
             let list = trusted
                 .into_iter()

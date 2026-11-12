@@ -1135,25 +1135,38 @@ impl<V: AppServerInfoView> AccountLinesSource for ApplicationServerInfo<V> {
     }
 }
 
+impl<V: AppServerInfoView> ApplicationServerInfo<V> {
+    /// The validator manifest cache (rippled `getValidatorManifests()`).
+    fn validator_manifests(&self) -> Option<&std::sync::Arc<app::state::manifest::ManifestCache>> {
+        self.view.app().map(|app| app.manifest_cache())
+    }
+}
+
+/// rippled `doManifest`: every lookup goes to `getValidatorManifests()`.
 impl<V: AppServerInfoView> ManifestSource for ApplicationServerInfo<V> {
-    fn get_master_key(&self, _requested: NodePublicKey) -> Option<NodePublicKey> {
-        None
+    fn get_master_key(&self, requested: NodePublicKey) -> Option<NodePublicKey> {
+        let pk = protocol::PublicKey::from_bytes(requested);
+        Some(self.validator_manifests()?.get_master_key(&pk).to_bytes())
     }
 
-    fn get_signing_key(&self, _master_key: NodePublicKey) -> Option<NodePublicKey> {
-        None
+    fn get_signing_key(&self, master_key: NodePublicKey) -> Option<NodePublicKey> {
+        let pk = protocol::PublicKey::from_bytes(master_key);
+        Some(self.validator_manifests()?.get_signing_key(&pk).to_bytes())
     }
 
-    fn get_manifest_blob(&self, _master_key: NodePublicKey) -> Option<Vec<u8>> {
-        None
+    fn get_manifest_blob(&self, master_key: NodePublicKey) -> Option<Vec<u8>> {
+        self.validator_manifests()?
+            .get_manifest(&protocol::PublicKey::from_bytes(master_key))
     }
 
-    fn get_manifest_sequence(&self, _master_key: NodePublicKey) -> Option<u32> {
-        None
+    fn get_manifest_sequence(&self, master_key: NodePublicKey) -> Option<u32> {
+        self.validator_manifests()?
+            .get_sequence(&protocol::PublicKey::from_bytes(master_key))
     }
 
-    fn get_manifest_domain(&self, _master_key: NodePublicKey) -> Option<String> {
-        None
+    fn get_manifest_domain(&self, master_key: NodePublicKey) -> Option<String> {
+        self.validator_manifests()?
+            .get_domain(&protocol::PublicKey::from_bytes(master_key))
     }
 }
 
@@ -2307,14 +2320,16 @@ impl<V: AppServerInfoView> crate::handlers::validator_info::ValidatorInfoSource
         let pk = protocol::PublicKey::from_bytes(validation_public_key);
         self.view.validators().master_key(pk).to_bytes()
     }
-    fn get_manifest_blob(&self, _master_key: protocol::NodePublicKey) -> Option<Vec<u8>> {
-        None
+    // rippled doValidatorInfo: manifest, seq and domain from
+    // getValidatorManifests().
+    fn get_manifest_blob(&self, master_key: protocol::NodePublicKey) -> Option<Vec<u8>> {
+        ManifestSource::get_manifest_blob(self, master_key)
     }
-    fn get_manifest_sequence(&self, _master_key: protocol::NodePublicKey) -> Option<u32> {
-        None
+    fn get_manifest_sequence(&self, master_key: protocol::NodePublicKey) -> Option<u32> {
+        ManifestSource::get_manifest_sequence(self, master_key)
     }
-    fn get_manifest_domain(&self, _master_key: protocol::NodePublicKey) -> Option<String> {
-        None
+    fn get_manifest_domain(&self, master_key: protocol::NodePublicKey) -> Option<String> {
+        ManifestSource::get_manifest_domain(self, master_key)
     }
 }
 
@@ -2891,5 +2906,86 @@ impl<V: AppServerInfoView> crate::commands::black_list::BlackListSource
 
     fn black_list_json_with_threshold(&self, _threshold: i64) -> JsonValue {
         JsonValue::Object(BTreeMap::new())
+    }
+}
+
+#[cfg(test)]
+mod manifest_rpc_tests {
+    use super::ApplicationServerInfo;
+    use app::ApplicationRoot;
+    use protocol::{JsonValue, KeyType, get_field_by_symbol};
+
+    /// A signed manifest with a domain, built as the validator-keys tool does.
+    fn signed_manifest(domain: &str) -> (protocol::PublicKey, protocol::PublicKey, Vec<u8>) {
+        let master = protocol::generate_root_secret_key(KeyType::Secp256k1, &protocol::seed::random_seed())
+            .expect("master");
+        let eph = protocol::generate_root_secret_key(KeyType::Secp256k1, &protocol::seed::random_seed())
+            .expect("ephemeral");
+        let master_pk = protocol::derive_public_key(KeyType::Secp256k1, &master).expect("pk");
+        let eph_pk = protocol::derive_public_key(KeyType::Secp256k1, &eph).expect("pk");
+        let mut st = protocol::STObject::new(protocol::sf_generic());
+        st.set_field_u32(get_field_by_symbol("sfSequence"), 3);
+        st.set_field_vl(get_field_by_symbol("sfPublicKey"), master_pk.as_bytes());
+        st.set_field_vl(get_field_by_symbol("sfSigningPubKey"), eph_pk.as_bytes());
+        st.set_field_vl(get_field_by_symbol("sfDomain"), domain.as_bytes());
+        let signing = |st: &protocol::STObject| {
+            let mut s = protocol::Serializer::default();
+            s.add32_prefix(protocol::HashPrefix::Manifest);
+            st.add_without_signing_fields(&mut s);
+            s.data().to_vec()
+        };
+        let sig = protocol::sign::sign(&eph_pk, &eph, &signing(&st)).expect("sign");
+        st.set_field_vl(get_field_by_symbol("sfSignature"), &sig);
+        let msig = protocol::sign::sign(&master_pk, &master, &signing(&st)).expect("sign");
+        st.set_field_vl(get_field_by_symbol("sfMasterSignature"), &msig);
+        (master_pk, eph_pk, st.get_serializer().data().to_vec())
+    }
+
+    /// rippled doManifest / doValidatorInfo read the manifest cache. Before
+    /// this, both RPCs returned no manifest, seq or domain on mainnet.
+    #[test]
+    fn manifest_and_validator_info_report_the_cached_manifest() {
+        let mut root = ApplicationRoot::new(0).expect("root");
+        let (master, ephemeral, blob) = signed_manifest("quaxar.xyz");
+        let manifest = app::state::manifest::deserialize_manifest(&blob).expect("manifest");
+        assert_ne!(
+            root.manifest_cache().apply_manifest(manifest),
+            app::state::manifest::ManifestDisposition::Invalid
+        );
+        root.set_validation_public_key(ephemeral);
+        let source = ApplicationServerInfo::new(&root);
+
+        let mut params = std::collections::BTreeMap::new();
+        params.insert(
+            "public_key".to_owned(),
+            JsonValue::String(master.to_node_public_base58()),
+        );
+        let JsonValue::Object(result) =
+            crate::handlers::manifest::do_manifest(&JsonValue::Object(params), &source)
+        else {
+            panic!("object");
+        };
+        assert!(result.contains_key("manifest"), "{result:?}");
+        let Some(JsonValue::Object(details)) = result.get("details") else {
+            panic!("details missing: {result:?}");
+        };
+        assert_eq!(
+            details.get("ephemeral_key"),
+            Some(&JsonValue::String(ephemeral.to_node_public_base58()))
+        );
+        assert_eq!(details.get("seq"), Some(&JsonValue::Unsigned(3)));
+        assert_eq!(details.get("domain"), Some(&JsonValue::String("quaxar.xyz".into())));
+
+        let JsonValue::Object(info) = crate::handlers::validator_info::do_validator_info(&source)
+        else {
+            panic!("object");
+        };
+        assert_eq!(
+            info.get("master_key"),
+            Some(&JsonValue::String(master.to_node_public_base58()))
+        );
+        assert_eq!(info.get("seq"), Some(&JsonValue::Unsigned(3)));
+        assert_eq!(info.get("domain"), Some(&JsonValue::String("quaxar.xyz".into())));
+        assert!(info.contains_key("manifest"));
     }
 }
