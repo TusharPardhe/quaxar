@@ -43,6 +43,10 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Fixed
 
+- `[validator_token]` is read with `lines()`, as rippled ValidatorKeys does.
+  A token line ending in base64 `=` padding parsed as `key=value` and was
+  missing from `values()`, so the node refused to start ("invalid
+  [validation_seed] or [validator_token] configuration").
 - The resident-tree trim and acquired-graph release no longer free SHAMap
   subtrees on the consensus thread. They detach the subtrees there and a
   low-priority `quaxar-graph-drop` thread frees them and purges jemalloc. On

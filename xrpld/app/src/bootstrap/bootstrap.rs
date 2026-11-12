@@ -928,9 +928,8 @@ pub fn build_bootstrap_root(
     }
     // Preserve [validator_token] presence even when empty so ValidatorKeys
     // rejects malformed configured tokens rather than treating them as absent.
-    if config.exists("validator_token") {
-        let token_values = config.section("validator_token").values();
-        root.set_validator_token(token_values.to_vec());
+    if let Some(token_lines) = configured_validator_token(config) {
+        root.set_validator_token(token_lines);
         tracing::info!(target: "app", "Validator token configured");
     }
 
@@ -4642,6 +4641,15 @@ fn node_size_name(raw: &str) -> Option<&'static str> {
 
 /// Startup errors rippled raises from `Config::loadFromString` for values that
 /// quaxar otherwise reads leniently.
+/// `[validator_token]` lines, as rippled ValidatorKeys reads them
+/// (`section(...).lines()`). IMPORTANT: not `values()`: a base64 line ending
+/// in `=` padding parses as `key=value` and is missing from `values()`.
+fn configured_validator_token(config: &BasicConfig) -> Option<Vec<String>> {
+    config
+        .exists("validator_token")
+        .then(|| config.section("validator_token").lines().to_vec())
+}
+
 /// Sections rippled `Config::loadFromString` reads with `getSingleSection`.
 const RIPPLED_SINGLE_VALUE_SECTIONS: [&str; 35] = [
     "database_path",
@@ -6213,6 +6221,26 @@ mod tests {
         assert!(check(&[("compression", "1")]).is_ok());
         assert!(check(&[("ledger_replay", "yes")]).is_err());
         assert!(check(&[("beta_rpc_api", "maybe")]).is_err());
+    }
+
+    /// A token whose last base64 line ends in `=` padding must reach
+    /// ValidatorKeys whole (mainnet Nov 12: the node refused to start).
+    #[test]
+    fn padded_validator_token_lines_are_all_read() {
+        let mut config = basics::basic_config::BasicConfig::new();
+        config
+            .section_mut("validator_token")
+            .append_lines(["eyJhYmMiOiAx", "fQ=="]);
+        assert_eq!(
+            config.section("validator_token").values(),
+            ["eyJhYmMiOiAx".to_owned()],
+            "values() drops the padded line (why lines() is required)"
+        );
+        assert_eq!(
+            super::configured_validator_token(&config),
+            Some(vec!["eyJhYmMiOiAx".to_owned(), "fQ==".to_owned()])
+        );
+        assert_eq!(super::configured_validator_token(&basics::basic_config::BasicConfig::new()), None);
     }
 
     /// rippled #8669 (Config_test): a repeated single-value section fails.
