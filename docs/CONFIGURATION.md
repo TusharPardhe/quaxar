@@ -441,10 +441,25 @@ servers under the same operator's control.
 
 ### `[debug_logfile]`
 
-Compatibility placeholder accepted by the parser but omitted from packaged
-configs. The current runtime does not open this path; logs are emitted through
-`tracing` to stdout/stderr and should be collected by systemd, Docker, or the
-process supervisor.
+The node log file, as in rippled. A relative path is relative to the config
+file's directory; the directory is created if missing.
+
+```ini
+[debug_logfile]
+/var/log/quaxar/debug.log
+```
+
+- Lines are written by a `quaxar-log-writer` thread through a bounded queue,
+  so a slow disk never blocks consensus. If the queue fills, lines are dropped
+  and a `log queue full, dropped N lines` warning is written.
+- The file rotates at 256 MB: `debug.log` → `debug.log.1` … `debug.log.8`; the
+  oldest is deleted. Disk use stays under about 2.3 GB.
+- Without this section the node logs to stdout (collected by systemd, Docker,
+  or the supervisor).
+
+IMPORTANT: on a validator, prefer the log file to journald. Reading a large
+journal back (`journalctl --since …`) pulls it through the page cache and, on
+a host with little free memory, evicts pages the node needs.
 
 ### `[rpc_startup]`
 

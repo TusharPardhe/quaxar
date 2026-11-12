@@ -712,6 +712,18 @@ fn levenshtein_distance(left: &str, right: &str) -> usize {
     previous[right.len()]
 }
 
+/// `[debug_logfile]` from the config, resolved like rippled. None when the
+/// config cannot be read (bootstrap reports that error) or has no section.
+fn configured_log_file(config_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let config = load_basic_config_file(config_path).ok()?;
+    if !config.exists("debug_logfile") {
+        return None;
+    }
+    let value = config.legacy("debug_logfile").ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| log_file::resolve_path(value, config_path))
+}
+
 fn main() -> ExitCode {
     // Initialize structured logging
     // Check for CLI subcommands first (status, health, peers, etc.)
@@ -722,15 +734,63 @@ fn main() -> ExitCode {
 
     use tracing_subscriber::prelude::*;
 
+    let args: Vec<String> = std::env::args().collect();
+    let options = match parse_bootstrap_args(args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("Fatal error — shutting down: {error}");
+            return ExitCode::from(1);
+        }
+    };
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(filter);
 
-    let subscriber = tracing_subscriber::registry().with(filter_layer).with(
-        tracing_subscriber::fmt::layer()
-            .with_target(true)
-            .with_thread_ids(true),
-    );
+    // rippled `[debug_logfile]`: the node log goes to that file (rotated by
+    // size, written off-thread) instead of stdout, so journald no longer holds
+    // or replays it. Without the section, log to stdout as before.
+    let log_file = configured_log_file(&options.config_path);
+    let file_log = log_file.as_ref().and_then(|path| {
+        match log_file::FileLog::start(
+            path.clone(),
+            log_file::DEFAULT_MAX_BYTES,
+            log_file::DEFAULT_KEEP,
+        ) {
+            Ok(log) => Some(log),
+            Err(error) => {
+                eprintln!("cannot open [debug_logfile] {}: {error}; logging to stdout", path.display());
+                None
+            }
+        }
+    });
+    let (stdout_layer, file_layer) = match file_log {
+        Some(log) => {
+            eprintln!("logging to {}", log_file.as_ref().expect("path").display());
+            (
+                None,
+                Some(
+                    tracing_subscriber::fmt::layer()
+                        .with_target(true)
+                        .with_thread_ids(true)
+                        .with_ansi(false)
+                        .with_writer(log),
+                ),
+            )
+        }
+        None => (
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .with_target(true)
+                    .with_thread_ids(true),
+            ),
+            None,
+        ),
+    };
+    let subscriber = tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(stdout_layer)
+        .with(file_layer);
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber");
     // Route `log` records (fjall, lsm-tree) into tracing so storage-engine
     // warnings and worker failures reach the node log.
@@ -751,15 +811,6 @@ fn main() -> ExitCode {
     // uptime is the node process lifetime, not time since the first RPC call.
     let _ = UptimeClock::now();
     let start_time = Instant::now();
-
-    let args: Vec<String> = std::env::args().collect();
-    let options = match parse_bootstrap_args(args) {
-        Ok(options) => options,
-        Err(error) => {
-            tracing::error!(target: "main", %error, "Fatal error — shutting down");
-            return ExitCode::from(1);
-        }
-    };
 
     if !options.rpc_parameters.is_empty() {
         return run_rpc_client(options);
@@ -1662,6 +1713,7 @@ fn run_rpc_client(options: AppBootstrapOptions) -> ExitCode {
 #[path = "main/tests.rs"]
 mod tests;
 mod snapshot_trust;
+mod log_file;
 
 // ─── Snapshot CLI handlers ───────────────────────────────────────────────────
 

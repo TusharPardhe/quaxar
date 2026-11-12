@@ -70,3 +70,21 @@ grep -E 'strand_(step|turn)_slow|update_positions_slow|background_drop_done' jou
   incrementally.
 - `strand_turn_slow sections_ms=end_consensus=…` with `execute_accept` slow →
   look at ledger build / persistence (dirty-node p99 is 416 ms).
+
+## Update: the stalls line up with paging (Nov 12 evening)
+
+`sar -B` (10-minute windows) on the validator:
+
+| Event | Window | majflt/s | Window before | majflt/s |
+|---|---|---|---|---|
+| Nov 11 00:44 | 00:40–00:50 | 955.6 | 00:30–00:40 | 0.03 |
+| Nov 12 02:46 | 02:40–02:50 | 506.9 | 02:30–02:40 | 8.2 |
+| Nov 12 13:52 | 13:50–14:00 | 862.5 | 13:40–13:50 | 9.6 |
+
+IMPORTANT: on an 8 GB host the node (5.2–5.8 GB RSS) leaves little page
+cache, so the kernel evicts pages the node still uses. At 13:52 a long
+`journalctl` read during a health check added to it. Two changes follow:
+
+- the node writes `[debug_logfile]` itself (no journald read-back on the host);
+- `strand_turn_slow host=majflt=… mem_some_ms=… io_some_ms=…` proves or rules
+  out paging for each stall.

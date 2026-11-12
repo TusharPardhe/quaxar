@@ -1,4 +1,5 @@
 pub mod background_dropper;
+pub mod host_pressure;
 pub mod network_ops;
 pub mod network_ops_runtime;
 pub mod network_ops_strand;

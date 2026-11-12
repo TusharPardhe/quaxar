@@ -540,7 +540,9 @@ const SLOW_TURN: Duration = Duration::from_secs(1);
 /// Run one strand step and log it by name when it is slow. Every step here
 /// runs on the consensus thread, so a slow one delays the round.
 fn timed_step<R>(step: &'static str, f: impl FnOnce() -> R) -> R {
+    use crate::network::host_pressure;
     let start = Instant::now();
+    let faults_before = host_pressure::major_faults();
     let result = f();
     let elapsed = start.elapsed();
     if elapsed >= SLOW_STEP {
@@ -549,6 +551,7 @@ fn timed_step<R>(step: &'static str, f: impl FnOnce() -> R) -> R {
             event = "strand_step_slow",
             step,
             elapsed_ms = elapsed.as_millis() as u64,
+            majflt = host_pressure::major_faults().saturating_sub(faults_before),
             "slow step on the consensus strand"
         );
     }
@@ -562,6 +565,8 @@ fn timed_step<R>(step: &'static str, f: impl FnOnce() -> R) -> R {
 struct TurnTimer {
     start: Instant,
     marks: Vec<(&'static str, Instant)>,
+    /// Host pressure at the turn's start; compared at the end of a slow turn.
+    pressure: Option<crate::network::host_pressure::PressureSample>,
 }
 
 impl TurnTimer {
@@ -569,6 +574,7 @@ impl TurnTimer {
         Self {
             start: Instant::now(),
             marks: Vec::with_capacity(10),
+            pressure: Some(crate::network::host_pressure::sample()),
         }
     }
 
@@ -604,6 +610,12 @@ impl Drop for TurnTimer {
                 event = "strand_turn_slow",
                 elapsed_ms = elapsed.as_millis() as u64,
                 sections_ms = %self.breakdown(end),
+                host = %self.pressure.as_ref().map_or_else(String::new, |before| {
+                    crate::network::host_pressure::describe_delta(
+                        before,
+                        &crate::network::host_pressure::sample(),
+                    )
+                }),
                 "slow turn on the consensus strand"
             );
         }
@@ -5314,6 +5326,7 @@ mod tests {
         let mut turn = super::TurnTimer {
             start,
             marks: Vec::new(),
+            pressure: None,
         };
         turn.marks.push(("commands", start + Duration::from_millis(10)));
         turn.marks.push(("end_consensus", start + Duration::from_millis(30)));
