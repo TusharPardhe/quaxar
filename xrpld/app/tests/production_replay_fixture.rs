@@ -312,6 +312,36 @@ fn sparse_mainnet_108184801_amm_withdraw_issuer_is_reserve_checked() {
     ));
 }
 
+/// Mainnet fork at 108328631 (2026-11-14): a Batch's inner self-payment
+/// (7EFCDA7C...) routes BTC -> xOracleGG -> XRP through the near-empty AMM
+/// rGKeSkN5 (2 drops after its first slice) and a 0.001 CLOB offer. rippled
+/// `changeSpotPriceQuality` rounds takerGets down to 0 drops, returns that
+/// zero-output offer (quality rate 0 passes the target check) and
+/// `AMMLiquidity::getOffer` drops it, so the next slice goes to the CLOB
+/// offer. quaxar treated the zero swap as an error, fell back to `maxOffer`
+/// and took a last drop from the AMM. Trimmed to the Batch and its two inner
+/// transactions from the state just before the Batch.
+#[test]
+fn sparse_mainnet_108328631_amm_zero_output_offer_is_not_replaced_by_max_offer() {
+    run_sparse_replay(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "tests/fixtures/sparse_replay/mainnet_108328631_batch_amm_zero_output_spot_price_offer.jsonl",
+    ));
+}
+
+/// Mainnet fork at 108321532 (2026-11-14), same route, starting from a pool
+/// of 7.6e-14 xOracleGG / 3,813,138 drops. The spot-price quadratic loses the
+/// `I*O/q` term to cancellation and proposes the whole pool; rippled
+/// `swapAssetOut` prices an output that empties the pool at `toMaxAmount`,
+/// so the quality check fails and `reduceOffer` retries 0.01% smaller.
+/// quaxar returned no offer, fell back to `maxOffer` (99% of the pool) and
+/// split the AMM input differently by 2.15e-11 xOracleGG (also 108321579).
+#[test]
+fn sparse_mainnet_108321532_amm_offer_that_drains_pool_is_reduced() {
+    run_sparse_replay(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "tests/fixtures/sparse_replay/mainnet_108321532_batch_amm_drained_pool_spot_price_offer.jsonl",
+    ));
+}
+
 /// Mainnet fork at 108127746 (2026-11-05): an all-or-nothing Batch
 /// (D8C5350D...) sets a 1e96 ETH trust line, then self-pays 1e96 ETH with
 /// SendMax 883 drops through CHROOPS and PLX. ETH's issuer charges 0.3%, so
