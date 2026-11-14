@@ -2003,7 +2003,28 @@ fn amm_offer_starting_with_gets(
 
     let amounts = |out_number| {
         let out = number_to_amount(pool_out.asset(), out_number, RoundingMode::Downward)?;
-        let input = amm_swap_asset_out(pool_in, pool_out, &out, trading_fee, amm_rounding_enabled)?;
+        // rippled `getAmounts` keeps a takerGets that rounds down to zero:
+        // `swapAssetOut(pool, 0)` is not an error, and `Quality{(in, 0)}` is
+        // rate 0, the best quality, so `changeSpotPriceQuality` returns the
+        // zero-output offer and `AMMLiquidity::getOffer` drops it as
+        // non-positive *without* falling back to `maxOffer` (mainnet
+        // 108328631: a 2-drop XRP pool). The input of a zero-output offer is
+        // never observed.
+        if out.signum() == 0 {
+            return Some((pool_in.zeroed(), out));
+        }
+        // rippled `swapAssetOut`: an output that would empty the pool
+        // (`pool.out - assetOut <= 0`) costs `toMaxAmount<TIn>`, so the
+        // offer's quality fails the target and `reduceOffer` retries 0.01%
+        // smaller. Near-empty pools hit this when the quadratic loses the
+        // `I*O/q` term to cancellation (mainnet 108321532/108321579). A
+        // negative swap clips to zero.
+        let input = if out >= *pool_out {
+            protocol::to_max_amount::<STAmount>(pool_in.asset())
+        } else {
+            amm_swap_asset_out(pool_in, pool_out, &out, trading_fee, amm_rounding_enabled)
+                .unwrap_or_else(|| pool_in.zeroed())
+        };
         Some((input, out))
     };
     let mut result = amounts(proposed)?;
@@ -2047,7 +2068,14 @@ fn amm_offer_starting_with_pays(
 
     let amounts = |in_number| {
         let input = number_to_amount(pool_in.asset(), in_number, RoundingMode::Downward)?;
-        let out = amm_swap_asset_in(pool_in, pool_out, &input, trading_fee, amm_rounding_enabled)?;
+        // rippled `swapAssetIn(pool, 0)` (and any swap that clips) yields a
+        // zero output rather than an error; as for takerGets above, the
+        // zero-output offer is returned and later dropped by getOffer.
+        if input.signum() == 0 {
+            return Some((input, pool_out.zeroed()));
+        }
+        let out = amm_swap_asset_in(pool_in, pool_out, &input, trading_fee, amm_rounding_enabled)
+            .unwrap_or_else(|| pool_out.zeroed());
         Some((input, out))
     };
     let mut result = amounts(proposed)?;

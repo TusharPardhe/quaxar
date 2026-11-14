@@ -43,6 +43,11 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Fixed
 
+- AMM spot-price offers on a near-empty pool match rippled
+  `changeSpotPriceQuality`: a takerGets that rounds to zero gives a dropped
+  zero-output offer, and an output that would empty the pool is priced at
+  `toMaxAmount` so `reduceOffer` retries. quaxar fell back to `maxOffer` in
+  both cases (mainnet forks 108321532, 108321579, 108328631).
 - `manifest` and `validator_info` RPCs read the validator manifest cache, as
   rippled `doManifest`/`doValidatorInfo` do; they returned no manifest, `seq`
   or `domain` before. A `manifests_sent` log line shows whether the local
