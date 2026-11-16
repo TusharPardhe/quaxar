@@ -207,14 +207,61 @@ pub fn exception_message(payload: &(dyn Any + Send)) -> String {
     }
 }
 
+thread_local! {
+    /// How many `try_catch` scopes are active on this thread.
+    static EXCEPTION_SCOPES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Decrements the scope count when a `try_catch` scope ends, unwinding or not.
+struct ExceptionScope;
+
+impl ExceptionScope {
+    fn enter() -> Self {
+        EXCEPTION_SCOPES.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for ExceptionScope {
+    fn drop(&mut self) {
+        EXCEPTION_SCOPES.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
 /// Run `f`, returning the panic payload if it unwinds (`try { f() } catch (...)`).
+///
+/// A panic inside is a C++-style exception that the caller handles, not a
+/// crash: [`in_exception_scope`] lets the process panic hook log it to the
+/// node log instead of stderr.
 pub fn try_catch<T>(f: impl FnOnce() -> T) -> Result<T, Box<dyn Any + Send>> {
+    let _scope = ExceptionScope::enter();
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+}
+
+/// True while the current thread runs inside [`try_catch`], so a panic now
+/// will be caught and handled as an exception.
+pub fn in_exception_scope() -> bool {
+    EXCEPTION_SCOPES.with(|depth| depth.get() > 0)
 }
 
 #[cfg(test)]
 mod exception_kind_tests {
     use super::*;
+
+    #[test]
+    fn exception_scope_is_set_only_inside_try_catch_and_survives_nesting() {
+        assert!(!in_exception_scope());
+        let inner = try_catch(|| {
+            assert!(in_exception_scope());
+            let nested = try_catch(|| -> () { panic!("nested exception") });
+            assert!(nested.is_err());
+            in_exception_scope()
+        })
+        .expect("outer closure returns normally");
+        assert!(inner, "still inside the outer scope after a caught nested panic");
+        assert!(try_catch(|| -> () { panic!("outer exception") }).is_err());
+        assert!(!in_exception_scope(), "scope count returns to zero after unwinding");
+    }
 
     #[test]
     fn kinds_follow_the_cpp_exception_hierarchy() {

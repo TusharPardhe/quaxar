@@ -35,6 +35,12 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Changed
 
+- A panic hook sends emulated C++ exceptions (panics caught by
+  `basics::contract::try_catch`, e.g. the `mulRatio` overflow that becomes
+  tecINTERNAL) to the node log at info (`target: exception`) instead of
+  stderr/journald. Any other panic is logged as an error and still printed to
+  stderr. Flow, AMM offer, offer crossing, invariant, transactor math and
+  manifest parsing catches use `try_catch`.
 - rippled develop sync to `58b73715c7`: receiveTimestamp is no longer sent
   (#8702); object-by-hash replies no longer echo nodeID as index (#8701); a
   repeated single-value config section fails startup (#8669); `log_level`

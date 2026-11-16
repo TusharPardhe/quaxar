@@ -5972,7 +5972,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     // owner (or authorized account) pays sfDiscountedFee.
                     ledger::amm_utils::get_trading_fee(view, &amm_sle, account)
                 };
-                let math_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let math_result = basics::contract::try_catch(|| {
                     tx::run_amm_deposit_apply_math_facts(&tx::AMMDepositApplyMathFacts {
                         amount1: amount,
                         amount2,
@@ -5985,7 +5985,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                         rules: view.rules(),
                         flags,
                     })
-                }));
+                });
                 let math = match math_result {
                     Ok(Ok(math)) => math,
                     Ok(Err(ter)) => return ter,
@@ -6203,7 +6203,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 );
                 let pool1 = amm_holds_or_return!(view, &amm_account, pool_asset1, sf("sfAmount"));
                 let pool2 = amm_holds_or_return!(view, &amm_account, pool_asset2, sf("sfAmount2"));
-                let math_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let math_result = basics::contract::try_catch(|| {
                     tx::run_amm_withdraw_apply_math_facts(&tx::AMMWithdrawApplyMathFacts {
                         amount1: amount,
                         amount2,
@@ -6217,7 +6217,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                         rules: view.rules(),
                         flags: sttx.get_flags(),
                     })
-                }));
+                });
                 let math = match math_result {
                     Ok(Ok(math)) => math,
                     Ok(Err(ter)) => return ter,

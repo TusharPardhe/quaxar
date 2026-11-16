@@ -395,7 +395,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         // ("Exception during offer crossing"); the transaction then claims
         // only its fee. Contain a panic the same way instead of letting it
         // escape as tefEXCEPTION, which would drop the transaction and fork.
-        let flow_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let flow_result = match basics::contract::try_catch(|| {
             ledger::flow_engine::strand_flow::execute_strands(
                 view,
                 &strands,
@@ -412,7 +412,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                 Some(quality_threshold),
                 Some(self_cross_cancellations.clone()),
             )
-        })) {
+        }) {
             Ok(result) => result,
             Err(panic) => {
                 let message = panic

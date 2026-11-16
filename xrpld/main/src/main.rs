@@ -712,6 +712,52 @@ fn levenshtein_distance(left: &str, right: &str) -> usize {
     previous[right.len()]
 }
 
+/// The panic payload as text (`panic!` gives `&str` or `String`).
+fn panic_message(info: &std::panic::PanicHookInfo<'_>) -> String {
+    let payload = info.payload();
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| basics::contract::exception_message(payload))
+}
+
+/// Route panics to the node log.
+///
+/// quaxar emulates C++ exceptions with panics caught by
+/// `basics::contract::try_catch` (an overflow in `mulRatio` becomes
+/// tecINTERNAL, as in rippled). Rust's default hook printed each of those to
+/// stderr, which systemd sends to journald (2,731 lines in 38 h on mainnet).
+///
+/// IMPORTANT: only panics inside a `try_catch` scope are quiet. Any other
+/// panic is a crash or a bug: it is logged as an error and still goes to
+/// stderr through the default hook, so it stays visible even if the process
+/// exits before the log writer drains.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let thread = thread.name().unwrap_or("unnamed").to_owned();
+        let location = info
+            .location()
+            .map(|location| location.to_string())
+            .unwrap_or_default();
+        let message = panic_message(info);
+        if basics::contract::in_exception_scope() {
+            tracing::info!(
+                target: "exception",
+                thread,
+                location,
+                message,
+                "exception raised (caught and handled)"
+            );
+        } else {
+            tracing::error!(target: "panic", thread, location, message, "panic");
+            default_hook(info);
+        }
+    }));
+}
+
 /// `[debug_logfile]` from the config, resolved like rippled. None when the
 /// config cannot be read (bootstrap reports that error) or has no section.
 fn configured_log_file(config_path: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -792,6 +838,7 @@ fn main() -> ExitCode {
         .with(stdout_layer)
         .with(file_layer);
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber");
+    install_panic_hook();
     // Route `log` records (fjall, lsm-tree) into tracing so storage-engine
     // warnings and worker failures reach the node log.
     let _ = tracing_log::LogTracer::init();
