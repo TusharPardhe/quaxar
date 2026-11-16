@@ -357,9 +357,9 @@ fn small_increased_quality_offer_disposition(
         matches!(taker_gets.asset(), Asset::Issue(issue) if issue.issuer() == *owner);
     let effective = if !issuer_has_unlimited_funds && owner_funds < taker_gets {
         let amounts = Amounts::new(taker_pays.clone(), taker_gets.clone());
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match basics::contract::try_catch(|| {
             offer_quality.ceil_out_strict(&amounts, owner_funds, false)
-        })) {
+        }) {
             Ok(amounts) => amounts,
             Err(payload) => return small_offer_exception_disposition(payload, mptokens_v2),
         }
@@ -2241,7 +2241,7 @@ fn get_amm_offer<V: ApplyView>(
     // catch (std::exception&) {}`: an arithmetic exception while generating
     // AMM liquidity means "no AMM offer" for this step, never a failed
     // transaction. Contain a panic the same way.
-    let generated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+    let generated = basics::contract::try_catch(
         || -> Option<SyntheticAmmOffer> {
         let max_offer = || {
             amm_max_offer_amounts(
@@ -2332,7 +2332,7 @@ fn get_amm_offer<V: ApplyView>(
             fix_reduced_offers_v2,
         })
         },
-    ));
+    );
     match generated {
         // rippled `AMMLiquidity::getOffer`: a generated offer is returned
         // only when `offer->amount().in > 0 && offer->amount().out > 0`. A

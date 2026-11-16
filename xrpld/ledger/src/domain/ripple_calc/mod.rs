@@ -269,7 +269,7 @@ pub fn ripple_calculate<V: ApplyView>(
 /// thrown exception from `flow()`: `None` means the caller must return
 /// tecINTERNAL and discard the flow sandbox.
 fn catch_flow_exception<T>(flow: impl FnOnce() -> T) -> Option<T> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(flow)) {
+    match basics::contract::try_catch(flow) {
         Ok(value) => Some(value),
         Err(panic) => {
             let message = panic

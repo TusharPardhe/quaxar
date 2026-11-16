@@ -181,7 +181,7 @@ pub(crate) fn check_invariants_for_tx_with_prefix<V: ApplyView + ?Sized>(
     let cross_currency_payment = payment_is_cross_currency(tx);
     // rippled InvariantRunner: an exception thrown while checking invariants
     // is logged and treated as an invariant failure (failInvariantCheck).
-    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let checked = basics::contract::try_catch(|| {
         check_invariants_inner(
             sandbox,
             txn_type,
@@ -200,7 +200,7 @@ pub(crate) fn check_invariants_for_tx_with_prefix<V: ApplyView + ?Sized>(
             expected_xrp_delta,
             prefix,
         )
-    }));
+    });
     match checked {
         Ok(outcome) => map_invariant_result(result, outcome),
         Err(_) => {

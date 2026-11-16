@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -567,7 +566,7 @@ where
 }
 
 fn parse_manifest_stobject(serialized: &[u8]) -> Option<STObject> {
-    catch_unwind(AssertUnwindSafe(|| {
+    basics::contract::try_catch(|| {
         let mut sit = SerialIter::new(serialized);
         let mut st = STObject::from_serial_iter(&mut sit, sf_generic(), 0);
         if !sit.empty() {
@@ -575,7 +574,7 @@ fn parse_manifest_stobject(serialized: &[u8]) -> Option<STObject> {
         }
         st.apply_template(manifest_template());
         Some(st)
-    }))
+    })
     .ok()
     .flatten()
 }
