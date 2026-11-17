@@ -15,11 +15,14 @@
 //!   later claim brought them back (count > 0) or they are pinned in
 //!   `UNCLAIMED`/`DEAD_PENDING` (the resurrection-race rules R2/R5).
 //! - `orphan_sweep` retires nodes stored but never claimed into a ledger.
+//! - The unclaimed list is kept in memory and copied to the `unclaimed`
+//!   keyspace in the same batch as each claim, sweep or prune that changes it,
+//!   so a restart reloads it instead of leaking the nodes on it.
 
 use crate::Backend;
 use crate::backends::kv::{Keyspace, KvBatch, PersistMode, notebook_key, notebook_scan_end};
 use basics::base_uint::Uint256;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Notebook record kind, stored as the single value byte of a notebook row.
@@ -52,7 +55,23 @@ mod meta_key {
     /// Newest fully stored (durably acquired) ledger before the first claim.
     pub const COMPLETED_SEQ: &[u8] = b"completed_seq";
     pub const COMPLETED_STATE_ROOT: &[u8] = b"completed_state_root";
+    /// The claimed sequence the `unclaimed` keyspace was last kept in step
+    /// with. Written in the same batch as every claim. A different value at
+    /// open means a claim ran without maintaining the keyspace (an older
+    /// binary), so its rows may name nodes that claim adopted.
+    pub const UNCLAIMED_SEQ: &[u8] = b"unclaimed_seq";
 }
+
+/// Fresh-write tracking adds no more entries once the unclaimed list holds
+/// this many (mainnet runs at 100k-170k). An untracked fresh node can only be
+/// left unpruned, never deleted, so the cap bounds the list's memory and disk
+/// against a flood of writes without risking a live node. Pins of dead nodes
+/// that an in-flight ledger needs (R3/R5) are never capped.
+const UNCLAIMED_FRESH_CAP: usize = 2_000_000;
+
+/// Exclusive upper bound for scanning the whole `unclaimed` keyspace: every
+/// key is a 32-byte hash, and each sorts below 33 bytes of 0xFF.
+const UNCLAIMED_SCAN_END: [u8; 33] = [0xFF; 33];
 
 /// On-disk schema version for the pruned index.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -77,8 +96,16 @@ pub struct ClaimDelta {
 pub struct IndexWriter {
     backend: Arc<dyn Backend>,
     /// Nodes stored but not yet claimed into a validated ledger, with the
-    /// sequence first seen. Prune never deletes these (rule R2).
+    /// sequence first seen. Prune never deletes these (rule R2). This is the
+    /// working copy; the `unclaimed` keyspace holds a copy that is only read at
+    /// open. Change it only through `pin_unclaimed` / `unpin_unclaimed`.
     unclaimed: HashMap<Uint256, u32>,
+    /// The rows the `unclaimed` keyspace holds as of the last successful
+    /// batch, so each batch writes only the difference.
+    unclaimed_on_disk: HashMap<Uint256, u32>,
+    /// Hashes whose unclaimed entry changed since the last successful batch.
+    /// Kept after a failed batch, so the next one retries the change.
+    unclaimed_dirty: HashSet<Uint256>,
     /// Mirror of the count==0 rows: nodes dead but not yet pruned, mapped to
     /// the sequence of their outstanding death record. Lets reuse pin them
     /// (rule R5) and lets a resurrection delete the exact stale record, both
@@ -128,13 +155,157 @@ impl IndexWriter {
         let mut writer = Self {
             backend,
             unclaimed: HashMap::new(),
+            unclaimed_on_disk: HashMap::new(),
+            unclaimed_dirty: HashSet::new(),
             recent_claimed: std::collections::VecDeque::new(),
             dead_pending: HashMap::new(),
             claimed_seq,
             pruned_to,
         };
         writer.rebuild_pending_from_notebook()?;
+        writer.load_unclaimed()?;
         Ok(writer)
+    }
+
+    /// Load the on-disk copy of the unclaimed list into memory. Runs at open,
+    /// before any claim, sweep or prune can use the list.
+    ///
+    /// A row that is wrongly loaded would make the orphan sweep retire a live
+    /// node, so rows are trusted only when nothing can have adopted their
+    /// nodes behind the keyspace's back:
+    /// - The keyspace must be in step with the last claim (`UNCLAIMED_SEQ` ==
+    ///   `CLAIMED_SEQ`). Otherwise a claim ran without maintaining it (an older
+    ///   binary), and every row is discarded. A discarded row can only leave a
+    ///   node unpruned.
+    /// - A row whose node carries an explicit live reference count was adopted
+    ///   by a claim, so it is stale and dropped.
+    /// - A malformed row is dropped.
+    fn load_unclaimed(&mut self) -> Result<(), String> {
+        let in_step_seq = read_u32(self.backend.as_ref(), meta_key::UNCLAIMED_SEQ)?;
+        let mut rows: Vec<(Uint256, u32)> = Vec::new();
+        let mut malformed: Vec<Vec<u8>> = Vec::new();
+        self.backend.kv_range(
+            Keyspace::Unclaimed,
+            &[],
+            &UNCLAIMED_SCAN_END,
+            &mut |key, value| {
+                match (decode_unclaimed_key(key), decode_unclaimed_value(value)) {
+                    (Some(hash), Some(seq)) => rows.push((hash, seq)),
+                    _ => malformed.push(key.to_vec()),
+                }
+                true
+            },
+        )?;
+        let trusted = self.claimed_seq.is_some() && in_step_seq == self.claimed_seq;
+        let mut batch = KvBatch::new();
+        for key in &malformed {
+            batch.delete(Keyspace::Unclaimed, key.clone());
+        }
+        let mut stale = 0usize;
+        let mut discarded = 0usize;
+        for (hash, seq) in rows {
+            if !trusted {
+                batch.delete(Keyspace::Unclaimed, hash.as_slice().to_vec());
+                discarded += 1;
+                continue;
+            }
+            // A row whose node has an explicit live count (or a count row that
+            // cannot be read) cannot be shown to be unclaimed; drop it rather
+            // than risk sweeping a live node or failing the open.
+            if !matches!(self.count_get(&hash), Ok(None) | Ok(Some(0))) {
+                batch.delete(Keyspace::Unclaimed, hash.as_slice().to_vec());
+                stale += 1;
+                continue;
+            }
+            self.unclaimed.insert(hash, seq);
+            self.unclaimed_on_disk.insert(hash, seq);
+        }
+        // From here on the keyspace is in step with the claimed sequence.
+        if let Some(claimed) = self.claimed_seq
+            && in_step_seq != Some(claimed)
+        {
+            batch.put(
+                Keyspace::Meta,
+                meta_key::UNCLAIMED_SEQ,
+                claimed.to_le_bytes().to_vec(),
+            );
+        }
+        if !batch.is_empty() {
+            self.backend.kv_write_batch(&batch)?;
+            self.backend.kv_persist(PersistMode::SyncAll)?;
+        }
+        if !self.unclaimed.is_empty() || stale > 0 || discarded > 0 || !malformed.is_empty() {
+            tracing::info!(
+                target: "nodestore",
+                event = "pruned_unclaimed_loaded",
+                loaded = self.unclaimed.len(),
+                stale,
+                discarded,
+                malformed = malformed.len(),
+                in_step = trusted,
+                "pruned store loaded the unclaimed list from disk"
+            );
+        }
+        Ok(())
+    }
+
+    /// Add `hash` to the unclaimed list unless it is already there (the first
+    /// sequence seen wins). Returns whether it was added.
+    fn pin_unclaimed(&mut self, hash: Uint256, seq: u32) -> bool {
+        match self.unclaimed.entry(hash) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(seq);
+                self.unclaimed_dirty.insert(hash);
+                true
+            }
+        }
+    }
+
+    /// Remove `hash` from the unclaimed list.
+    fn unpin_unclaimed(&mut self, hash: &Uint256) {
+        if self.unclaimed.remove(hash).is_some() {
+            self.unclaimed_dirty.insert(*hash);
+        }
+    }
+
+    /// Add the unclaimed-list changes since the last successful batch to
+    /// `batch`, so they land atomically with the claim, sweep or prune that
+    /// made them. Pass the result to `commit_unclaimed` once the batch is
+    /// written. A node pinned and adopted between two batches writes nothing.
+    fn stage_unclaimed(&self, batch: &mut KvBatch) -> Vec<(Uint256, Option<u32>)> {
+        let mut staged = Vec::new();
+        for hash in &self.unclaimed_dirty {
+            let wanted = self.unclaimed.get(hash).copied();
+            if wanted == self.unclaimed_on_disk.get(hash).copied() {
+                continue;
+            }
+            match wanted {
+                Some(seq) => batch.put(
+                    Keyspace::Unclaimed,
+                    hash.as_slice().to_vec(),
+                    seq.to_le_bytes().to_vec(),
+                ),
+                None => batch.delete(Keyspace::Unclaimed, hash.as_slice().to_vec()),
+            };
+            staged.push((*hash, wanted));
+        }
+        staged
+    }
+
+    /// Record that a batch holding `staged` was written.
+    fn commit_unclaimed(&mut self, staged: Vec<(Uint256, Option<u32>)>) {
+        for (hash, wanted) in staged {
+            match wanted {
+                Some(seq) => {
+                    self.unclaimed_on_disk.insert(hash, seq);
+                }
+                None => {
+                    self.unclaimed_on_disk.remove(&hash);
+                }
+            }
+        }
+        self.unclaimed_dirty.clear();
     }
 
     /// Rebuild the in-memory dead-pending mirror and the restore watch from
@@ -225,21 +396,25 @@ impl IndexWriter {
     /// owned by a validated ledger. Rule R5: if it is dead-pending, pin it so
     /// prune keeps it until the next claim decides its fate.
     pub fn note_stored(&mut self, hash: Uint256, current_seq: u32) {
-        self.unclaimed.entry(hash).or_insert(current_seq);
+        self.pin_unclaimed(hash, current_seq);
     }
 
     /// Track nodes a backend write inserted for the first time (they were
     /// absent, so no claimed tree holds them) as unclaimed from `seq`. A claim
     /// that adopts one removes it; otherwise the orphan sweep retires it after
     /// the window. Nodes a recent claim already adopted are skipped (the record
-    /// lost the race with that claim). Returns how many were noted.
+    /// lost the race with that claim), and nothing is added once the list
+    /// holds `UNCLAIMED_FRESH_CAP` entries. Returns how many were noted.
     pub fn note_fresh_writes(&mut self, hashes: Vec<Uint256>, seq: u32) -> usize {
         let mut noted = 0;
         for hash in hashes {
+            if self.unclaimed.len() >= UNCLAIMED_FRESH_CAP {
+                break;
+            }
             if self.recent_claimed.iter().any(|claimed| claimed.contains(&hash)) {
                 continue;
             }
-            self.unclaimed.entry(hash).or_insert(seq);
+            self.pin_unclaimed(hash, seq);
             noted += 1;
         }
         noted
@@ -271,7 +446,7 @@ impl IndexWriter {
                 batch.delete(Keyspace::Notebook, notebook_key(dead_seq, hash));
                 resurrected.push(*hash);
             }
-            self.unclaimed.remove(hash);
+            self.unpin_unclaimed(hash);
         }
         // Dead state nodes: decrement; a drop to zero writes a notebook record.
         for hash in &delta.dead_state {
@@ -299,12 +474,20 @@ impl IndexWriter {
                 notebook_key(delta.seq.saturating_add(1), hash),
                 vec![NotebookKind::Owned as u8],
             );
-            self.unclaimed.remove(hash);
+            self.unpin_unclaimed(hash);
         }
         // Advance cursors in the same atomic batch.
         batch.put(
             Keyspace::Meta,
             meta_key::CLAIMED_SEQ,
+            delta.seq.to_le_bytes().to_vec(),
+        );
+        // The unclaimed list lands with the claim that adopted its nodes, and
+        // the keyspace is marked in step with this claim.
+        let staged = self.stage_unclaimed(&mut batch);
+        batch.put(
+            Keyspace::Meta,
+            meta_key::UNCLAIMED_SEQ,
             delta.seq.to_le_bytes().to_vec(),
         );
         batch.put(
@@ -325,6 +508,7 @@ impl IndexWriter {
         self.backend.watch_restores(&newly_dead);
         self.backend.watch_restores(&delta.owned);
         self.backend.kv_write_batch(&batch)?;
+        self.commit_unclaimed(staged);
         self.backend.kv_persist(PersistMode::SyncAll)?;
         self.backend.unwatch_restores(&resurrected);
         self.claimed_seq = Some(delta.seq);
@@ -372,11 +556,24 @@ impl IndexWriter {
             meta_key::ANCHOR_SEQ,
             seq.to_le_bytes().to_vec(),
         );
+        // Every node present at the anchor is implicitly live-once, so the
+        // unclaimed list (and its on-disk copy) starts empty.
+        let pinned: Vec<Uint256> = self.unclaimed.keys().copied().collect();
+        for hash in &pinned {
+            self.unpin_unclaimed(hash);
+        }
+        let on_disk: Vec<Uint256> = self.unclaimed_on_disk.keys().copied().collect();
+        self.unclaimed_dirty.extend(on_disk);
+        let staged = self.stage_unclaimed(&mut batch);
+        batch.put(
+            Keyspace::Meta,
+            meta_key::UNCLAIMED_SEQ,
+            seq.to_le_bytes().to_vec(),
+        );
         self.backend.kv_write_batch(&batch)?;
+        self.commit_unclaimed(staged);
         self.backend.kv_persist(PersistMode::SyncAll)?;
         self.claimed_seq = Some(seq);
-        // Every node present at the anchor is implicitly live-once.
-        self.unclaimed.clear();
         self.recent_claimed.clear();
         Ok(())
     }
@@ -427,7 +624,7 @@ impl IndexWriter {
                 // in-flight ledger. Keep it and track it as unclaimed so the
                 // next claim (or the orphan sweep) decides its fate (R3/R5).
                 if needed {
-                    self.unclaimed.entry(*hash).or_insert(*seq);
+                    self.pin_unclaimed(*hash, *seq);
                 }
                 let pinned = self.unclaimed.contains_key(hash);
                 // A State row deletes its node only if the node is still dead
@@ -467,7 +664,9 @@ impl IndexWriter {
                 meta_key::PRUNED_TO,
                 advance_to.to_le_bytes().to_vec(),
             );
+            let staged = self.stage_unclaimed(&mut batch);
             self.backend.kv_write_batch(&batch)?;
+            self.commit_unclaimed(staged);
             // Nodes read or written while this batch was deleting them are
             // written back and pinned as unclaimed; the next claim or orphan
             // sweep decides their fate like any other re-stored node.
@@ -481,10 +680,12 @@ impl IndexWriter {
                         .iter()
                         .find(|(_, deleted)| deleted == hash)
                         .map_or(advance_to, |(seq, _)| *seq);
-                    self.unclaimed.entry(*hash).or_insert(seq);
+                    self.pin_unclaimed(*hash, seq);
                     total = total.saturating_sub(1);
                 }
+                let staged = self.stage_unclaimed(&mut restore);
                 self.backend.kv_write_batch(&restore)?;
+                self.commit_unclaimed(staged);
                 tracing::info!(
                     target: "nodestore",
                     rescued = rescued.len(),
@@ -522,11 +723,13 @@ impl IndexWriter {
                 notebook_key(current_seq, hash),
                 vec![NotebookKind::State as u8],
             );
-            self.unclaimed.remove(hash);
+            self.unpin_unclaimed(hash);
             self.dead_pending.insert(*hash, current_seq);
         }
         self.backend.watch_restores(&orphans);
+        let staged = self.stage_unclaimed(&mut batch);
         self.backend.kv_write_batch(&batch)?;
+        self.commit_unclaimed(staged);
         Ok(orphans.len())
     }
 
@@ -596,6 +799,19 @@ fn decode_notebook_key(key: &[u8]) -> Option<(u32, Uint256)> {
     let seq = u32::from_be_bytes(key[..4].try_into().ok()?);
     let hash = Uint256::from_slice(&key[4..])?;
     Some((seq, hash))
+}
+
+/// An `unclaimed` row key is exactly one 32-byte node hash.
+fn decode_unclaimed_key(key: &[u8]) -> Option<Uint256> {
+    if key.len() != 32 {
+        return None;
+    }
+    Uint256::from_slice(key)
+}
+
+/// An `unclaimed` row value is exactly the first-seen sequence (`u32` LE).
+fn decode_unclaimed_value(value: &[u8]) -> Option<u32> {
+    Some(u32::from_le_bytes(value.try_into().ok()?))
 }
 
 #[cfg(test)]

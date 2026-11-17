@@ -23,6 +23,10 @@ pub enum Keyspace {
     Counts,
     /// Small named cursors: schema version, claimed/pruned sequences, anchor.
     Meta,
+    /// Hash -> first-seen sequence (`u32` LE) of nodes stored but not yet
+    /// claimed. The on-disk copy of the index's in-memory unclaimed list,
+    /// written in the same batch as the claim, sweep or prune that changes it.
+    Unclaimed,
 }
 
 impl Keyspace {
@@ -33,15 +37,17 @@ impl Keyspace {
             Keyspace::Notebook => "notebook",
             Keyspace::Counts => "counts",
             Keyspace::Meta => "meta",
+            Keyspace::Unclaimed => "unclaimed",
         }
     }
 
     /// Every keyspace, in a fixed order, for backend initialization.
-    pub const ALL: [Keyspace; 4] = [
+    pub const ALL: [Keyspace; 5] = [
         Keyspace::Nodes,
         Keyspace::Notebook,
         Keyspace::Counts,
         Keyspace::Meta,
+        Keyspace::Unclaimed,
     ];
 }
 
@@ -160,7 +166,7 @@ mod tests {
     #[test]
     fn keyspace_names_are_stable_and_distinct() {
         let names: Vec<&str> = Keyspace::ALL.iter().map(|ks| ks.name()).collect();
-        assert_eq!(names, ["nodes", "notebook", "counts", "meta"]);
+        assert_eq!(names, ["nodes", "notebook", "counts", "meta", "unclaimed"]);
     }
 
     #[test]

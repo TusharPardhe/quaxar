@@ -84,6 +84,7 @@ impl PrunedStore {
         };
         metrics.claimed_seq = writer.claimed_seq();
         metrics.pruned_to = writer.pruned_to();
+        metrics.unclaimed = writer.unclaimed_len();
         // An anchored store tracks nodes that writes insert for the first
         // time, so a node that no claim ever adopts (it lived only in a
         // ledger that was never claimed) is still pruned. Before the anchor
@@ -691,6 +692,10 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let path = std::env::temp_dir().join(format!("quaxar-pruned-{tag}-{t}"));
+        open_fjall_at(&path)
+    }
+
+    fn open_fjall_at(path: &std::path::Path) -> Arc<dyn Backend> {
         let mut section = Section::new("node_db");
         section.set("type", "fjall");
         section.set("path", path.to_string_lossy().into_owned());
@@ -772,6 +777,51 @@ mod tests {
         }
         assert!(!present(&store, hidden), "a node no claim adopted must be pruned");
         assert!(present(&store, hid(312)), "the live node of the last claim stays");
+    }
+
+    /// The same orphan, with a full process restart (fjall closed and opened
+    /// by a new backend) after it was noted. The in-memory unclaimed list was
+    /// lost at the restart, so the node leaked; it is now reloaded from the
+    /// `unclaimed` keyspace and pruned.
+    #[test]
+    fn orphan_noted_before_a_restart_is_pruned() {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("quaxar-pruned-restart-{t}"));
+        let config = PrunedConfig {
+            online_delete: 4,
+            prune_mode: PruneMode::On,
+            ..PrunedConfig::default()
+        };
+        let hidden = hid(9_010);
+        {
+            let backend = open_fjall_at(&path);
+            let store = PrunedStore::open(Arc::clone(&backend), config).expect("open");
+            store.anchor(1, hid(1)).expect("anchor");
+            write_nodes(&store, &[hidden]);
+            churn_one(&store, 2);
+            assert_eq!(store.metrics().unclaimed, 1);
+            drop(store);
+            backend.close().expect("close");
+        }
+        let backend = open_fjall_at(&path);
+        let store = PrunedStore::open(backend, config).expect("reopen");
+        for seq in 3..=14u32 {
+            churn_one(&store, seq);
+            store.maintain(seq, u32::MAX).expect("maintain");
+        }
+        assert!(
+            !present(&store, hidden),
+            "the orphan is pruned after the restart"
+        );
+        assert!(
+            present(&store, hid(314)),
+            "the live node of the last claim stays"
+        );
+        let _ = store.backend().close();
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     /// The fresh-write record can reach the index after the claim that

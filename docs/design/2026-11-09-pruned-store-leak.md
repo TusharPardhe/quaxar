@@ -72,6 +72,53 @@ Unclaimed tracking is in memory only, so nodes written before a restart and
 never claimed still leak. Ledger headers are not claimed, so they are now
 deleted about two windows after they are written, outside the window.
 
+## Follow-up (2026-11-17): the unclaimed list survives restarts
+
+Each restart leaked the ~100k-170k nodes on the in-memory unclaimed list
+(about 50 MB). The list is now also kept in an `unclaimed` keyspace
+(`hash -> first_seen_seq`, `u32` LE):
+
+- **Memory stays the working copy.** Claims, the orphan sweep and prune read
+  only the in-memory map. The keyspace is read once, in `IndexWriter::open`,
+  before anything can claim, sweep or prune.
+- **Changes land in the batch that causes them.** Every change goes through
+  `pin_unclaimed` / `unpin_unclaimed`, which mark the hash dirty. The claim,
+  orphan-sweep, prune and anchor batches write the dirty hashes whose wanted
+  state differs from the last written state. A node pinned and adopted
+  between two batches writes nothing, so a claim writes only the nodes it
+  leaves unclaimed. A failed batch keeps the hashes dirty for the next one.
+- **Cap.** Fresh-write tracking stops adding entries at 2M (mainnet runs at
+  100k-170k). Pins of dead nodes that an in-flight ledger needs are never
+  capped.
+
+**IMPORTANT, safety:** a wrongly loaded row makes the orphan sweep retire a
+live node. Counts cannot tell "claimed once" from "never claimed" (both have
+no row), so a row is trusted only when nothing can have adopted its node
+behind the keyspace's back:
+
+| Case | Handling |
+|---|---|
+| A claim ran without maintaining the keyspace (rollback to an older binary, then forward) | Every claim batch writes `meta/unclaimed_seq = seq`. At open, rows load only if `unclaimed_seq == claimed_seq`; otherwise all are deleted. A discarded row can only leave a node unpruned. |
+| Row for a node with an explicit live count, or an unreadable count row | Cannot be shown unclaimed: dropped at open (the open still succeeds) |
+| Malformed row (key not 32 bytes, value not 4 bytes) | Dropped at open |
+| Store not yet anchored | No row is trusted; the anchor clears the keyspace |
+
+Peers cannot write the keyspace. They can only cause fresh writes of
+hash-verified nodes, which the cap bounds. Write access to the store
+directory is outside this guarantee, as for the other keyspaces; the
+periodic verify still halts pruning on a missing required node.
+
+Tests: `unclaimed_node_is_pruned_after_a_restart` and
+`orphan_noted_before_a_restart_is_pruned` (real fjall close and reopen) fail
+without the load; `saved_rows_are_discarded_when_a_claim_ran_without_them`
+fails without the `unclaimed_seq` check. Also
+`node_adopted_after_its_row_was_saved_survives_a_restart`,
+`saved_row_of_a_node_with_a_live_count_is_dropped`,
+`saved_row_with_a_corrupt_count_row_is_dropped_and_the_store_opens`,
+`malformed_saved_rows_are_dropped`, `anchor_starts_the_saved_list_empty`,
+`node_adopted_by_the_next_claim_writes_no_row`,
+`failed_claim_keeps_unclaimed_changes_for_the_retry`.
+
 ## Tests
 
 - `node_hidden_by_a_claim_gap_is_pruned`
