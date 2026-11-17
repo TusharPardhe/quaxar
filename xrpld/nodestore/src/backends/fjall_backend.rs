@@ -399,6 +399,7 @@ struct OpenDb {
     notebook: FjallKeyspace,
     counts: FjallKeyspace,
     meta: FjallKeyspace,
+    unclaimed: FjallKeyspace,
 }
 
 impl OpenDb {
@@ -408,6 +409,7 @@ impl OpenDb {
             Keyspace::Notebook => &self.notebook,
             Keyspace::Counts => &self.counts,
             Keyspace::Meta => &self.meta,
+            Keyspace::Unclaimed => &self.unclaimed,
         }
     }
 }
@@ -585,6 +587,7 @@ impl Backend for FjallBackend {
             notebook: handles.next().expect("notebook keyspace"),
             counts: handles.next().expect("counts keyspace"),
             meta: handles.next().expect("meta keyspace"),
+            unclaimed: handles.next().expect("unclaimed keyspace"),
             db,
         };
         let open = Arc::new(open);

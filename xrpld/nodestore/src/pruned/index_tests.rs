@@ -869,3 +869,312 @@ fn restart_rebuilds_dead_pending_so_reuse_pins_the_node() {
     writer.prune(3, 16).expect("prune 3");
     assert!(present_nodes(backend.as_ref()).contains(&x), "resurrected node stays live");
 }
+
+// --- the unclaimed list survives a restart ----------------------------------
+
+/// Claim ledger `seq` of a chain where each ledger replaces one live node
+/// (`hid(1000 + seq)` replaces `hid(1000 + seq - 1)`), plus `extra` new nodes.
+fn churn_claim(writer: &mut IndexWriter, backend: &dyn Backend, seq: u32, extra: &[Uint256]) {
+    let live = hid(1000 + u64::from(seq));
+    store_node(backend, &live);
+    let mut new_state = vec![live];
+    new_state.extend_from_slice(extra);
+    let dead_state = if seq <= 1 {
+        vec![]
+    } else {
+        vec![hid(1000 + u64::from(seq) - 1)]
+    };
+    writer
+        .claim(&ClaimDelta {
+            seq,
+            state_root: hid(u64::from(seq)),
+            new_state,
+            dead_state,
+            owned: vec![],
+        })
+        .expect("claim");
+}
+
+/// What `PrunedStore::maintain` does per validated ledger: prune to the window
+/// floor, then retire orphans older than the window.
+fn maintain(writer: &mut IndexWriter, seq: u32, window: u32) {
+    writer.prune(seq.saturating_sub(window), 16).expect("prune");
+    writer.orphan_sweep(seq, window).expect("orphan sweep");
+}
+
+fn put_raw(backend: &dyn Backend, keyspace: Keyspace, key: Vec<u8>, value: Vec<u8>) {
+    let mut batch = crate::backends::kv::KvBatch::new();
+    batch.put(keyspace, key, value);
+    backend.kv_write_batch(&batch).expect("raw write");
+}
+
+/// A node written but never claimed is on the unclaimed list only. The list
+/// was kept in memory, so a restart lost it and the node was never pruned
+/// (each mainnet restart leaked ~100k nodes). It is now reloaded from disk.
+#[test]
+fn unclaimed_node_is_pruned_after_a_restart() {
+    let backend = open_memory();
+    let orphan = hid(9_100);
+    {
+        let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("open");
+        churn_claim(&mut writer, backend.as_ref(), 1, &[]);
+        store_node(backend.as_ref(), &orphan);
+        writer.note_fresh_writes(vec![orphan], 2);
+        churn_claim(&mut writer, backend.as_ref(), 2, &[]);
+        assert_eq!(writer.unclaimed_len(), 1);
+    }
+    let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("restart");
+    assert_eq!(writer.unclaimed_len(), 1, "the unclaimed list is reloaded");
+    for seq in 3..=14u32 {
+        churn_claim(&mut writer, backend.as_ref(), seq, &[]);
+        maintain(&mut writer, seq, 4);
+    }
+    let present = present_nodes(backend.as_ref());
+    assert!(
+        !present.contains(&orphan),
+        "the orphan is pruned after the restart"
+    );
+    assert!(present.contains(&hid(1014)), "the live node stays");
+    assert_eq!(keyspace_rows(backend.as_ref(), Keyspace::Unclaimed), 0);
+}
+
+/// A saved node that a later claim adopts loses its row in that claim's
+/// batch, so a restart cannot reload it and sweep a live node.
+#[test]
+fn node_adopted_after_its_row_was_saved_survives_a_restart() {
+    let backend = open_memory();
+    let adopted = hid(9_101);
+    {
+        let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("open");
+        churn_claim(&mut writer, backend.as_ref(), 1, &[]);
+        store_node(backend.as_ref(), &adopted);
+        writer.note_fresh_writes(vec![adopted], 2);
+        churn_claim(&mut writer, backend.as_ref(), 2, &[]);
+        assert_eq!(keyspace_rows(backend.as_ref(), Keyspace::Unclaimed), 1);
+        churn_claim(&mut writer, backend.as_ref(), 3, &[adopted]);
+        assert_eq!(
+            keyspace_rows(backend.as_ref(), Keyspace::Unclaimed),
+            0,
+            "the adopting claim deletes the row"
+        );
+    }
+    let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("restart");
+    assert_eq!(writer.unclaimed_len(), 0);
+    for seq in 4..=16u32 {
+        churn_claim(&mut writer, backend.as_ref(), seq, &[]);
+        maintain(&mut writer, seq, 4);
+    }
+    assert!(
+        present_nodes(backend.as_ref()).contains(&adopted),
+        "an adopted node is never swept"
+    );
+}
+
+/// A claim made without maintaining the keyspace (an older binary after a
+/// rollback) may have adopted saved nodes. The rows are then not trusted: all
+/// are discarded, which can only leave nodes unpruned.
+#[test]
+fn saved_rows_are_discarded_when_a_claim_ran_without_them() {
+    let backend = open_memory();
+    let node = hid(9_102);
+    {
+        let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("open");
+        churn_claim(&mut writer, backend.as_ref(), 1, &[]);
+        store_node(backend.as_ref(), &node);
+        writer.note_fresh_writes(vec![node], 2);
+        churn_claim(&mut writer, backend.as_ref(), 2, &[]);
+    }
+    // An older binary claims ledger 3 (adopting `node`, which as a count-1
+    // node leaves no count row) and does not touch the unclaimed keyspace.
+    put_raw(
+        backend.as_ref(),
+        Keyspace::Meta,
+        b"claimed_seq".to_vec(),
+        3u32.to_le_bytes().to_vec(),
+    );
+    let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("restart");
+    assert_eq!(writer.unclaimed_len(), 0, "rows out of step are not loaded");
+    assert_eq!(keyspace_rows(backend.as_ref(), Keyspace::Unclaimed), 0);
+    for seq in 4..=16u32 {
+        churn_claim(&mut writer, backend.as_ref(), seq, &[]);
+        maintain(&mut writer, seq, 4);
+    }
+    assert!(
+        present_nodes(backend.as_ref()).contains(&node),
+        "a node the older binary adopted is not swept"
+    );
+    // The keyspace is in step again: a new orphan saved now reloads.
+    store_node(backend.as_ref(), &hid(9_103));
+    writer.note_fresh_writes(vec![hid(9_103)], 17);
+    churn_claim(&mut writer, backend.as_ref(), 17, &[]);
+    drop(writer);
+    let writer = IndexWriter::open(Arc::clone(&backend)).expect("restart again");
+    assert_eq!(writer.unclaimed_len(), 1);
+}
+
+/// A saved row whose node now carries an explicit live count was adopted by a
+/// claim, so it is dropped at load instead of being swept.
+#[test]
+fn saved_row_of_a_node_with_a_live_count_is_dropped() {
+    let backend = open_memory();
+    let node = hid(9_104);
+    {
+        let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("open");
+        churn_claim(&mut writer, backend.as_ref(), 1, &[]);
+        store_node(backend.as_ref(), &node);
+        writer.note_fresh_writes(vec![node], 2);
+        churn_claim(&mut writer, backend.as_ref(), 2, &[]);
+    }
+    put_raw(
+        backend.as_ref(),
+        Keyspace::Counts,
+        node.as_slice().to_vec(),
+        2u32.to_le_bytes().to_vec(),
+    );
+    let writer = IndexWriter::open(Arc::clone(&backend)).expect("restart");
+    assert_eq!(writer.unclaimed_len(), 0);
+    assert_eq!(keyspace_rows(backend.as_ref(), Keyspace::Unclaimed), 0);
+}
+
+/// A saved row whose count row is corrupt cannot be checked, so it is dropped
+/// and the store still opens.
+#[test]
+fn saved_row_with_a_corrupt_count_row_is_dropped_and_the_store_opens() {
+    let backend = open_memory();
+    let node = hid(9_111);
+    {
+        let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("open");
+        churn_claim(&mut writer, backend.as_ref(), 1, &[]);
+        store_node(backend.as_ref(), &node);
+        writer.note_fresh_writes(vec![node], 2);
+        churn_claim(&mut writer, backend.as_ref(), 2, &[]);
+    }
+    put_raw(
+        backend.as_ref(),
+        Keyspace::Counts,
+        node.as_slice().to_vec(),
+        vec![1, 2, 3],
+    );
+    let writer = IndexWriter::open(Arc::clone(&backend)).expect("the store still opens");
+    assert_eq!(writer.unclaimed_len(), 0);
+    assert_eq!(keyspace_rows(backend.as_ref(), Keyspace::Unclaimed), 0);
+}
+
+/// Rows that are not a 32-byte hash with a 4-byte sequence are dropped at
+/// load; well-formed rows next to them still load.
+#[test]
+fn malformed_saved_rows_are_dropped() {
+    let backend = open_memory();
+    {
+        let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("open");
+        churn_claim(&mut writer, backend.as_ref(), 1, &[]);
+    }
+    put_raw(
+        backend.as_ref(),
+        Keyspace::Unclaimed,
+        vec![1, 2, 3],
+        vec![0; 4],
+    );
+    put_raw(
+        backend.as_ref(),
+        Keyspace::Unclaimed,
+        hid(9_105).as_slice().to_vec(),
+        vec![1, 2, 3],
+    );
+    put_raw(
+        backend.as_ref(),
+        Keyspace::Unclaimed,
+        hid(9_106).as_slice().to_vec(),
+        1u32.to_le_bytes().to_vec(),
+    );
+    let writer = IndexWriter::open(Arc::clone(&backend)).expect("restart");
+    assert_eq!(writer.unclaimed_len(), 1, "only the well-formed row loads");
+    assert_eq!(keyspace_rows(backend.as_ref(), Keyspace::Unclaimed), 1);
+}
+
+/// Before the anchor no row is trusted, and the anchor starts the list empty.
+/// Rows saved after the anchor reload.
+#[test]
+fn anchor_starts_the_saved_list_empty() {
+    let backend = open_memory();
+    put_raw(
+        backend.as_ref(),
+        Keyspace::Unclaimed,
+        hid(9_107).as_slice().to_vec(),
+        1u32.to_le_bytes().to_vec(),
+    );
+    let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("open");
+    assert_eq!(
+        writer.unclaimed_len(),
+        0,
+        "an unanchored store loads nothing"
+    );
+    assert_eq!(keyspace_rows(backend.as_ref(), Keyspace::Unclaimed), 0);
+    writer.note_stored(hid(9_108), 1);
+    writer.adopt_anchor(5, hid(5)).expect("anchor");
+    assert_eq!(writer.unclaimed_len(), 0);
+    assert_eq!(keyspace_rows(backend.as_ref(), Keyspace::Unclaimed), 0);
+    store_node(backend.as_ref(), &hid(9_109));
+    writer.note_fresh_writes(vec![hid(9_109)], 6);
+    churn_claim(&mut writer, backend.as_ref(), 6, &[]);
+    drop(writer);
+    let writer = IndexWriter::open(Arc::clone(&backend)).expect("restart");
+    assert_eq!(writer.unclaimed_len(), 1);
+}
+
+/// A node pinned and adopted between two batches never reaches the disk, so
+/// the common case (every fresh write adopted by the next claim) costs no row.
+#[test]
+fn node_adopted_by_the_next_claim_writes_no_row() {
+    let backend = open_memory();
+    let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("open");
+    churn_claim(&mut writer, backend.as_ref(), 1, &[]);
+    let fresh: Vec<Uint256> = (0..50).map(|n| hid(9_200 + n)).collect();
+    writer.note_fresh_writes(fresh.clone(), 2);
+    churn_claim(&mut writer, backend.as_ref(), 2, &fresh);
+    assert_eq!(writer.unclaimed_len(), 0);
+    assert_eq!(keyspace_rows(backend.as_ref(), Keyspace::Unclaimed), 0);
+}
+
+/// A batch that fails keeps its unclaimed changes for the next batch. The
+/// adopting claim fails, is retried, and the retry deletes the saved row, so a
+/// restart cannot reload the adopted node.
+#[test]
+fn failed_claim_keeps_unclaimed_changes_for_the_retry() {
+    use crate::FaultBackend;
+    let inner = open_memory();
+    let fault = Arc::new(FaultBackend::new(Arc::clone(&inner)));
+    let backend: Arc<dyn Backend> = fault.clone();
+    let node = hid(9_110);
+    {
+        let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("open");
+        churn_claim(&mut writer, backend.as_ref(), 1, &[]);
+        store_node(backend.as_ref(), &node);
+        writer.note_fresh_writes(vec![node], 2);
+        churn_claim(&mut writer, backend.as_ref(), 2, &[]);
+        assert_eq!(keyspace_rows(inner.as_ref(), Keyspace::Unclaimed), 1);
+        store_node(backend.as_ref(), &hid(1003));
+        let adopt = ClaimDelta {
+            seq: 3,
+            state_root: hid(3),
+            new_state: vec![hid(1003), node],
+            dead_state: vec![hid(1002)],
+            owned: vec![],
+        };
+        fault.fail_on_write(1);
+        assert!(
+            writer.claim(&adopt).is_err(),
+            "the injected fault fails the claim"
+        );
+        fault.clear();
+        assert_eq!(keyspace_rows(inner.as_ref(), Keyspace::Unclaimed), 1);
+        writer.claim(&adopt).expect("retry");
+        assert_eq!(
+            keyspace_rows(inner.as_ref(), Keyspace::Unclaimed),
+            0,
+            "the retry deletes the row"
+        );
+    }
+    let writer = IndexWriter::open(Arc::clone(&inner)).expect("restart");
+    assert_eq!(writer.unclaimed_len(), 0);
+}
