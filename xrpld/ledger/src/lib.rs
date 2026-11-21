@@ -189,7 +189,8 @@ pub use payment_sandbox::PaymentSandbox;
 pub use pending_saves::PendingSaves;
 pub use persistence::{
     LedgerPersistence, LedgerPersistenceJob, LedgerPersistenceJobType, LedgerPersistenceRuntime,
-    get_latest_ledger, load_by_hash, load_by_index, load_ledger_helper, pend_save_validated,
+    ValidatedLedgerSave, get_latest_ledger, load_by_hash, load_by_index, load_ledger_helper,
+    pend_save_validated,
 };
 use protocol::{
     DecodedLedgerHashesEntry, Keylet, STArray, STLedgerEntry, STObject, STTx, SerialIter,

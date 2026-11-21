@@ -5,8 +5,9 @@ use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::ManualClock;
 use ledger::{
     Ledger, LedgerConfig, LedgerHeader, LedgerInfoProvider, LedgerPersistence,
-    LedgerPersistenceJobType, LedgerPersistenceRuntime, NullLedgerJournal, calculate_ledger_hash,
-    get_latest_ledger, load_by_hash, load_by_index, load_ledger_helper, pend_save_validated,
+    LedgerPersistenceJobType, LedgerPersistenceRuntime, NullLedgerJournal, ValidatedLedgerSave,
+    calculate_ledger_hash, get_latest_ledger, load_by_hash, load_by_index, load_ledger_helper,
+    pend_save_validated,
 };
 use shamap::family::{
     NullFullBelowCache, NullMissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher,
@@ -114,8 +115,13 @@ struct RecordingPersistenceRuntime {
     save_calls: Mutex<Vec<(u32, bool)>>,
     failed_saves: Mutex<Vec<(u32, SHAMapHash)>>,
     queued_jobs: Mutex<Vec<(LedgerPersistenceJobType, String)>>,
+    /// Runtime calls in order, for the cases where order matters.
+    events: Mutex<Vec<String>>,
     allow_enqueue: bool,
+    /// The accepted ledger is missing nodes.
     fail_save: bool,
+    /// The database write fails.
+    write_fails: bool,
 }
 
 impl LedgerPersistenceRuntime for RecordingPersistenceRuntime {
@@ -135,6 +141,14 @@ impl LedgerPersistenceRuntime for RecordingPersistenceRuntime {
 
     fn finish_work(&self, seq: u32) {
         self.finished.lock().expect("finished mutex").push(seq);
+        self.pending
+            .lock()
+            .expect("pending mutex")
+            .retain(|s| *s != seq);
+        self.events
+            .lock()
+            .expect("events mutex")
+            .push(format!("finish:{seq}"));
     }
 
     fn should_work(&self, _seq: u32, _is_synchronous: bool) -> bool {
@@ -145,12 +159,18 @@ impl LedgerPersistenceRuntime for RecordingPersistenceRuntime {
         self.pending.lock().expect("pending mutex").contains(&seq)
     }
 
-    fn save_validated_ledger(&self, ledger: Arc<Ledger>, is_current: bool) -> bool {
+    fn save_validated_ledger(&self, ledger: Arc<Ledger>, is_current: bool) -> ValidatedLedgerSave {
         self.save_calls
             .lock()
             .expect("save_calls mutex")
             .push((ledger.header().seq, is_current));
-        !self.fail_save
+        if self.write_fails {
+            ValidatedLedgerSave::WriteFailed
+        } else if self.fail_save {
+            ValidatedLedgerSave::MissingNodes
+        } else {
+            ValidatedLedgerSave::Saved
+        }
     }
 
     fn failed_save(&self, seq: u32, hash: SHAMapHash) {
@@ -158,6 +178,28 @@ impl LedgerPersistenceRuntime for RecordingPersistenceRuntime {
             .lock()
             .expect("failed_saves mutex")
             .push((seq, hash));
+        self.events
+            .lock()
+            .expect("events mutex")
+            .push(format!("failed_save:{seq}"));
+    }
+
+    fn clear_ledger(&self, seq: u32) {
+        self.events
+            .lock()
+            .expect("events mutex")
+            .push(format!("clear_ledger:{seq}"));
+    }
+
+    fn clear_saved(&self, hash: SHAMapHash) {
+        self.saved_hashes
+            .lock()
+            .expect("saved_hashes mutex")
+            .retain(|saved| *saved != hash);
+        self.events
+            .lock()
+            .expect("events mutex")
+            .push("clear_saved".to_owned());
     }
 
     fn enqueue_job(
@@ -228,6 +270,78 @@ fn pend_save_validated_queued_failure_notifies_owner_after_work_finishes() {
         runtime.finished.lock().expect("finished mutex").as_slice(),
         &[42],
         "failure notification runs only after pending work is released"
+    );
+}
+
+/// rippled #8662: a database write that fails leaves the sequence out of the
+/// complete range and releases the in-progress mark before the SAVED flag, so
+/// a later save of the same ledger runs instead of being deduplicated away.
+#[test]
+fn failed_write_releases_the_save_state_so_a_retry_runs() {
+    let runtime = Arc::new(RecordingPersistenceRuntime {
+        write_fails: true,
+        ..RecordingPersistenceRuntime::default()
+    });
+    let ledger = immutable_ledger(43, 0x34);
+
+    assert!(!pend_save_validated(
+        runtime.clone(),
+        Arc::clone(&ledger),
+        true,
+        true
+    ));
+    assert_eq!(
+        runtime.events.lock().expect("events mutex").as_slice(),
+        &["clear_ledger:43", "finish:43", "clear_saved"],
+        "clear the range, then the pending mark, then the SAVED flag"
+    );
+    assert!(
+        runtime
+            .failed_saves
+            .lock()
+            .expect("failed_saves mutex")
+            .is_empty(),
+        "a write failure does not reacquire the ledger"
+    );
+
+    // The retry is not deduplicated away.
+    pend_save_validated(runtime.clone(), ledger, false, true);
+    assert_eq!(
+        runtime.save_calls.lock().expect("save_calls mutex").len(),
+        2,
+        "the retry reaches the database"
+    );
+}
+
+/// A ledger whose accepted ledger misses nodes is reported to the ledger
+/// master (rippled `LedgerMaster::failedSave`) on the synchronous path too,
+/// and its SAVED flag stays set, as in rippled.
+#[test]
+fn synchronous_save_with_missing_nodes_calls_failed_save() {
+    let runtime = Arc::new(RecordingPersistenceRuntime {
+        fail_save: true,
+        ..RecordingPersistenceRuntime::default()
+    });
+    let ledger = immutable_ledger(44, 0x35);
+    let hash = ledger.header().hash;
+
+    assert!(!pend_save_validated(runtime.clone(), ledger, true, true));
+    assert_eq!(
+        runtime
+            .failed_saves
+            .lock()
+            .expect("failed_saves mutex")
+            .as_slice(),
+        &[(44, hash)]
+    );
+    assert_eq!(
+        runtime
+            .saved_hashes
+            .lock()
+            .expect("saved_hashes mutex")
+            .as_slice(),
+        &[hash],
+        "the SAVED flag stays set"
     );
 }
 

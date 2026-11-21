@@ -1193,6 +1193,9 @@ where
         } else {
             let keep = entry.last_access > when_expire;
             if !keep {
+                // rippled #8660: a key-only entry is never held weakly, so an
+                // expired one leaves the cache and the map at the same time.
+                counts.cache_removals += 1;
                 counts.map_removals += 1;
             }
             keep
@@ -1227,8 +1230,8 @@ fn scale_duration(duration: Duration, numerator: usize, denominator: usize) -> D
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyCache, ManualClock, TaggedCache, TaggedCacheLogger, TaggedCacheMetrics,
-        TaggedCacheMetricsSnapshot,
+        KeyCache, KeyOnlyEntry, ManualClock, StdHashMap, TaggedCache, TaggedCacheLogger,
+        TaggedCacheMetrics, TaggedCacheMetricsSnapshot, sweep_key_partition,
     };
     use crate::intrusive_pointer::{
         IntrusiveObject, SharedIntrusive, SharedWeakUnion, make_shared_intrusive,
@@ -1486,6 +1489,24 @@ mod tests {
                 .expect("surviving entry should remain fetchable");
             assert!(Arc::ptr_eq(value, &fetched));
         }
+    }
+
+    // rippled #8660: an expired key-only entry is counted as a cache removal
+    // and a map removal.
+    #[test]
+    fn key_partition_sweep_counts_expired_entries_as_cache_and_map_removals() {
+        let mut partition: StdHashMap<u32, KeyOnlyEntry, std::hash::RandomState> =
+            StdHashMap::default();
+        partition.insert(1, KeyOnlyEntry::new(Duration::seconds(1)));
+        partition.insert(2, KeyOnlyEntry::new(Duration::seconds(1)));
+        partition.insert(3, KeyOnlyEntry::new(Duration::seconds(5)));
+
+        let counts =
+            sweep_key_partition(&mut partition, Duration::seconds(2), Duration::seconds(5));
+
+        assert_eq!(counts.cache_removals, 2);
+        assert_eq!(counts.map_removals, 2);
+        assert_eq!(partition.len(), 1);
     }
 
     #[test]

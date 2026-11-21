@@ -212,12 +212,16 @@ mod tests {
             false
         }
 
-        fn save_validated_ledger(&self, ledger: Arc<Ledger>, is_current: bool) -> bool {
+        fn save_validated_ledger(
+            &self,
+            ledger: Arc<Ledger>,
+            is_current: bool,
+        ) -> ledger::ValidatedLedgerSave {
             self.events
                 .lock()
                 .expect("events mutex")
                 .push(format!("save:{}:{is_current}", ledger.header().seq));
-            true
+            ledger::ValidatedLedgerSave::Saved
         }
 
         fn enqueue_job(

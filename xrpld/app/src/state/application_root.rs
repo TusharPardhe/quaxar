@@ -575,11 +575,11 @@ pub struct ApplicationRoot {
     basic_app: Arc<BasicApp>,
     job_queue: Arc<JobQueue>,
     /// Shared, persistent ledger persistence runtime -- constructed once so
-    /// its hash-router-style dedup (`saved_hashes`) and pending-save gating
-    /// (`pending`) are real bookkeeping across calls, matching the
-    /// reference's long-lived `HashRouter`/`PendingSaves` members on
-    /// `Application`. Rebuilt (state reset) only when storage targets
-    /// change, which happens once at startup, not on the hot path.
+    /// its SAVED-flag dedup (kept in the shared `HashRouter`, as rippled) and
+    /// pending-save gating (`pending`) are real bookkeeping across calls,
+    /// matching the reference's long-lived `HashRouter`/`PendingSaves`
+    /// members on `Application`. Rebuilt only when storage targets change,
+    /// which happens once at startup, not on the hot path.
     ledger_persistence_runtime: Arc<std::sync::RwLock<Arc<crate::AppLedgerPersistenceRuntime>>>,
     time_keeper: Arc<TimeKeeper<SystemTimeKeeperClock>>,
     /// Built-in SNTP client for environments where host NTP cannot be
@@ -5132,7 +5132,8 @@ impl ApplicationRoot {
                     0,
                     None,
                     Some(Arc::clone(&shared_job_queue)),
-                ),
+                )
+                .with_hash_router(Arc::clone(&registry.hash_router)),
             ))),
             time_keeper: Arc::clone(&time_keeper),
             sntp_client: None,
@@ -6752,7 +6753,15 @@ impl ApplicationRoot {
                 }
             }) as Arc<dyn Fn(u32, SHAMapHash) + Send + Sync>
         });
-        let runtime = Arc::new(
+        let clear_ledger_handler = self.ledger_master_runtime().map(|runtime| {
+            let ledger_master = runtime.ledger_master();
+            Arc::new(move |seq: u32| {
+                // rippled #8662: a failed database write may have deleted
+                // the ledger's rows, so stop advertising it as complete.
+                ledger_master.clear_ledger(seq);
+            }) as Arc<dyn Fn(u32) + Send + Sync>
+        });
+        let mut runtime =
             crate::AppLedgerPersistenceRuntime::with_job_queue_and_failed_save_handler(
                 self.registry.relational_database.clone(),
                 self.registry.node_store.clone(),
@@ -6761,8 +6770,12 @@ impl ApplicationRoot {
                 self.registry.ledger_db.clone(),
                 Some(Arc::clone(&self.job_queue)),
                 failed_save_handler,
-            ),
-        );
+            )
+            .with_hash_router(Arc::clone(&self.registry.hash_router));
+        if let Some(handler) = clear_ledger_handler {
+            runtime = runtime.with_clear_ledger_handler(handler);
+        }
+        let runtime = Arc::new(runtime);
         *self
             .ledger_persistence_runtime
             .write()

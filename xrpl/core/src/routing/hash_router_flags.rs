@@ -85,6 +85,12 @@ impl HashRouterEntry {
         changed
     }
 
+    /// rippled `Entry::clearFlags`: clear the given flags, leaving every
+    /// other flag as it is.
+    pub fn clear_flags(&mut self, flags: HashRouterFlags) {
+        self.flags &= !flags;
+    }
+
     pub fn release_peer_set(&mut self) -> BTreeSet<PeerShortId> {
         std::mem::take(&mut self.peers)
     }
@@ -149,6 +155,14 @@ impl std::ops::BitAnd for HashRouterFlags {
 impl std::ops::BitAndAssign for HashRouterFlags {
     fn bitand_assign(&mut self, rhs: Self) {
         *self = *self & rhs;
+    }
+}
+
+impl std::ops::Not for HashRouterFlags {
+    type Output = Self;
+
+    fn not(self) -> Self::Output {
+        Self(!self.0)
     }
 }
 
