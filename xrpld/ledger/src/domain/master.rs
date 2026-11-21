@@ -1215,8 +1215,12 @@ mod tests {
             false
         }
 
-        fn save_validated_ledger(&self, _ledger: Arc<Ledger>, _is_current: bool) -> bool {
-            true
+        fn save_validated_ledger(
+            &self,
+            _ledger: Arc<Ledger>,
+            _is_current: bool,
+        ) -> crate::ValidatedLedgerSave {
+            crate::ValidatedLedgerSave::Saved
         }
 
         fn enqueue_job(

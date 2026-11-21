@@ -102,8 +102,12 @@ impl LedgerPersistenceRuntime for NoopPersistenceRuntime {
         false
     }
 
-    fn save_validated_ledger(&self, _ledger: Arc<Ledger>, _is_current: bool) -> bool {
-        true
+    fn save_validated_ledger(
+        &self,
+        _ledger: Arc<Ledger>,
+        _is_current: bool,
+    ) -> ledger::ValidatedLedgerSave {
+        ledger::ValidatedLedgerSave::Saved
     }
 
     fn enqueue_job(
@@ -138,8 +142,12 @@ impl LedgerPersistenceRuntime for FailingPersistenceRuntime {
         false
     }
 
-    fn save_validated_ledger(&self, _ledger: Arc<Ledger>, _is_current: bool) -> bool {
-        false
+    fn save_validated_ledger(
+        &self,
+        _ledger: Arc<Ledger>,
+        _is_current: bool,
+    ) -> ledger::ValidatedLedgerSave {
+        ledger::ValidatedLedgerSave::WriteFailed
     }
 
     fn enqueue_job(

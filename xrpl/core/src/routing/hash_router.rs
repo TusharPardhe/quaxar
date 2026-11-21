@@ -273,6 +273,22 @@ impl HashRouter {
         self.lock_state().emplace(key, now, hold_time).0.flags()
     }
 
+    /// rippled `HashRouter::clearFlags` (#8662): clear `flags` on `key`. A
+    /// hash without an entry is left without one, so clearing never creates
+    /// or refreshes an entry. Returns whether at least one of the flags was
+    /// set and is now clear.
+    pub fn clear_flags(&self, key: Uint256, flags: HashRouterFlags) -> bool {
+        assert!(any(flags), "HashRouter::clearFlags requires non-zero input");
+
+        let mut state = self.lock_state();
+        let Some(aged) = state.suppression_map.get_mut(&key) else {
+            return false;
+        };
+        let before = aged.entry.flags();
+        aged.entry.clear_flags(flags);
+        aged.entry.flags() != before
+    }
+
     pub fn should_relay(&self, key: Uint256) -> Option<BTreeSet<PeerShortId>> {
         let now = self.now();
         let hold_time = self.setup.hold_time;
@@ -333,6 +349,42 @@ mod tests {
     ) -> (HashRouter, Arc<ManualHashRouterClock>) {
         let clock = Arc::new(ManualHashRouterClock::new(start));
         (HashRouter::with_clock(setup, clock.clone()), clock)
+    }
+
+    // rippled #8662 `HashRouterTest.clear_flags_clears_only_the_named_flags`.
+    #[test]
+    fn clear_flags_clears_only_the_named_flags() {
+        let (router, _) = router_with_clock(HashRouterSetup::default(), Duration::from_secs(5));
+        let key1 = key(1);
+        assert!(router.set_flags(key1, HashRouterFlags::SAVED | HashRouterFlags::BAD));
+
+        assert!(router.clear_flags(key1, HashRouterFlags::SAVED));
+        assert_eq!(router.get_flags(key1), HashRouterFlags::BAD);
+
+        // The flag is clear, so setting it again is a change.
+        assert!(router.set_flags(key1, HashRouterFlags::SAVED));
+
+        // A mask with one set flag and one clear flag is still a change.
+        assert!(router.clear_flags(key1, HashRouterFlags::SAVED | HashRouterFlags::HELD));
+        assert_eq!(router.get_flags(key1), HashRouterFlags::BAD);
+    }
+
+    // rippled #8662 `HashRouterTest.clear_flags_reports_when_nothing_changes`.
+    #[test]
+    fn clear_flags_reports_when_nothing_changes() {
+        let (router, _) = router_with_clock(HashRouterSetup::default(), Duration::from_secs(5));
+        let key2 = key(2);
+
+        // No entry, so nothing to clear and no entry is created: the next
+        // insertion is a new one.
+        assert!(!router.clear_flags(key2, HashRouterFlags::SAVED));
+        assert_eq!(router.entry_count(), 0);
+        assert!(router.add_suppression_peer(key2, 0));
+
+        // An entry whose flags do not include the one named.
+        assert!(router.set_flags(key2, HashRouterFlags::BAD));
+        assert!(!router.clear_flags(key2, HashRouterFlags::SAVED));
+        assert_eq!(router.get_flags(key2), HashRouterFlags::BAD);
     }
 
     #[test]

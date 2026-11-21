@@ -3660,6 +3660,18 @@ fn application_root_shares_one_persistence_runtime_with_real_dedup_state_across_
         "mark_saved for the same hash through a second handle must observe \
          the first call's dedup state -- proving the runtime is truly shared"
     );
+    // rippled keeps SAVED in the application's HashRouter, so the flag
+    // expires with the router's hold time and a failed write can clear it.
+    assert_eq!(
+        app.registry.hash_router.get_flags(Uint256::from_u64(42)),
+        xrpl_core::HashRouterFlags::SAVED,
+        "the SAVED flag lives in the shared hash router"
+    );
+    first.clear_saved(hash);
+    assert!(
+        second.mark_saved(hash),
+        "clearing SAVED lets the next save of the same ledger run"
+    );
 }
 
 #[test]

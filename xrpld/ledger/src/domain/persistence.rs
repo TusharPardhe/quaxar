@@ -23,17 +23,36 @@ pub enum LedgerPersistenceJobType {
     PubOldLedger,
 }
 
+/// How one validated-ledger save ended. The two failures are handled
+/// differently, as in rippled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidatedLedgerSave {
+    Saved,
+    /// The accepted ledger could not be built because nodes were missing
+    /// (rippled `detail::saveValidatedLedger` returns `false` after
+    /// `LedgerMaster::failedSave`). The SAVED flag stays set.
+    MissingNodes,
+    /// A database write failed (rippled: the write throws). Since #8662 the
+    /// sequence leaves the complete range and both the pending-save mark and
+    /// the SAVED flag are released, so a later save can run.
+    WriteFailed,
+}
+
 pub trait LedgerPersistenceRuntime: Send + Sync + 'static {
     fn mark_saved(&self, hash: SHAMapHash) -> bool;
     fn start_work(&self, seq: u32) -> bool;
     fn finish_work(&self, seq: u32);
     fn should_work(&self, seq: u32, is_synchronous: bool) -> bool;
     fn pending(&self, seq: u32) -> bool;
-    fn save_validated_ledger(&self, ledger: Arc<Ledger>, is_current: bool) -> bool;
-    /// Invoked only when an asynchronously queued save fails after its caller
-    /// has received queue-admission success. The application owner clears the
-    /// optimistic completion claim and reacquires the exact ledger.
+    fn save_validated_ledger(&self, ledger: Arc<Ledger>, is_current: bool) -> ValidatedLedgerSave;
+    /// rippled `LedgerMaster::failedSave`: retract the complete-ledger claim
+    /// and reacquire the exact ledger. Runs when the accepted ledger had
+    /// missing nodes, for synchronous and queued saves alike.
     fn failed_save(&self, _seq: u32, _hash: SHAMapHash) {}
+    /// rippled `LedgerMaster::clearLedger`: stop advertising `seq` as complete.
+    fn clear_ledger(&self, _seq: u32) {}
+    /// rippled `HashRouter::clearFlags(hash, SAVED)`.
+    fn clear_saved(&self, _hash: SHAMapHash) {}
     fn enqueue_job(
         &self,
         job_type: LedgerPersistenceJobType,
@@ -104,21 +123,21 @@ pub fn pend_save_validated(
             job_type,
             job_name,
             Box::new(move || {
-                let _ = save_validated_ledger(runtime_for_job, ledger_for_job, is_current, true);
+                let _ = save_validated_ledger(runtime_for_job, ledger_for_job, is_current);
             }),
         ) {
             return true;
         }
     }
 
-    save_validated_ledger(runtime, ledger, is_current, false)
+    save_validated_ledger(runtime, ledger, is_current)
 }
 
+/// rippled `saveValidatedLedger` (LedgerPersistence.cpp).
 fn save_validated_ledger(
     runtime: Arc<dyn LedgerPersistenceRuntime>,
     ledger: Arc<Ledger>,
     is_current: bool,
-    notify_async_failure: bool,
 ) -> bool {
     let seq = ledger.header().seq;
     if !runtime.start_work(seq) {
@@ -126,12 +145,29 @@ fn save_validated_ledger(
     }
 
     let hash = ledger.header().hash;
-    let result = runtime.save_validated_ledger(ledger, is_current);
-    runtime.finish_work(seq);
-    if !result && notify_async_failure {
-        runtime.failed_save(seq, hash);
+    match runtime.save_validated_ledger(ledger, is_current) {
+        ValidatedLedgerSave::Saved => {
+            runtime.finish_work(seq);
+            true
+        }
+        ValidatedLedgerSave::MissingNodes => {
+            runtime.finish_work(seq);
+            runtime.failed_save(seq, hash);
+            false
+        }
+        ValidatedLedgerSave::WriteFailed => {
+            // rippled #8662: the ledger's rows may be gone, so stop
+            // advertising the sequence as complete. Then release the
+            // in-progress mark and the SAVED flag in the reverse of the order
+            // pend_save_validated takes them, or a concurrent enqueue could
+            // re-arm the flag and dedupe the retry away. rippled rethrows the
+            // database error here; quaxar reports `false` instead.
+            runtime.clear_ledger(seq);
+            runtime.finish_work(seq);
+            runtime.clear_saved(hash);
+            false
+        }
     }
-    result
 }
 
 pub fn load_ledger_helper<CLOCK, S, FB, F, MR, NS, J>(

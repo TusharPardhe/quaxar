@@ -16,7 +16,7 @@ use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::MonotonicClock;
 use ledger::{
     AcceptedLedger, Ledger, LedgerPersistenceJob, LedgerPersistenceJobType,
-    LedgerPersistenceRuntime,
+    LedgerPersistenceRuntime, ValidatedLedgerSave,
 };
 use nodestore::{FetchType, NodeObjectType as NodeStoreObjectType};
 use shamap::family::{
@@ -28,8 +28,28 @@ use shamap::tree_node_cache::TreeNodeCache;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use time::Duration;
+use xrpl_core::{HashRouter, HashRouterFlags};
 
 type FailedSaveHandler = Arc<dyn Fn(u32, SHAMapHash) + Send + Sync + 'static>;
+type ClearLedgerHandler = Arc<dyn Fn(u32) + Send + Sync + 'static>;
+
+/// Why [`save_validated_ledger_to_sql`] failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlSaveError {
+    /// The accepted ledger could not be built (missing nodes).
+    MissingNodes(String),
+    /// A database write failed.
+    Write(String),
+}
+
+impl std::fmt::Display for SqlSaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingNodes(error) => write!(f, "accepted ledger build failed: {error}"),
+            Self::Write(error) => write!(f, "database write failed: {error}"),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct PersistenceNodeStoreFetcher {
@@ -74,7 +94,7 @@ pub fn save_validated_ledger_to_sql(
     ledger: Arc<Ledger>,
     network_id: u32,
     node_store: Option<crate::SHAMapStoreNodeStore>,
-) -> Result<(), String> {
+) -> Result<(), SqlSaveError> {
     let accepted = if let Some(node_store) = node_store {
         let family = SHAMapFamily::new(
             Arc::new(TreeNodeCache::new(
@@ -88,12 +108,14 @@ pub fn save_validated_ledger_to_sql(
             NullMissingNodeReporter,
         );
         AcceptedLedger::new_with_family(Arc::clone(&ledger), &family)
-            .map_err(|error| format!("accepted ledger build failed: {error:?}"))?
+            .map_err(|error| SqlSaveError::MissingNodes(format!("{error:?}")))?
     } else {
         AcceptedLedger::new(Arc::clone(&ledger))
-            .map_err(|error| format!("accepted ledger build failed: {error:?}"))?
+            .map_err(|error| SqlSaveError::MissingNodes(format!("{error:?}")))?
     };
-    relational.write_accepted_ledger(&accepted, transaction_master, network_id)
+    relational
+        .write_accepted_ledger(&accepted, transaction_master, network_id)
+        .map_err(SqlSaveError::Write)
 }
 
 pub struct AppLedgerPersistenceRuntime {
@@ -102,7 +124,11 @@ pub struct AppLedgerPersistenceRuntime {
     transaction_master: Arc<TransactionMaster>,
     network_id: u32,
     ledger_db: Option<Arc<rdb::LedgerDb>>,
-    saved_hashes: Mutex<HashSet<SHAMapHash>>,
+    /// Holds the SAVED flag per ledger hash, as rippled's
+    /// `HashRouter::setFlags(hash, SAVED)`. Entries expire after the router's
+    /// hold time like every other entry. The application passes its shared
+    /// router; isolated construction gets a private one.
+    hash_router: Arc<HashRouter>,
     pending: Mutex<HashSet<u32>>,
     /// Background dispatch target for `enqueue_job`. `None` only in
     /// isolated/test construction; production wiring always attaches this
@@ -110,6 +136,7 @@ pub struct AppLedgerPersistenceRuntime {
     /// `app_.getJobQueue()` access from `pendSaveValidated`.
     job_queue: Option<Arc<crate::job::job_queue::JobQueue>>,
     failed_save_handler: Option<FailedSaveHandler>,
+    clear_ledger_handler: Option<ClearLedgerHandler>,
 }
 
 impl AppLedgerPersistenceRuntime {
@@ -164,20 +191,44 @@ impl AppLedgerPersistenceRuntime {
             transaction_master,
             network_id,
             ledger_db,
-            saved_hashes: Mutex::new(HashSet::new()),
+            hash_router: Arc::new(HashRouter::default()),
             pending: Mutex::new(HashSet::new()),
             job_queue,
             failed_save_handler,
+            clear_ledger_handler: None,
         }
+    }
+
+    /// Keep the SAVED flag in the application's shared router.
+    #[must_use]
+    pub fn with_hash_router(mut self, hash_router: Arc<HashRouter>) -> Self {
+        self.hash_router = hash_router;
+        self
+    }
+
+    /// rippled `LedgerMaster::clearLedger`, run when a database write fails.
+    #[must_use]
+    pub fn with_clear_ledger_handler(mut self, handler: ClearLedgerHandler) -> Self {
+        self.clear_ledger_handler = Some(handler);
+        self
     }
 }
 
 impl LedgerPersistenceRuntime for AppLedgerPersistenceRuntime {
     fn mark_saved(&self, hash: SHAMapHash) -> bool {
-        self.saved_hashes
-            .lock()
-            .expect("saved_hashes mutex must not be poisoned")
-            .insert(hash)
+        self.hash_router
+            .set_flags(*hash.as_uint256(), HashRouterFlags::SAVED)
+    }
+
+    fn clear_saved(&self, hash: SHAMapHash) {
+        self.hash_router
+            .clear_flags(*hash.as_uint256(), HashRouterFlags::SAVED);
+    }
+
+    fn clear_ledger(&self, seq: u32) {
+        if let Some(handler) = self.clear_ledger_handler.as_ref() {
+            handler(seq);
+        }
     }
 
     fn start_work(&self, seq: u32) -> bool {
@@ -205,16 +256,12 @@ impl LedgerPersistenceRuntime for AppLedgerPersistenceRuntime {
             .contains(&seq)
     }
 
-    fn save_validated_ledger(&self, ledger: Arc<Ledger>, _is_current: bool) -> bool {
+    fn save_validated_ledger(&self, ledger: Arc<Ledger>, _is_current: bool) -> ValidatedLedgerSave {
         // Write header to SQLite Ledgers table (compatibility: the reference source kADD_LEDGER).
         // This is the primary bootstrap source on restart — mirrors reference getLastFullLedger().
         if let Some(db) = self.ledger_db.as_ref()
             && let Err(error) = db.insert_ledger(&ledger.header())
         {
-            self.saved_hashes
-                .lock()
-                .expect("saved_hashes mutex must not be poisoned")
-                .remove(&ledger.header().hash);
             tracing::warn!(
                 target: "ledger",
                 seq = ledger.header().seq,
@@ -222,11 +269,11 @@ impl LedgerPersistenceRuntime for AppLedgerPersistenceRuntime {
                 %error,
                 "required ledger-header persistence failed"
             );
-            return false;
+            return ValidatedLedgerSave::WriteFailed;
         }
 
         let Some(relational) = self.relational_database.as_ref() else {
-            return true;
+            return ValidatedLedgerSave::Saved;
         };
 
         match save_validated_ledger_to_sql(
@@ -236,19 +283,18 @@ impl LedgerPersistenceRuntime for AppLedgerPersistenceRuntime {
             self.network_id,
             self.node_store.clone(),
         ) {
-            Ok(()) => true,
+            Ok(()) => ValidatedLedgerSave::Saved,
             Err(error) => {
-                self.saved_hashes
-                    .lock()
-                    .expect("saved_hashes mutex must not be poisoned")
-                    .remove(&ledger.header().hash);
                 tracing::info!(target: "ledger",
                     "[ledger_persistence] save failed seq={} hash={} error={}",
                     ledger.header().seq,
                     ledger.header().hash,
                     error
                 );
-                false
+                match error {
+                    SqlSaveError::MissingNodes(_) => ValidatedLedgerSave::MissingNodes,
+                    SqlSaveError::Write(_) => ValidatedLedgerSave::WriteFailed,
+                }
             }
         }
     }
