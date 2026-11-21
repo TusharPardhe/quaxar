@@ -223,3 +223,56 @@ fn validated_ledger_persistence_writes_cpp_style_relational_rows_and_marks_cache
     assert_eq!(cached.get_status(), TransStatus::COMMITTED);
     assert_eq!(cached.get_ledger(), 8123);
 }
+
+/// A failed ledger-header write is counted (and logged as
+/// `ledger_save_failed`), and the next successful save resets the run of
+/// failures while the total is kept.
+#[test]
+fn failed_header_write_is_counted_and_recovery_resets_the_run() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger_headers.db");
+    let ledger_db = Arc::new(rdb::LedgerDb::open(&path).expect("open ledger db"));
+    let persistence = Arc::new(AppLedgerPersistenceRuntime::new(
+        None,
+        None,
+        Arc::new(TransactionMaster::new()),
+        0,
+        Some(Arc::clone(&ledger_db)),
+    ));
+
+    // Make every header insert fail, as a broken database would.
+    let breaker = rusqlite::Connection::open(&path).expect("second connection");
+    breaker
+        .execute_batch("DROP TABLE Ledgers;")
+        .expect("drop table");
+
+    for seq in [9001, 9002] {
+        assert!(!pend_save_validated(
+            Arc::clone(&persistence) as Arc<dyn ledger::LedgerPersistenceRuntime>,
+            immutable_ledger_with_txs(&[], seq),
+            true,
+            true
+        ));
+    }
+    assert_eq!(persistence.save_failure_counts(), (2, 2));
+
+    // The database works again: the run resets, the total stays.
+    breaker
+        .execute_batch(
+            "CREATE TABLE Ledgers (
+                 LedgerHash TEXT NOT NULL, LedgerSeq INTEGER NOT NULL,
+                 PrevHash TEXT NOT NULL, TotalCoins TEXT NOT NULL,
+                 ClosingTime INTEGER NOT NULL, PrevClosingTime INTEGER NOT NULL,
+                 CloseTimeRes INTEGER NOT NULL, CloseFlags INTEGER NOT NULL,
+                 AccountSetHash TEXT NOT NULL, TransSetHash TEXT NOT NULL,
+                 PRIMARY KEY (LedgerHash));",
+        )
+        .expect("recreate table");
+    assert!(pend_save_validated(
+        Arc::clone(&persistence) as Arc<dyn ledger::LedgerPersistenceRuntime>,
+        immutable_ledger_with_txs(&[], 9003),
+        true,
+        true
+    ));
+    assert_eq!(persistence.save_failure_counts(), (0, 2));
+}

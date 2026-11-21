@@ -26,6 +26,7 @@ use shamap::node_object::NodeObject as SHAMapNodeObject;
 use shamap::storage::NodeObjectType as SHAMapNodeObjectType;
 use shamap::tree_node_cache::TreeNodeCache;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use time::Duration;
 use xrpl_core::{HashRouter, HashRouterFlags};
@@ -137,6 +138,31 @@ pub struct AppLedgerPersistenceRuntime {
     job_queue: Option<Arc<crate::job::job_queue::JobQueue>>,
     failed_save_handler: Option<FailedSaveHandler>,
     clear_ledger_handler: Option<ClearLedgerHandler>,
+    /// Failed saves since the last successful one, and since start.
+    consecutive_save_failures: AtomicU64,
+    total_save_failures: AtomicU64,
+}
+
+/// Which write of a validated-ledger save failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveStage {
+    /// `Ledgers` row in the ledger header database (`ledger_db`).
+    LedgerHeader,
+    /// Building the accepted ledger from the node store.
+    AcceptedLedger,
+    /// `Transactions` / `AccountTransactions` rows and the relational
+    /// `Ledgers` row.
+    Transactions,
+}
+
+impl SaveStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LedgerHeader => "ledger_header",
+            Self::AcceptedLedger => "accepted_ledger",
+            Self::Transactions => "transactions",
+        }
+    }
 }
 
 impl AppLedgerPersistenceRuntime {
@@ -196,6 +222,78 @@ impl AppLedgerPersistenceRuntime {
             job_queue,
             failed_save_handler,
             clear_ledger_handler: None,
+            consecutive_save_failures: AtomicU64::new(0),
+            total_save_failures: AtomicU64::new(0),
+        }
+    }
+
+    /// `(consecutive, total)` failed validated-ledger saves.
+    pub fn save_failure_counts(&self) -> (u64, u64) {
+        (
+            self.consecutive_save_failures.load(Ordering::Relaxed),
+            self.total_save_failures.load(Ordering::Relaxed),
+        )
+    }
+
+    fn note_save_succeeded(&self, ledger: &Ledger) {
+        let previous = self.consecutive_save_failures.swap(0, Ordering::Relaxed);
+        if previous > 0 {
+            tracing::warn!(
+                target: "ledger",
+                event = "ledger_save_recovered",
+                seq = ledger.header().seq,
+                failed_in_a_row = previous,
+                total_failures = self.total_save_failures.load(Ordering::Relaxed),
+                "validated ledger saves to the database are working again"
+            );
+        }
+    }
+
+    /// Log one failed save. The node keeps validating either way: the
+    /// database holds history and the restart point, not consensus state.
+    fn note_save_failed(
+        &self,
+        ledger: &Ledger,
+        stage: SaveStage,
+        outcome: ValidatedLedgerSave,
+        error: &dyn std::fmt::Display,
+    ) {
+        let consecutive = self
+            .consecutive_save_failures
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        let total = self.total_save_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        let seq = ledger.header().seq;
+        let hash = ledger.header().hash;
+        match outcome {
+            ValidatedLedgerSave::MissingNodes => tracing::warn!(
+                target: "ledger",
+                event = "ledger_save_failed",
+                kind = "missing_nodes",
+                stage = stage.as_str(),
+                seq,
+                %hash,
+                %error,
+                failed_in_a_row = consecutive,
+                total_failures = total,
+                action = "dropped from complete_ledgers; reacquiring the ledger",
+                "validated ledger not saved: nodes missing from the node store"
+            ),
+            _ => tracing::error!(
+                target: "ledger",
+                event = "ledger_save_failed",
+                kind = "write_failed",
+                stage = stage.as_str(),
+                seq,
+                %hash,
+                %error,
+                failed_in_a_row = consecutive,
+                total_failures = total,
+                action = "dropped from complete_ledgers; the next save of this ledger will retry",
+                "validated ledger not saved: database write failed. Validation continues, but \
+                 tx/account_tx history and the restart point stop advancing while this repeats. \
+                 Check free disk space and the database files under [database_path]"
+            ),
         }
     }
 
@@ -262,17 +360,13 @@ impl LedgerPersistenceRuntime for AppLedgerPersistenceRuntime {
         if let Some(db) = self.ledger_db.as_ref()
             && let Err(error) = db.insert_ledger(&ledger.header())
         {
-            tracing::warn!(
-                target: "ledger",
-                seq = ledger.header().seq,
-                hash = %ledger.header().hash,
-                %error,
-                "required ledger-header persistence failed"
-            );
-            return ValidatedLedgerSave::WriteFailed;
+            let outcome = ValidatedLedgerSave::WriteFailed;
+            self.note_save_failed(&ledger, SaveStage::LedgerHeader, outcome, &error);
+            return outcome;
         }
 
         let Some(relational) = self.relational_database.as_ref() else {
+            self.note_save_succeeded(&ledger);
             return ValidatedLedgerSave::Saved;
         };
 
@@ -283,18 +377,25 @@ impl LedgerPersistenceRuntime for AppLedgerPersistenceRuntime {
             self.network_id,
             self.node_store.clone(),
         ) {
-            Ok(()) => ValidatedLedgerSave::Saved,
+            Ok(()) => {
+                self.note_save_succeeded(&ledger);
+                ValidatedLedgerSave::Saved
+            }
             Err(error) => {
-                tracing::info!(target: "ledger",
-                    "[ledger_persistence] save failed seq={} hash={} error={}",
-                    ledger.header().seq,
-                    ledger.header().hash,
-                    error
-                );
-                match error {
-                    SqlSaveError::MissingNodes(_) => ValidatedLedgerSave::MissingNodes,
-                    SqlSaveError::Write(_) => ValidatedLedgerSave::WriteFailed,
-                }
+                let (stage, outcome, detail) = match &error {
+                    SqlSaveError::MissingNodes(detail) => (
+                        SaveStage::AcceptedLedger,
+                        ValidatedLedgerSave::MissingNodes,
+                        detail,
+                    ),
+                    SqlSaveError::Write(detail) => (
+                        SaveStage::Transactions,
+                        ValidatedLedgerSave::WriteFailed,
+                        detail,
+                    ),
+                };
+                self.note_save_failed(&ledger, stage, outcome, detail);
+                outcome
             }
         }
     }
