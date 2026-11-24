@@ -46,3 +46,65 @@ fn ledger_state_progresses_after_standalone_accept() {
     };
     assert!(!closed_hash.is_empty());
 }
+
+fn ledger_response(
+    source: &ApplicationServerInfo<&ApplicationRoot>,
+    ledger_index: u64,
+    api_version: u32,
+) -> std::collections::BTreeMap<String, protocol::JsonValue> {
+    let params = protocol::JsonValue::Object(std::collections::BTreeMap::from([(
+        "ledger_index".to_owned(),
+        protocol::JsonValue::Unsigned(ledger_index),
+    )]));
+    let protocol::JsonValue::Object(result) =
+        rpc::do_ledger(&params, rpc::RpcRole::User, api_version, source)
+    else {
+        panic!("ledger must return an object");
+    };
+    assert_eq!(result.get("error"), None, "ledger failed: {result:?}");
+    result
+}
+
+/// rippled `LedgerMaster::isValidated`: a ledger older than the newest
+/// validated one is still validated when it is in the validated chain. Before
+/// the fix quaxar compared against the newest ledger only and answered
+/// `validated: false` for every older ledger (mainnet, 2026-11-24). Also
+/// checks rippled `fillJson`: the header's `ledger_index` is a string in API
+/// v1 and a number from v2.
+#[test]
+fn ledger_reports_older_validated_ledgers_as_validated() {
+    let mut options = ApplicationRootOptions::default();
+    options.standalone = true;
+    let mut app = ApplicationRoot::with_options(options).expect("root shell should build");
+    let _ = app.attach_default_network_ops_runtime();
+    for _ in 0..3 {
+        app.accept_standalone_ledger().expect("standalone accept");
+    }
+    let source = ApplicationServerInfo::new(&app);
+    let newest = app
+        .validated_ledger()
+        .expect("standalone accept validates")
+        .header()
+        .seq;
+    let older = u64::from(newest - 1);
+
+    let v1 = ledger_response(&source, older, 1);
+    assert_eq!(v1.get("validated"), Some(&protocol::JsonValue::Bool(true)));
+    let Some(protocol::JsonValue::Object(header)) = v1.get("ledger") else {
+        panic!("ledger header must be an object: {v1:?}");
+    };
+    assert_eq!(
+        header.get("ledger_index"),
+        Some(&protocol::JsonValue::String(older.to_string()))
+    );
+
+    let v2 = ledger_response(&source, older, 2);
+    assert_eq!(v2.get("validated"), Some(&protocol::JsonValue::Bool(true)));
+    let Some(protocol::JsonValue::Object(header)) = v2.get("ledger") else {
+        panic!("ledger header must be an object: {v2:?}");
+    };
+    assert_eq!(
+        header.get("ledger_index"),
+        Some(&protocol::JsonValue::Unsigned(older))
+    );
+}

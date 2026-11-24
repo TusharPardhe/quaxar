@@ -580,3 +580,83 @@ fn ledger_to_json_synthetic_nft_fields_stay_in_metadata() {
         );
     }
 }
+
+#[derive(Debug)]
+struct NetworkContext {
+    api_version: u32,
+    network_id: u32,
+}
+
+impl LedgerToJsonContext for NetworkContext {
+    fn api_version(&self) -> u32 {
+        self.api_version
+    }
+
+    fn is_validated(&self, _ledger: &Ledger) -> bool {
+        true
+    }
+
+    fn get_close_time_by_seq(&self, _ledger_seq: u32) -> Option<NetClockTimePoint> {
+        None
+    }
+
+    fn network_id(&self) -> Option<u32> {
+        Some(self.network_id)
+    }
+}
+
+/// rippled develop LedgerToJson `fillJsonTx` (#6401): every expanded
+/// transaction (JSON v1, JSON v2 and binary) carries `ctid` built from the
+/// ledger sequence, the metadata's TransactionIndex and the network ID; the
+/// transaction's own NetworkID overrides the server's. Before the fix quaxar
+/// never wrote `ctid` in `ledger` responses.
+#[test]
+fn ledger_to_json_tx_expanded_entries_carry_ctid() {
+    let ledger = base_ledger(44, true);
+    let tx = payment_tx(10);
+    let meta = payment_meta(tx.get_transaction_id(), 44, None);
+    let txs = [LedgerTxEntry {
+        txn: &tx,
+        meta: Some(&meta),
+    }];
+    let mut networked = payment_tx(11);
+    networked.set_field_u32(get_field_by_symbol("sfNetworkID"), 9);
+    let networked_meta = payment_meta(networked.get_transaction_id(), 44, None);
+    let networked_txs = [LedgerTxEntry {
+        txn: &networked,
+        meta: Some(&networked_meta),
+    }];
+
+    let ctid_of = |txs: &[LedgerTxEntry<'_>], api_version: u32, binary: bool| {
+        let context = NetworkContext {
+            api_version,
+            network_id: 5,
+        };
+        let mut options = LedgerFillOptions::DUMP_TXRP | LedgerFillOptions::EXPAND;
+        if binary {
+            options = options | LedgerFillOptions::BINARY;
+        }
+        let rendered = get_json(
+            &AppLedgerFill::new(&ledger, options)
+                .with_context(&context)
+                .with_transactions(txs),
+        )
+        .expect("ledger json should render");
+        let rendered = object(rendered);
+        object(array(rendered.get("transactions").expect("transactions"))[0].clone())
+            .get("ctid")
+            .cloned()
+    };
+
+    // (0xC000_0000 + 44) << 32 | 2 << 16 | network
+    let server = Some(JsonValue::String("C000002C00020005".to_owned()));
+    let own = Some(JsonValue::String("C000002C00020009".to_owned()));
+    for (api_version, binary) in [(1, false), (2, false), (1, true), (2, true)] {
+        assert_eq!(ctid_of(&txs, api_version, binary), server, "v{api_version} binary={binary}");
+        assert_eq!(
+            ctid_of(&networked_txs, api_version, binary),
+            own,
+            "v{api_version} binary={binary}"
+        );
+    }
+}

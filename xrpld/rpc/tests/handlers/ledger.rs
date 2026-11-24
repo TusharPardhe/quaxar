@@ -89,6 +89,7 @@ impl LedgerSource for TestSource {
         &self,
         ledger: LedgerLookupLedger,
         options: LedgerFillOptions,
+        _api_version: u32,
     ) -> Result<JsonValue, RpcStatus> {
         self.selected_calls
             .borrow_mut()

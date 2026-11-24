@@ -1,93 +1,75 @@
-//! Ledger header RPC handler slice.
+//! Ledger header RPC handler slice (rippled `doLedgerHeader`).
 
 use basics::str_hex::str_hex;
+use ledger::LedgerFillOptions;
 use protocol::{
     JsonValue, LedgerHeader, serialize_ledger_header as serialize_protocol_ledger_header,
 };
 use std::collections::BTreeMap;
 
-use crate::handlers::ledger_lookup::RpcStatus;
+use crate::handlers::ledger::{LedgerSource, set_ledger_index_type};
+use crate::handlers::ledger_lookup::{
+    LedgerLookupContext, LedgerLookupLedger, RpcErrorCode, RpcRole, RpcStatus,
+    lookup_ledger_with_result,
+};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LedgerHeaderResolved {
-    pub base_json: JsonValue,
-    pub header: LedgerHeader,
+
+pub struct LedgerHeaderRequest<'a> {
+    pub params: &'a JsonValue,
+    pub api_version: u32,
+    pub role: RpcRole,
 }
 
-pub trait LedgerHeaderSource {
-    fn resolve_ledger_header(&self) -> Result<LedgerHeaderResolved, RpcStatus>;
+pub trait LedgerHeaderSource: LedgerSource {
+    /// The header of the ledger the lookup selected.
+    fn ledger_header(&self, ledger: &LedgerLookupLedger) -> Option<LedgerHeader>;
 }
 
 pub fn serialize_ledger_header(header: &LedgerHeader) -> Vec<u8> {
     serialize_protocol_ledger_header(header, false)
 }
 
-fn ensure_object(json: &mut JsonValue) -> &mut BTreeMap<String, JsonValue> {
-    if !matches!(json, JsonValue::Object(_)) {
-        *json = JsonValue::Object(BTreeMap::new());
-    }
-
-    let JsonValue::Object(object) = json else {
-        unreachable!("json value should now be an object");
-    };
-    object
+fn error_json(status: RpcStatus) -> JsonValue {
+    let mut error = JsonValue::Object(BTreeMap::new());
+    status.inject(&mut error);
+    error
 }
 
-pub fn do_ledger_header<S: LedgerHeaderSource>(source: &S) -> JsonValue {
-    let resolved = match source.resolve_ledger_header() {
-        Ok(resolved) => resolved,
-        Err(status) => {
-            let mut error = JsonValue::Object(BTreeMap::new());
-            status.inject(&mut error);
-            return error;
-        }
+/// rippled `doLedgerHeader`: `lookupLedger` (so the request's ledger
+/// selector is honored and `ledger_hash`, `ledger_index`, `validated` are
+/// set), then `ledger_data` as the hex of the serialized header, then
+/// `ledger` from the same LedgerToJson writer as `ledger` with no options.
+pub fn do_ledger_header<S: LedgerHeaderSource>(
+    request: &LedgerHeaderRequest<'_>,
+    source: &S,
+) -> JsonValue {
+    let context = LedgerLookupContext {
+        params: request.params,
+        source,
+        api_version: request.api_version,
+        role: request.role,
     };
+    let (ledger, mut result) = match lookup_ledger_with_result(&context) {
+        Ok(value) => value,
+        Err(status) => return error_json(status),
+    };
+    let Some(header) = source.ledger_header(&ledger) else {
+        return error_json(RpcStatus::new(RpcErrorCode::LedgerNotFound));
+    };
+    let mut ledger_json =
+        match source.render_selected_ledger(ledger, LedgerFillOptions::new(0), request.api_version)
+        {
+            Ok(json) => json,
+            Err(status) => return error_json(status),
+        };
+    set_ledger_index_type(&mut ledger_json, request.api_version);
 
-    let mut result = resolved.base_json;
-    let object = ensure_object(&mut result);
-
-    // Binary-encoded header data
-    object.insert(
-        "ledger_data".to_owned(),
-        JsonValue::String(str_hex(serialize_ledger_header(&resolved.header))),
-    );
-
-    // JSON header fields matching rippled's ledger_header response
-    let mut ledger = BTreeMap::new();
-    ledger.insert(
-        "ledger_hash".to_owned(),
-        JsonValue::String(resolved.header.hash.to_string()),
-    );
-    ledger.insert(
-        "ledger_index".to_owned(),
-        JsonValue::String(resolved.header.seq.to_string()),
-    );
-    ledger.insert(
-        "close_time".to_owned(),
-        JsonValue::Unsigned(u64::from(resolved.header.close_time)),
-    );
-    ledger.insert(
-        "parent_close_time".to_owned(),
-        JsonValue::Unsigned(u64::from(resolved.header.parent_close_time)),
-    );
-    ledger.insert(
-        "parent_hash".to_owned(),
-        JsonValue::String(resolved.header.parent_hash.to_string()),
-    );
-    ledger.insert(
-        "total_coins".to_owned(),
-        JsonValue::String(resolved.header.drops.to_string()),
-    );
-    ledger.insert(
-        "transaction_hash".to_owned(),
-        JsonValue::String(resolved.header.tx_hash.to_string()),
-    );
-    ledger.insert(
-        "account_hash".to_owned(),
-        JsonValue::String(resolved.header.account_hash.to_string()),
-    );
-    ledger.insert("closed".to_owned(), JsonValue::Bool(true));
-    object.insert("ledger".to_owned(), JsonValue::Object(ledger));
-
+    if let JsonValue::Object(object) = &mut result {
+        object.insert(
+            "ledger_data".to_owned(),
+            JsonValue::String(str_hex(serialize_ledger_header(&header))),
+        );
+        object.insert("ledger".to_owned(), ledger_json);
+    }
     result
 }

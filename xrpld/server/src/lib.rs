@@ -656,7 +656,14 @@ where
                     };
                     RpcReply::result(rpc::do_consensus_info(&context))
                 }
-                "ledger_header" => RpcReply::result(rpc::do_ledger_header(&self.source)),
+                "ledger_header" => RpcReply::result(rpc::do_ledger_header(
+                    &rpc::LedgerHeaderRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                )),
                 "account_channels" => RpcReply::result(rpc::do_account_channels(
                     &rpc::AccountChannelsRequest {
                         params: &params,

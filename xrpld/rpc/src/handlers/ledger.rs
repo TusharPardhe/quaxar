@@ -22,10 +22,13 @@ pub trait LedgerSource: LedgerLookupSource {
         false
     }
 
+    /// Render the selected ledger as rippled `getJson(LedgerFill)` would for
+    /// `api_version` (transaction shapes and the header differ by version).
     fn render_selected_ledger(
         &self,
         ledger: LedgerLookupLedger,
         options: LedgerFillOptions,
+        api_version: u32,
     ) -> Result<JsonValue, RpcStatus>;
 
     fn render_closed_ledger(&self) -> Result<JsonValue, RpcStatus>;
@@ -55,18 +58,36 @@ fn merge_objects(target: &mut JsonValue, source: &JsonValue) {
     }
 }
 
-fn normalize_ledger_index_string(value: &mut JsonValue) {
+/// rippled LedgerToJson `fillJson`: the ledger header's `ledger_index` is a
+/// string in API v1 and a number from v2. Applies to a ledger object and to a
+/// `{"ledger": {...}}` wrapper.
+pub(crate) fn set_ledger_index_type(value: &mut JsonValue, api_version: u32) {
     let JsonValue::Object(object) = value else {
         return;
     };
+    if let Some(JsonValue::Object(_)) = object.get("ledger") {
+        set_ledger_index_type(
+            object.get_mut("ledger").expect("ledger key checked above"),
+            api_version,
+        );
+    }
     let Some(index) = object.get_mut("ledger_index") else {
         return;
     };
-    match index {
-        JsonValue::Unsigned(number) => *index = JsonValue::String(number.to_string()),
-        JsonValue::Signed(number) => *index = JsonValue::String(number.to_string()),
-        _ => {}
-    }
+    let number = match index {
+        JsonValue::Unsigned(number) => *number,
+        JsonValue::Signed(number) if *number >= 0 => *number as u64,
+        JsonValue::String(text) => match text.parse::<u64>() {
+            Ok(number) => number,
+            Err(_) => return,
+        },
+        _ => return,
+    };
+    *index = if api_version > 1 {
+        JsonValue::Unsigned(number)
+    } else {
+        JsonValue::String(number.to_string())
+    };
 }
 
 fn parse_flag(params: &JsonValue, field: &str) -> bool {
@@ -174,8 +195,8 @@ fn render_selected<S: LedgerSource>(
         return Err(RpcStatus::new(RpcErrorCode::InvalidParams));
     }
 
-    let mut rendered = source.render_selected_ledger(ledger, options)?;
-    normalize_ledger_index_string(&mut rendered);
+    let mut rendered = source.render_selected_ledger(ledger, options, api_version)?;
+    set_ledger_index_type(&mut rendered, api_version);
     if matches!(&rendered, JsonValue::Object(object) if object.contains_key("ledger")) {
         merge_objects(&mut result, &rendered);
     } else {

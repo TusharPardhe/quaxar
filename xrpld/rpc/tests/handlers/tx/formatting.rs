@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use app::SqliteSHAMapStoreRelational;
 use quaxar_core::{DatabaseCon, LEDGER_DB_INIT, TRANSACTION_DB_INIT};
 
-fn attach_test_relational(app: &mut ApplicationRoot, label: &str) -> Arc<DatabaseCon> {
+pub(super) fn attach_test_relational(app: &mut ApplicationRoot, label: &str) -> Arc<DatabaseCon> {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be after epoch")
@@ -35,7 +35,7 @@ fn attach_test_relational(app: &mut ApplicationRoot, label: &str) -> Arc<Databas
     transaction_db
 }
 
-fn insert_sql_transaction(
+pub(super) fn insert_sql_transaction(
     transaction_db: &DatabaseCon,
     tx: &STTx,
     meta: &TxMeta,

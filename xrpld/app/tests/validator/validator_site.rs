@@ -155,11 +155,11 @@ fn validator_site_applies_valid_json_response() {
     let entries = entries(&site);
     assert_eq!(
         json_string(&entries[0], "last_refresh_time"),
-        "2033-May-18 03:33:20"
+        "2033-May-18 03:33:20.000000000 UTC"
     );
     assert_eq!(
         json_string(&entries[0], "next_refresh_time"),
-        "2033-May-18 03:38:20"
+        "2033-May-18 03:38:20.000000000 UTC"
     );
 }
 
@@ -217,10 +217,10 @@ fn validator_site_records_retryable_fetch_errors() {
     );
     assert_eq!(
         json_string(&entries[0], "last_refresh_time"),
-        "2036-Jul-18 13:20:00"
+        "2036-Jul-18 13:20:00.000000000 UTC"
     );
     assert_eq!(
         json_string(&entries[0], "next_refresh_time"),
-        "2036-Jul-18 13:20:30"
+        "2036-Jul-18 13:20:30.000000000 UTC"
     );
 }

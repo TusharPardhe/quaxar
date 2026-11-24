@@ -457,7 +457,13 @@ fn tx_ctid_only_uses_explicit_lookup_network_id() {
     let JsonValue::Object(v1) = v1 else {
         panic!("result must be an object");
     };
-    assert_eq!(v1.get("ctid"), None);
+    // rippled Transaction::getJson: the transaction's own sfNetworkID overrides
+    // the local network ID for the ctid written inside the transaction JSON
+    // (flat in v1). No lookup network ID means no top-level override.
+    assert_eq!(
+        v1.get("ctid"),
+        Some(&JsonValue::String("C000000300030009".to_owned()))
+    );
 
     let v2 = do_tx(
         &TxRequest {
@@ -470,4 +476,11 @@ fn tx_ctid_only_uses_explicit_lookup_network_id() {
         panic!("result must be an object");
     };
     assert_eq!(v2.get("ctid"), None);
+    let Some(JsonValue::Object(tx_json)) = v2.get("tx_json") else {
+        panic!("v2 must carry tx_json");
+    };
+    assert_eq!(
+        tx_json.get("ctid"),
+        Some(&JsonValue::String("C000000300030009".to_owned()))
+    );
 }
