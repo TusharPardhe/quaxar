@@ -5470,6 +5470,15 @@ impl ApplicationRoot {
         self.registry.tx_q.get_metrics(&mut lock, current.as_ref())
     }
 
+    /// [`Self::tx_q_rpc_report`] for RPC readers: does not wait on the TxQ
+    /// mutex (see `SharedAppTxQ::current_rpc_report_nonblocking`).
+    pub fn tx_q_rpc_report_nonblocking(&self) -> QueueTxQRpcReport {
+        let current = self.registry.open_ledger.current();
+        self.registry
+            .tx_q
+            .current_rpc_report_nonblocking(current.as_ref())
+    }
+
     pub fn tx_q_rpc_report(&self) -> QueueTxQRpcReport {
         let current = self.registry.open_ledger.current();
         let mut lock = AppTxQLock;

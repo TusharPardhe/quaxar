@@ -682,13 +682,15 @@ fn builtin_dispatcher_routes_ping_and_server_info() {
         server::RpcReply::Result(value) => value,
         other => panic!("unexpected rpc reply: {other:?}"),
     };
+    // rippled doFee reads the live open ledger and queue, not the report
+    // published at the last close.
     assert_eq!(
         from_protocol_json(&fee)["ledger_current_index"],
-        serde_json::Value::Number(101_u64.into())
+        serde_json::Value::Number(u64::from(app.tx_q_rpc_report().ledger_current_index).into())
     );
     assert_eq!(
         from_protocol_json(&fee)["drops"]["open_ledger_fee"],
-        serde_json::Value::String("20".to_owned())
+        serde_json::Value::String(app.tx_q_rpc_report().drops.open_ledger_fee)
     );
 
     let ledger_current = dispatcher.dispatch(RpcRequest {
