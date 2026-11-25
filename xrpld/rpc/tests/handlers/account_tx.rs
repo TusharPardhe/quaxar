@@ -149,6 +149,7 @@ fn source() -> FakeSource {
                 txn_index: Some(3),
                 network_id: Some(0),
             }],
+            binary_transactions: Vec::new(),
         },
         close_times: BTreeMap::from([(22, NetClockTimePoint::new(600_000_100))]),
     }
@@ -218,6 +219,7 @@ fn account_tx_preserves_persisted_mpt_delivered_amount_in_json_and_binary() {
                     network_id: Some(0),
                 },
             ],
+            binary_transactions: Vec::new(),
         },
         close_times: BTreeMap::from([(22, NetClockTimePoint::new(600_000_100))]),
     };

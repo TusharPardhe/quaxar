@@ -39,7 +39,8 @@ use crate::handlers::TxSource;
 use crate::handlers::account_info::{AccountInfoSource, AccountQueueTransaction};
 use crate::handlers::account_lines::AccountLinesSource;
 use crate::handlers::account_tx::{
-    AccountTxLedgerRange, AccountTxMarker, AccountTxPage, AccountTxQuery, AccountTxSource,
+    AccountTxBinaryRow, AccountTxLedgerRange, AccountTxMarker, AccountTxPage, AccountTxQuery,
+    AccountTxSource,
 };
 use crate::handlers::ledger_entry::LedgerEntrySource;
 use crate::handlers::manifest::ManifestSource;
@@ -860,10 +861,22 @@ fn read_lookup_ledger_entry<V: AppServerInfoView>(
     let resolved = resolve_lookup_ledger(view, ledger)?;
     match resolved.read(keylet) {
         Ok(Some(entry)) => Some(entry),
+        // A miss in a state map that is this ledger's state is final: the
+        // descent reached an empty branch or another leaf, and a node it could
+        // not load would have been an error. Re-reading it through a freshly
+        // hydrated ledger doubled the cost of every not-found lookup
+        // (account_info / amm_info for missing objects, 2026-11-24 benchmark).
+        Ok(None) if state_map_is_loaded(&resolved) => None,
         Ok(None) | Err(_) => view
             .app()
             .and_then(|app| read_lookup_ledger_entry_with_family(app, resolved.as_ref(), keylet)),
     }
+}
+
+/// Whether the ledger's in-memory state map is its state (root hash equals
+/// the header's account hash), so a lookup miss in it is authoritative.
+fn state_map_is_loaded(ledger: &ledger::Ledger) -> bool {
+    ledger.state_map().root().get_hash() == ledger.header().account_hash
 }
 
 fn succ_lookup_ledger_key<V: AppServerInfoView>(
@@ -883,6 +896,8 @@ fn succ_lookup_ledger_key<V: AppServerInfoView>(
     let resolved = resolve_lookup_ledger(view, ledger)?;
     match resolved.succ(key, last) {
         Ok(Some(entry)) => Some(entry),
+        // As for reads: no successor in a loaded state map is final.
+        Ok(None) if state_map_is_loaded(&resolved) => None,
         Ok(None) | Err(_) => view
             .app()
             .and_then(|app| succ_lookup_ledger_key_with_family(app, resolved.as_ref(), key, last)),
@@ -1253,6 +1268,7 @@ impl<V: AppServerInfoView> AccountTxSource for ApplicationServerInfo<V> {
 
     fn page(&self, query: &AccountTxQuery) -> Result<AccountTxPage, Status> {
         let mut page_rows: Vec<(crate::state::TxRecord, AccountTxMarker)> = Vec::new();
+        let mut binary_rows: Vec<(AccountTxBinaryRow, AccountTxMarker)> = Vec::new();
 
         let maybe_transaction_db = self
             .view
@@ -1347,6 +1363,25 @@ impl<V: AppServerInfoView> AccountTxSource for ApplicationServerInfo<V> {
             };
             drop(connection);
 
+            // rippled accountTxPage, binary: the stored blobs go out as hex
+            // without being parsed, and the response needs no ledger header.
+            if query.binary {
+                for (ledger_seq, txn_seq, _status, raw_txn, raw_meta) in raw_rows {
+                    binary_rows.push((
+                        AccountTxBinaryRow {
+                            tx_blob: raw_txn,
+                            meta_blob: raw_meta,
+                            ledger_index: ledger_seq,
+                        },
+                        AccountTxMarker {
+                            ledger: ledger_seq,
+                            seq: txn_seq,
+                        },
+                    ));
+                }
+                return Ok(binary_page(query, binary_rows));
+            }
+
             // One header lookup per ledger, not per transaction.
             let mut headers: std::collections::HashMap<u32, Option<(Uint256, NetClockTimePoint)>> =
                 std::collections::HashMap::new();
@@ -1401,6 +1436,7 @@ impl<V: AppServerInfoView> AccountTxSource for ApplicationServerInfo<V> {
             limit: query.limit,
             marker,
             transactions: page_rows.into_iter().map(|(record, _)| record).collect(),
+            binary_transactions: Vec::new(),
         })
     }
 
@@ -1662,6 +1698,26 @@ fn get_ledger_obj<V: AppServerInfoView>(
     None
 }
 
+/// The binary `account_tx` page: rows beyond `limit` become the marker, as in
+/// the JSON page.
+fn binary_page(
+    query: &AccountTxQuery,
+    mut rows: Vec<(AccountTxBinaryRow, AccountTxMarker)>,
+) -> AccountTxPage {
+    let mut marker = None;
+    if rows.len() > query.limit as usize {
+        marker = rows.get(query.limit as usize).map(|(_, marker)| *marker);
+        rows.truncate(query.limit as usize);
+    }
+    AccountTxPage {
+        ledger_range: query.ledger_range,
+        limit: query.limit,
+        marker,
+        transactions: Vec::new(),
+        binary_transactions: rows.into_iter().map(|(row, _)| row).collect(),
+    }
+}
+
 /// rippled `LedgerFill::context` for the RPC layer: API version, whether the
 /// ledger is validated (expanded transactions carry `validated`,
 /// `ledger_index`, `close_time_iso`), and close times by sequence.
@@ -1717,6 +1773,24 @@ impl<V: AppServerInfoView> app::LedgerToJsonContext for RpcLedgerJsonContext<'_,
     fn network_id(&self) -> Option<u32> {
         Some(self.view.network_id())
     }
+
+    /// rippled LedgerToJson `fillJsonTx`: `owner_funds` for an OfferCreate is
+    /// `accountFunds(ledger, account, TakerGets, IgnoreFreeze, IgnoreAuth)`.
+    /// Quaxar never filled it in (mainnet, 2026-11-25).
+    fn account_funds(
+        &self,
+        ledger: &ledger::Ledger,
+        account: protocol::AccountID,
+        amount: &protocol::STAmount,
+    ) -> Option<String> {
+        ledger::account_funds_text(
+            ledger,
+            account,
+            amount,
+            ledger::FreezeHandling::IgnoreFreeze,
+        )
+        .ok()
+    }
 }
 
 impl<V: AppServerInfoView> LedgerSource for ApplicationServerInfo<V> {
@@ -1736,23 +1810,50 @@ impl<V: AppServerInfoView> LedgerSource for ApplicationServerInfo<V> {
             api_version,
         };
 
-        // For full/state/transaction dumps, use the family-aware path so
-        // traversal can fetch released nodes from the NodeStore rather than
-        // rendering an empty TransactionMd map.
-        if options.contains(LedgerFillOptions::FULL)
-            || options.contains(LedgerFillOptions::DUMP_STATE)
-            || options.contains(LedgerFillOptions::DUMP_TXRP)
+        let dump_state = options.contains(LedgerFillOptions::FULL)
+            || options.contains(LedgerFillOptions::DUMP_STATE);
+        let dump_txs = dump_state || options.contains(LedgerFillOptions::DUMP_TXRP);
+        // A recent ledger's transaction map is usually in memory: read it
+        // there first. Walking it through a per-request node-store family
+        // re-read every node from disk (2026-11-24 benchmark: ledger with
+        // transactions 1.16x slower than rippled).
+        let snapshot = if dump_txs && !dump_state {
+            ledger.tx_snapshot().ok()
+        } else {
+            None
+        };
+
+        // State dumps, and transaction maps that are not all in memory, use
+        // the family-aware path so traversal can fetch released nodes from
+        // the NodeStore rather than rendering an empty map.
+        if dump_txs
+            && snapshot.is_none()
+            && let Some(app) = self.view.app()
+            && let Some(family) = build_rpc_state_family(app)
         {
-            if let Some(app) = self.view.app()
-                && let Some(family) = build_rpc_state_family(app)
-            {
-                let app_fill = app::AppLedgerFill::new(&ledger, options).with_context(&context);
-                return app::get_json_with_family(&app_fill, &family)
-                    .map_err(|_| RpcStatus::new(RpcErrorCode::Internal));
-            }
+            let app_fill = app::AppLedgerFill::new(&ledger, options).with_context(&context);
+            return app::get_json_with_family(&app_fill, &family)
+                .map_err(|_| RpcStatus::new(RpcErrorCode::Internal));
         }
 
-        let fill = AppLedgerFill::new(&ledger, options).with_context(&context);
+        // Without a node store (standalone/test roots) the transactions are
+        // read from the in-memory map; the fill renders only the entries it
+        // is given.
+        let snapshot = match snapshot {
+            Some(snapshot) => snapshot,
+            None if dump_txs => ledger.tx_snapshot().unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let entries: Vec<app::LedgerTxEntry<'_>> = snapshot
+            .iter()
+            .map(|(txn, meta)| app::LedgerTxEntry {
+                txn: txn.as_ref(),
+                meta: Some(meta),
+            })
+            .collect();
+        let fill = AppLedgerFill::new(&ledger, options)
+            .with_context(&context)
+            .with_transactions(&entries);
         app_get_json(&fill).map_err(|_| RpcStatus::new(RpcErrorCode::Internal))
     }
 
@@ -2204,13 +2305,16 @@ impl<V: AppServerInfoView> crate::handlers::book_changes::BookChangesSource
         // the memory-only walk then saw no transactions and reported no
         // changes (mainnet ledger 108548865, 2026-11-24). Read through the
         // node store; without one, use the in-memory walk.
-        let snapshot = self
-            .view
-            .app()
-            .and_then(build_rpc_state_family)
-            .map(|family| resolved.tx_snapshot_with_family(&family))
-            .unwrap_or_else(|| resolved.tx_snapshot())
-            .ok()?;
+        // The in-memory walk errors (it does not return a partial list) when
+        // a node is not loaded; only then read through the node store.
+        let snapshot = match resolved.tx_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(_) => self
+                .view
+                .app()
+                .and_then(build_rpc_state_family)
+                .and_then(|family| resolved.tx_snapshot_with_family(&family).ok())?,
+        };
         let transactions = snapshot
             .into_iter()
             .map(
