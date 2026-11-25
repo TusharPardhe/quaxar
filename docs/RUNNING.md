@@ -510,6 +510,43 @@ The tool's nodes options must match `keyspace_options` in
 `compaction_base_mb`). Keep the old directory until the node has run cleanly.
 Needs free disk of about twice the store size during compaction.
 
+### Dropping untracked nodes (`--reachable`)
+
+Nodes written before the leak fix (`docs/design/2026-11-09-pruned-store-leak.md`)
+are in no retained ledger and in none of the pruning bookkeeping, so the
+pruned store never deletes them. `--reachable` copies only the `nodes` entries
+that are:
+
+- reachable from a ledger at or above the retained floor (`meta/pruned_to + 1`):
+  the state, transaction and header roots of each such row in `ledger.db` and
+  `ledger_headers.db`, plus the claimed and completed state roots in `meta`;
+- named by a `counts`, `notebook` or `unclaimed` row;
+- ledger header objects.
+
+All other keyspaces are copied whole. The copy stops if the claimed state tree
+is incomplete in the old store. After compaction the tool walks every root
+again in the new store and fails unless it finds exactly the nodes found in
+the old one.
+
+Run it as the service user, so that SQLite creates no root-owned files beside
+the databases:
+
+```bash
+sudo systemctl stop quaxar
+sudo -u rippled ./tools/fjall-rebuild/target/release/fjall-rebuild --reachable \
+    /srv/quaxar/rippled/db/fjall /srv/quaxar/rippled/db/fjall.new /srv/quaxar/rippled/db
+sudo mv /srv/quaxar/rippled/db/fjall /srv/quaxar/fjall.old
+sudo mv /srv/quaxar/rippled/db/fjall.new /srv/quaxar/rippled/db/fjall
+sudo systemctl start quaxar
+```
+
+`--reachable-dry-run <store> <db-dir>` walks and counts without writing. It can
+run beside a live node on a hard-linked copy of the store (journals and
+version files copied, `keyspaces/*/tables` linked with `cp -al`) and of the
+SQLite files. Set `FJALL_REBUILD_THREADS=4 FJALL_REBUILD_CACHE_MB=128` there
+to limit its load. The walk's node set takes about 50 bytes per kept node
+(about 1.5 GB at 30M nodes).
+
 ## Priming the NodeStore from a Snapshot
 
 A snapshot transfers immutable node objects from an existing node. Importing
