@@ -6378,6 +6378,7 @@ mod tests {
             .expect("fjall pruning driver");
         assert_eq!(driver.store().metrics().claimed_seq, None, "empty store");
 
+        let _serial = baseline::serial_for_test();
         baseline::clear_for_test();
         super::wire_trusted_baseline(&driver);
         assert!(baseline::active().is_none(), "nothing claimed yet");

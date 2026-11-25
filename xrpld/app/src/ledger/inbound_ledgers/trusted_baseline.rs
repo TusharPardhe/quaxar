@@ -377,6 +377,16 @@ pub(crate) fn retire(reason: &'static str) -> Option<TrustedBaselineStats> {
 }
 
 
+/// Tests that use the process-wide baseline hold this, so parallel tests do
+/// not replace each other's baseline.
+#[cfg(test)]
+pub(crate) fn serial_for_test() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 pub(crate) fn clear_for_test() {
     if let Ok(mut guard) = slot().write() {
@@ -424,6 +434,7 @@ mod tests {
     /// completion replaces it; once any claim exists claims own it.
     #[test]
     fn completed_acquisition_seeds_baseline_until_the_first_claim() {
+        let _serial = serial_for_test();
         clear_for_test();
         let root = SHAMapTreeNode::new_inner(0);
         root.set_child_hash(1, hash(0x11));
@@ -466,6 +477,7 @@ mod tests {
     /// instead of leaving the node with none once the claim is retired.
     #[test]
     fn stale_claim_is_replaced_by_the_first_completion() {
+        let _serial = serial_for_test();
         clear_for_test();
         let root = SHAMapTreeNode::new_inner(0);
         root.set_child_hash(2, hash(0x22));
@@ -521,6 +533,7 @@ mod tests {
     /// so an in-flight holder of the previous Arc stops trusting it.
     #[test]
     fn advance_replaces_and_retires_previous_baseline() {
+        let _serial = serial_for_test();
         clear_for_test();
         let (first, x_hash, _, _) = baseline();
         let first = Arc::new(first);
