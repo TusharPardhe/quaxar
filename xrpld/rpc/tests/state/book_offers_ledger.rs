@@ -27,12 +27,19 @@ struct TwoLedgerView {
     inner: OwnedApplicationServerInfo,
     validated: Arc<Ledger>,
     closed: Arc<Ledger>,
+    /// Expose the application (and its node store) to the source.
+    with_app: bool,
 }
 
 impl AppServerInfoView for TwoLedgerView {
     fn app(&self) -> Option<&ApplicationRoot> {
-        // No LedgerMaster: only the two ledgers below are resolvable.
-        None
+        // Without the app there is no LedgerMaster: only the two ledgers
+        // below are resolvable.
+        if self.with_app {
+            self.inner.app()
+        } else {
+            None
+        }
     }
 
     fn status_snapshot(&self) -> StatusRpcSnapshot {
@@ -231,6 +238,7 @@ fn book_offers_reads_the_requested_ledger_not_the_validated_ledger() {
         inner: OwnedApplicationServerInfo::from_application_root(&app),
         validated: Arc::new(validated),
         closed: Arc::new(closed),
+        with_app: false,
     });
     let mut result = JsonValue::Object(Default::default());
     source.get_book_page(&requested, book, issuer, false, 10, JsonValue::Null, &mut result);
@@ -242,4 +250,189 @@ fn book_offers_reads_the_requested_ledger_not_the_validated_ledger() {
         other => panic!("result must be an object: {other:?}"),
     };
     assert_eq!(offers, 1, "the requested ledger's book tip must be returned");
+}
+
+fn memory_node_store() -> app::SHAMapStoreNodeStore {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "quaxar-rpc-book-offers-{}-{unique}",
+        std::process::id()
+    ));
+    let mut config = basics::basic_config::BasicConfig::new();
+    config.set_legacy("database_path", dir.join("sql").to_string_lossy());
+    let node_db = config.section_mut("node_db");
+    node_db.set("type", "Memory");
+    node_db.set("path", dir.join("node").to_string_lossy());
+    app::bootstrap_shamap_store(
+        &config,
+        false,
+        128,
+        1,
+        8,
+        64,
+        2,
+        &nodestore::ManagerImp::new(),
+        Arc::new(nodestore::DummyScheduler) as Arc<dyn nodestore::Scheduler>,
+        Arc::new(nodestore::NullJournal),
+    )
+    .expect("node store bootstrap")
+    .node_store
+}
+
+/// A ledger whose state (one book directory and its offer) is in
+/// `node_store` with only the root in memory and no node fetcher: an older
+/// ledger as the ledger master loads it from disk.
+fn store_backed_book_ledger(
+    node_store: &app::SHAMapStoreNodeStore,
+    entries: &[STLedgerEntry],
+) -> Ledger {
+    use shamap::sync::{SHAMapType, SyncState, SyncTree};
+
+    let seq = 11;
+    let mut state = shamap::mutation::MutableTree::new(seq);
+    for entry in entries {
+        state
+            .add_item(
+                shamap::tree_node::SHAMapNodeType::AccountState,
+                shamap::item::SHAMapItem::new(*entry.key(), entry.get_serializer().data().to_vec()),
+            )
+            .expect("state entry should insert");
+    }
+    let header = ledger::LedgerHeader {
+        seq,
+        close_time: 110,
+        account_hash: state.root().get_hash(),
+        ..ledger::LedgerHeader::default()
+    };
+    let mut full = Ledger::from_maps(
+        header.clone(),
+        SyncTree::from_root_with_type(
+            state.root(),
+            SHAMapType::State,
+            true,
+            seq,
+            SyncState::Modifying,
+        ),
+        SyncTree::new_with_type(SHAMapType::Transaction, true, seq),
+    );
+    let writer = node_store.clone();
+    full.set_node_writer(Arc::new(
+        move |object_type: ledger::LedgerNodeObjectType, hash: Uint256, data: Vec<u8>, seq: u32| {
+            let object_type = match object_type {
+                ledger::LedgerNodeObjectType::AccountNode => nodestore::NodeObjectType::AccountNode,
+                ledger::LedgerNodeObjectType::TransactionNode => {
+                    nodestore::NodeObjectType::TransactionNode
+                }
+            };
+            match &writer {
+                app::SHAMapStoreNodeStore::Single(db) => db
+                    .store(object_type, data, hash, seq)
+                    .expect("test node store write should succeed"),
+            }
+        },
+    ));
+    full.flush_state_map_to_store();
+    let root = full.state_map().root();
+    let sparse_root = shamap::nodes::tree_node::SHAMapTreeNode::make_from_wire(
+        &root.serialize_for_wire().expect("root should serialize"),
+    )
+    .expect("root should decode from wire shape")
+    .expect("root wire must contain a node");
+    sparse_root.set_hash(root.get_hash());
+    let mut ledger = Ledger::from_maps(
+        header,
+        SyncTree::from_root_with_type(
+            sparse_root,
+            SHAMapType::State,
+            true,
+            seq,
+            SyncState::Immutable,
+        ),
+        SyncTree::new_with_type(SHAMapType::Transaction, true, seq),
+    );
+    ledger.set_immutable(true);
+    ledger
+}
+
+/// rippled reads an older ledger's book through its node-store-backed
+/// SHAMap. Quaxar walked only the nodes in memory and returned an empty book
+/// for a ledger 300 back on mainnet, where rippled returned 50 offers
+/// (2026-11-25).
+#[test]
+fn book_offers_reads_an_older_ledger_through_the_node_store() {
+    let mut app = ApplicationRoot::with_options(ApplicationRootOptions::default()).expect("app");
+    let node_store = memory_node_store();
+    app.attach_node_store(Some(node_store.clone()));
+    let issuer = AccountID::from_array([0x42; 20]);
+    let usd = Issue::new(currency_from_string("USD"), issuer);
+    let book = Book {
+        r#in: Asset::Issue(xrp_issue()),
+        out: Asset::Issue(usd),
+        domain: None,
+    };
+    let mut quality_bytes = *get_book_base(book).data();
+    quality_bytes[24..].copy_from_slice(&0x5A1A_3809_F838_A480_u64.to_be_bytes());
+    let quality_dir = Uint256::from_slice(&quality_bytes).expect("quality key");
+    let offer = offer_keylet(Uint160::from_slice(issuer.data()).expect("account"), 9);
+    let mut dir = STLedgerEntry::from_type_and_key(LedgerEntryType::DirectoryNode, quality_dir);
+    dir.set_field_v256(
+        get_field_by_symbol("sfIndexes"),
+        STVector256::from_values(get_field_by_symbol("sfIndexes"), vec![offer.key]),
+    );
+    dir.set_field_h256(get_field_by_symbol("sfRootIndex"), quality_dir);
+    let mut sle = STLedgerEntry::new(offer);
+    sle.set_account_id(get_field_by_symbol("sfAccount"), issuer);
+    sle.set_field_u32(get_field_by_symbol("sfSequence"), 9);
+    sle.set_field_h256(get_field_by_symbol("sfBookDirectory"), quality_dir);
+    sle.set_field_amount(
+        get_field_by_symbol("sfTakerPays"),
+        STAmount::new_native(656_501_727, false),
+    );
+    sle.set_field_amount(
+        get_field_by_symbol("sfTakerGets"),
+        STAmount::new_with_asset(sf_generic(), usd, 8_895_729_709_111_601, -13, false),
+    );
+    sle.set_field_u64(get_field_by_symbol("sfOwnerNode"), 0);
+    sle.set_field_u64(get_field_by_symbol("sfBookNode"), 0);
+    let closed = store_backed_book_ledger(&node_store, &[dir, sle]);
+    assert!(
+        !closed.has_node_fetcher(),
+        "fixture: loaded without a node fetcher"
+    );
+
+    let requested = LedgerLookupLedger {
+        hash: *closed.header().hash.as_uint256(),
+        seq: closed.header().seq,
+        open: false,
+    };
+    let source = ApplicationServerInfo::new(TwoLedgerView {
+        inner: OwnedApplicationServerInfo::from_application_root(&app),
+        validated: Arc::new(Ledger::from_ledger_seq_and_close_time(10, 100, false)),
+        closed: Arc::new(closed),
+        with_app: true,
+    });
+    let mut result = JsonValue::Object(Default::default());
+    source.get_book_page(
+        &requested,
+        book,
+        issuer,
+        false,
+        10,
+        JsonValue::Null,
+        &mut result,
+    );
+    let JsonValue::Object(map) = &result else {
+        panic!("result must be an object: {result:?}");
+    };
+    let Some(JsonValue::Array(offers)) = map.get("offers") else {
+        panic!("offers must be an array: {map:?}");
+    };
+    assert_eq!(
+        offers.len(),
+        1,
+        "the book must be read through the node store"
+    );
 }

@@ -724,6 +724,23 @@ fn resolve_lookup_ledger<V: AppServerInfoView>(
     view: &V,
     ledger: &LedgerLookupLedger,
 ) -> Option<std::sync::Arc<ledger::Ledger>> {
+    let resolved = resolve_lookup_ledger_in_memory(view, ledger)?;
+    // An older ledger loaded from disk has most of its state on disk. Without
+    // a node fetcher, in-memory walks stop at the first unloaded node: on
+    // mainnet book_offers for a ledger 300 back came back empty while rippled
+    // returned 50 offers (2026-11-25). rippled's SHAMap reads through the
+    // node store, so attach one. Ledgers that already have it are returned
+    // as they are.
+    Some(match view.app() {
+        Some(app) => app.ledger_with_node_fetcher(resolved),
+        None => resolved,
+    })
+}
+
+fn resolve_lookup_ledger_in_memory<V: AppServerInfoView>(
+    view: &V,
+    ledger: &LedgerLookupLedger,
+) -> Option<std::sync::Arc<ledger::Ledger>> {
     if ledger.open {
         return view
             .closed_ledger()
@@ -2671,7 +2688,6 @@ impl<V: AppServerInfoView> crate::handlers::book_offers::BookOffersRuntime
             obj.insert("offers".to_owned(), offers_array);
             return;
         };
-
         let book_base = get_book_base(book);
         let book_end = get_quality_next(book_base);
         let mut tip_index = book_base;
