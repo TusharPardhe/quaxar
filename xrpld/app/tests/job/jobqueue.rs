@@ -141,3 +141,38 @@ fn job_queue_running_job_is_fully_owned_by_the_reservation() {
     drop(running);
     assert_eq!(queue.job_count_total(JobType::JtPack), 0);
 }
+
+/// rippled `JobQueue::getJson` reports each type's rate and latency from its
+/// `LoadMonitor` (`per_second`, `peak_time`, `avg_time`), and leaves out
+/// `generic`. Before, only `waiting` and `in_progress` were reported.
+#[test]
+fn get_json_reports_job_type_rates_and_latency() {
+    let queue = JobQueue::default();
+    for _ in 0..8 {
+        assert!(queue.add_job(JobType::JtPack, "slow", || {
+            thread::sleep(std::time::Duration::from_millis(30));
+        }));
+    }
+    queue.run_until_idle();
+    queue.add_load_events(JobType::JtGeneric, 5, std::time::Duration::from_millis(50));
+
+    let json = queue.get_json(0);
+    let types = json["job_types"].as_array().expect("job_types");
+    let pack = types
+        .iter()
+        .find(|entry| entry["job_type"] == "makeFetchPack")
+        .unwrap_or_else(|| panic!("makeFetchPack in {json}"));
+    assert!(
+        pack["per_second"].as_u64().is_some_and(|n| n >= 1),
+        "{pack}"
+    );
+    assert!(
+        pack["peak_time"].as_u64().is_some_and(|ms| ms >= 30),
+        "{pack}"
+    );
+    assert!(pack["avg_time"].as_u64().is_some_and(|ms| ms > 0), "{pack}");
+    assert!(
+        types.iter().all(|entry| entry["job_type"] != "generic"),
+        "generic is never reported: {json}"
+    );
+}
