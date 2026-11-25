@@ -149,7 +149,20 @@ fn submit_missing_tx_blob_returns_invalid_params() {
     let source = env.rpc_source();
     let result = submit_request(&json([]), &source);
 
-    assert!(result.is_err(), "missing tx_blob should error");
+    // rippled doSubmit: without tx_blob it signs tx_json, so keypairForSignature
+    // reports the missing secret, and the deprecation notice is added.
+    let Ok(JsonValue::Object(result)) = result else {
+        panic!("missing tx_blob returns an error payload: {result:?}");
+    };
+    assert_eq!(
+        result.get("error"),
+        Some(&JsonValue::String("invalidParams".to_owned()))
+    );
+    assert_eq!(
+        result.get("error_message"),
+        Some(&JsonValue::String("Missing field 'secret'.".to_owned()))
+    );
+    assert!(result.contains_key("deprecated"));
 }
 
 #[test]
