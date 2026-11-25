@@ -246,7 +246,7 @@ impl SqliteSHAMapStoreRelational {
             return Vec::new();
         };
 
-        let connection = transaction_db.get_session();
+        let connection = transaction_db.get_read_session();
         let Ok(mut statement) = connection.prepare(
             "SELECT LedgerSeq, Status, RawTxn \
              FROM Transactions ORDER BY LedgerSeq DESC LIMIT ?1, ?2",
