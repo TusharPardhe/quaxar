@@ -201,7 +201,14 @@ fn shape_auction_slot(slot: &STObject, parent_close_time: u32) -> JsonValue {
             );
             auth_accounts.push(JsonValue::Object(auth_object));
         }
-        object.insert("auth_accounts".to_owned(), JsonValue::Array(auth_accounts));
+        // rippled AMMInfo.cpp appends to a default (null) json::Value, so an
+        // empty AuthAccounts array renders as null.
+        let auth_accounts = if auth_accounts.is_empty() {
+            JsonValue::Null
+        } else {
+            JsonValue::Array(auth_accounts)
+        };
+        object.insert("auth_accounts".to_owned(), auth_accounts);
     }
 
     JsonValue::Object(object)
@@ -343,41 +350,60 @@ pub fn do_amm_info<S: AmmInfoSource>(request: &AmmInfoRequest<'_>, source: &S) -
         }
     };
 
+    // rippled AMMInfo.cpp injects errors found after the ledger lookup into
+    // the lookup result, so they keep ledger_hash, ledger_index and
+    // validated.
+    match amm_json_for_ledger(request, source, &ledger) {
+        Ok(amm_json) => {
+            ensure_object(&mut result).insert("amm".to_owned(), amm_json);
+        }
+        Err(JsonValue::Object(error)) => ensure_object(&mut result).extend(error),
+        Err(error) => return error,
+    }
+    result
+}
+
+fn amm_json_for_ledger<S: AmmInfoSource>(
+    request: &AmmInfoRequest<'_>,
+    source: &S,
+    ledger: &LedgerLookupLedger,
+) -> Result<JsonValue, JsonValue> {
+    let ledger = *ledger;
     if request.api_version < 3 && invalid_parameters(request.params) {
-        return rpc_error(RpcErrorCode::InvalidParams);
+        return Err(rpc_error(RpcErrorCode::InvalidParams));
     }
 
     let (asset1, asset2) = match parse_assets(request.params) {
         Ok(assets) => assets,
-        Err(error) => return error,
+        Err(error) => return Err(error),
     };
 
     let JsonValue::Object(object) = request.params else {
-        return rpc_error(RpcErrorCode::InvalidParams);
+        return Err(rpc_error(RpcErrorCode::InvalidParams));
     };
 
     let mut amm_account = None;
     if let Some(value) = object.get("amm_account") {
         let Some(parsed) = parse_amm_account(value) else {
-            return rpc_error(RpcErrorCode::ActMalformed);
+            return Err(rpc_error(RpcErrorCode::ActMalformed));
         };
         if source.read_account_root(&ledger, parsed).is_none() {
-            return rpc_error(RpcErrorCode::ActMalformed);
+            return Err(rpc_error(RpcErrorCode::ActMalformed));
         }
         amm_account = Some(parsed);
     }
 
     if let Some(value) = object.get("account") {
         let Some(parsed) = parse_amm_account(value) else {
-            return rpc_error(RpcErrorCode::ActMalformed);
+            return Err(rpc_error(RpcErrorCode::ActMalformed));
         };
         if source.read_account_root(&ledger, parsed).is_none() {
-            return rpc_error(RpcErrorCode::ActMalformed);
+            return Err(rpc_error(RpcErrorCode::ActMalformed));
         }
     }
 
     if request.api_version >= 3 && invalid_parameters(request.params) {
-        return rpc_error(RpcErrorCode::InvalidParams);
+        return Err(rpc_error(RpcErrorCode::InvalidParams));
     }
 
     let amm_key = if let (Some(issue1), Some(issue2)) = (asset1, asset2) {
@@ -385,20 +411,20 @@ pub fn do_amm_info<S: AmmInfoSource>(request: &AmmInfoRequest<'_>, source: &S) -
     } else if let Some(amm_account) = amm_account {
         let account_root = match source.read_account_root(&ledger, amm_account) {
             Some(root) => root,
-            None => return rpc_error(RpcErrorCode::ActMalformed),
+            None => return Err(rpc_error(RpcErrorCode::ActMalformed)),
         };
         let amm_id = account_root.get_field_h256(get_field_by_symbol("sfAMMID"));
         if amm_id.is_zero() {
-            return rpc_error(RpcErrorCode::ActNotFound);
+            return Err(rpc_error(RpcErrorCode::ActNotFound));
         }
         amm_id
     } else {
-        return rpc_error(RpcErrorCode::InvalidParams);
+        return Err(rpc_error(RpcErrorCode::InvalidParams));
     };
 
     let amm_entry = match read_amm_entry(source, &ledger, amm_key) {
         Ok(entry) => entry,
-        Err(error) => return error,
+        Err(error) => return Err(error),
     };
 
     let (issue1, issue2) = if let (Some(issue1), Some(issue2)) = (asset1, asset2) {
@@ -409,22 +435,19 @@ pub fn do_amm_info<S: AmmInfoSource>(request: &AmmInfoRequest<'_>, source: &S) -
             .asset()
         {
             Asset::Issue(issue) => issue,
-            Asset::MPTIssue(_) => return rpc_error(RpcErrorCode::InvalidParams),
+            Asset::MPTIssue(_) => return Err(rpc_error(RpcErrorCode::InvalidParams)),
         };
         let issue2 = match amm_entry
             .get_field_issue(get_field_by_symbol("sfAsset2"))
             .asset()
         {
             Asset::Issue(issue) => issue,
-            Asset::MPTIssue(_) => return rpc_error(RpcErrorCode::InvalidParams),
+            Asset::MPTIssue(_) => return Err(rpc_error(RpcErrorCode::InvalidParams)),
         };
         (issue1, issue2)
     };
 
-    let amm_json = shape_amm_json(source, &ledger, &amm_entry, issue1, issue2);
-    let object = ensure_object(&mut result);
-    object.insert("amm".to_owned(), amm_json);
-    result
+    Ok(shape_amm_json(source, &ledger, &amm_entry, issue1, issue2))
 }
 
 #[cfg(test)]
@@ -484,6 +507,27 @@ mod tests {
             time_interval(protocol::TOTAL_TIME_SLOT_SECS - 1, 0),
             u64::from(protocol::AUCTION_SLOT_TIME_INTERVALS)
         );
+    }
+
+    /// rippled AMMInfo.cpp fills `auth_accounts` by appending to a default
+    /// json::Value, so a present but empty AuthAccounts renders as null.
+    /// Quaxar used to render `[]` (mainnet, 2026-11-24).
+    #[test]
+    fn auction_slot_empty_auth_accounts_render_as_null() {
+        let mut slot = auction_slot(100_000);
+        slot.set_field_array(
+            get_field_by_symbol("sfAuthAccounts"),
+            protocol::STArray::new(get_field_by_symbol("sfAuthAccounts")),
+        );
+        let JsonValue::Object(shaped) = shape_auction_slot(&slot, 0) else {
+            panic!("auction slot should be an object");
+        };
+        assert_eq!(shaped.get("auth_accounts"), Some(&JsonValue::Null));
+
+        let JsonValue::Object(shaped) = shape_auction_slot(&auction_slot(100_000), 0) else {
+            panic!("auction slot should be an object");
+        };
+        assert_eq!(shaped.get("auth_accounts"), None, "absent stays absent");
     }
 
     #[test]

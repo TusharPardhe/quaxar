@@ -478,3 +478,89 @@ fn simulate_with_tx_json() {
         _ => {}
     }
 }
+
+fn unsigned_payment(from: &TestAccount, to: &TestAccount) -> Vec<(&'static str, JsonValue)> {
+    vec![
+        ("TransactionType", JsonValue::String("Payment".to_owned())),
+        ("Account", JsonValue::String(to_base58(from.id))),
+        ("Destination", JsonValue::String(to_base58(to.id))),
+        ("Amount", JsonValue::String("1000000".to_owned())),
+    ]
+}
+
+/// rippled Simulate.cpp `autofillTx`: an unsigned transaction gets empty
+/// `SigningPubKey` and `TxnSignature`, `Sequence` from the open ledger and
+/// `Fee` from `getCurrentNetworkFee`. Before the fix quaxar left
+/// `TxnSignature` out of the simulated `tx_json` (mainnet, 2026-11-24).
+#[test]
+fn simulate_autofills_like_rippled() {
+    let alice = TestAccount::new("sim_fill_alice");
+    let bob = TestAccount::new("sim_fill_bob");
+    let env = RpcTestEnv::new(&[(&alice, 10_000_000_000), (&bob, 1_000_000_000)]);
+    let source = env.rpc_source();
+
+    let result = simulate_request(
+        &json([("tx_json", json(unsigned_payment(&alice, &bob)))]),
+        &source,
+    )
+    .expect("simulate should run");
+    let JsonValue::Object(result) = result else {
+        panic!("result must be an object");
+    };
+    assert_eq!(
+        result.get("engine_result"),
+        Some(&JsonValue::String("tesSUCCESS".to_owned())),
+        "{result:?}"
+    );
+    let Some(JsonValue::Object(tx_json)) = result.get("tx_json") else {
+        panic!("tx_json must be an object: {result:?}");
+    };
+    assert_eq!(
+        tx_json.get("TxnSignature"),
+        Some(&JsonValue::String(String::new()))
+    );
+    assert_eq!(
+        tx_json.get("SigningPubKey"),
+        Some(&JsonValue::String(String::new()))
+    );
+    assert_eq!(
+        tx_json.get("Fee"),
+        Some(&JsonValue::String("10".to_owned()))
+    );
+    assert_eq!(
+        tx_json.get("Sequence"),
+        Some(&JsonValue::Unsigned(u64::from(alice.seq)))
+    );
+}
+
+/// rippled `autofillSignature`: a signed transaction is `transactionSigned`.
+#[test]
+fn simulate_rejects_signed_transactions() {
+    let alice = TestAccount::new("sim_signed_alice");
+    let bob = TestAccount::new("sim_signed_bob");
+    let env = RpcTestEnv::new(&[(&alice, 10_000_000_000), (&bob, 1_000_000_000)]);
+    let source = env.rpc_source();
+
+    let mut fields = unsigned_payment(&alice, &bob);
+    fields.push(("TxnSignature", JsonValue::String("ABCD".to_owned())));
+    let status = simulate_request(&json([("tx_json", json(fields))]), &source)
+        .expect_err("a signed transaction must be rejected");
+    assert_eq!(status.error_code(), Some(rpc::RpcErrorCode::TxSigned));
+}
+
+/// rippled `getAutofillSequence`: no account root and no ticket is
+/// `srcActNotFound` (quaxar used to guess Sequence 1).
+#[test]
+fn simulate_unknown_account_is_src_act_not_found() {
+    let alice = TestAccount::new("sim_missing_alice");
+    let bob = TestAccount::new("sim_missing_bob");
+    let env = RpcTestEnv::new(&[(&bob, 1_000_000_000)]);
+    let source = env.rpc_source();
+
+    let status = simulate_request(
+        &json([("tx_json", json(unsigned_payment(&alice, &bob)))]),
+        &source,
+    )
+    .expect_err("an unfunded account has no sequence to autofill");
+    assert_eq!(status.error_code(), Some(rpc::RpcErrorCode::SrcActNotFound));
+}

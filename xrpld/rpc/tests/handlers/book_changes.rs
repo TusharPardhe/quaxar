@@ -483,5 +483,9 @@ fn book_changes_reads_transactions_through_the_node_store() {
         })
         .expect("the ledger's transactions should be readable");
     assert_eq!(snapshot.ledger_time, 666);
-    assert_eq!(snapshot.transactions.len(), 1, "the offer change must be seen");
+    assert_eq!(
+        snapshot.transactions.len(),
+        1,
+        "the offer change must be seen"
+    );
 }

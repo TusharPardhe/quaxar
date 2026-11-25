@@ -99,7 +99,12 @@ pub(crate) fn fill_json_tx_entry(
 /// rippled develop LedgerToJson `fillJsonTx` (#6401): every expanded
 /// transaction (JSON v1, v2 and binary) carries `ctid` when its metadata has
 /// `TransactionIndex`. A transaction's own `NetworkID` overrides the server's.
-fn insert_ctid(tx_json: &mut JsonValue, fill: &AppLedgerFill<'_>, txn: &STTx, meta: Option<&TxMeta>) {
+fn insert_ctid(
+    tx_json: &mut JsonValue,
+    fill: &AppLedgerFill<'_>,
+    txn: &STTx,
+    meta: Option<&TxMeta>,
+) {
     let Some(meta) = meta else {
         return;
     };

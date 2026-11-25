@@ -331,7 +331,11 @@ fn insert_v1_transaction(target: &mut JsonValue, record: &TxRecord) {
 /// `hash`, `ledger_index`, `ledger_hash` (always; getHashBySeq gives zero
 /// when unknown), `close_time_iso` when the close time is known, `meta`,
 /// `validated`.
-fn insert_v2_transaction<S: AccountTxSource>(target: &mut JsonValue, record: &TxRecord, source: &S) {
+fn insert_v2_transaction<S: AccountTxSource>(
+    target: &mut JsonValue,
+    record: &TxRecord,
+    source: &S,
+) {
     let txn = record.txn.as_ref();
     let close_time = record
         .close_time

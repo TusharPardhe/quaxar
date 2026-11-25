@@ -1876,7 +1876,10 @@ fn application_root_warns_on_validated_ledger_with_unknown_majority() {
         .unsupported_majority_warning_details()
         .expect("warning details should be present");
     assert_eq!(details.expected_date, 1_200 + 14 * 24 * 60 * 60);
-    assert_eq!(details.expected_date_utc, "2000-Jan-15 00:20:00 UTC");
+    assert_eq!(
+        details.expected_date_utc,
+        "2000-Jan-15 00:20:00.000000000 UTC"
+    );
 }
 
 #[test]

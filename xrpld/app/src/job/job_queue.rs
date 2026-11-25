@@ -578,29 +578,33 @@ impl JobQueue {
                 .any(|c| c.waiting > 1_000)
     }
 
-    /// A minimal JSON diagnostic summary. Matches `JobQueue::getJson`'s
-    /// intent (a per-type breakdown), reduced to the aggregate counters
-    /// this port tracks -- full per-type latency percentiles are out of
-    /// scope (see module-level deviation note).
+    /// rippled `JobQueue::getJson`: `threads` and a `job_types` array with
+    /// one entry per active job type. Each entry has `job_type` and, when
+    /// nonzero, `waiting` and `in_progress`. This port does not keep
+    /// rippled's per-second rate or latency figures (`per_second`,
+    /// `peak_time`, `avg_time`, `over_target`; see the module-level deviation
+    /// note), so those keys are absent.
     pub fn get_json(&self, _threshold: u32) -> serde_json::Value {
         let state = self.inner.state.lock();
-        let jobs: Vec<serde_json::Value> = state
+        let job_types: Vec<serde_json::Value> = state
             .counters
             .iter()
             .filter(|&(_, c)| c.waiting > 0 || c.running > 0 || c.load_events > 0)
             .map(|(&job_type, c)| {
-                serde_json::json!({
-                    "job_type": job_type.name(),
-                    "waiting": c.waiting,
-                    "running": c.running,
-                    "load_events": c.load_events,
-                })
+                let mut entry = serde_json::Map::new();
+                entry.insert("job_type".to_owned(), job_type.name().into());
+                if c.waiting != 0 {
+                    entry.insert("waiting".to_owned(), c.waiting.into());
+                }
+                if c.running != 0 {
+                    entry.insert("in_progress".to_owned(), c.running.into());
+                }
+                serde_json::Value::Object(entry)
             })
             .collect();
         serde_json::json!({
             "threads": self.worker_thread_count(),
-            "load_events": self.inner.load_events.load(AtomicOrdering::Relaxed),
-            "jobs": jobs,
+            "job_types": job_types,
         })
     }
 

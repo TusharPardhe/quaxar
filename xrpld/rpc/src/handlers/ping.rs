@@ -35,14 +35,18 @@ pub fn do_ping<Env>(context: &JsonContext<'_, Env>) -> JsonValue {
         }
         RpcRole::Proxy => {
             result.insert("role".to_owned(), JsonValue::String("proxied".to_owned()));
-            result.insert(
-                "ip".to_owned(),
-                JsonValue::String(context.headers.forwarded_for.to_owned()),
-            );
+            if !context.headers.forwarded_for.is_empty() {
+                result.insert(
+                    "ip".to_owned(),
+                    JsonValue::String(context.headers.forwarded_for.to_owned()),
+                );
+            }
         }
         _ => {}
     }
 
+    // The caller sets `unlimited` only for a WebSocket session whose consumer
+    // is unlimited (rippled: `context.infoSub->getConsumer().isUnlimited()`).
     if context.unlimited {
         result.insert("unlimited".to_owned(), JsonValue::Bool(true));
     }

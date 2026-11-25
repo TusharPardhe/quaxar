@@ -8,18 +8,9 @@ use crate::state::app_server_info_source::AppServerInfoView;
 
 const HIGH_AGE_THRESHOLD_SECS: u64 = 1_000_000;
 
-fn format_human_xrp_drops(drops: u64) -> String {
-    let whole = drops / 1_000_000;
-    let remainder = drops % 1_000_000;
-    if remainder == 0 {
-        return whole.to_string();
-    }
-
-    let mut formatted = format!("{whole}.{remainder:06}");
-    while formatted.ends_with('0') {
-        formatted.pop();
-    }
-    formatted
+/// rippled `XRPAmount::decimalXRP()`: drops / 1e6 as a `double`.
+fn decimal_xrp(drops: u64) -> JsonValue {
+    crate::state::app_server_info_fee::json_double(drops as f64 / 1_000_000.0)
 }
 
 fn build_ledger_summary(ledger: &Ledger, human: bool) -> JsonValue {
@@ -33,18 +24,9 @@ fn build_ledger_summary(ledger: &Ledger, human: bool) -> JsonValue {
     );
 
     if human {
-        summary.insert(
-            "base_fee_xrp".to_owned(),
-            JsonValue::String(format_human_xrp_drops(fees.base)),
-        );
-        summary.insert(
-            "reserve_base_xrp".to_owned(),
-            JsonValue::String(format_human_xrp_drops(fees.reserve)),
-        );
-        summary.insert(
-            "reserve_inc_xrp".to_owned(),
-            JsonValue::String(format_human_xrp_drops(fees.increment)),
-        );
+        summary.insert("base_fee_xrp".to_owned(), decimal_xrp(fees.base));
+        summary.insert("reserve_base_xrp".to_owned(), decimal_xrp(fees.reserve));
+        summary.insert("reserve_inc_xrp".to_owned(), decimal_xrp(fees.increment));
     } else {
         summary.insert(
             "base_fee".to_owned(),
@@ -161,7 +143,7 @@ pub fn append_ledger_fields<V: AppServerInfoView>(
 
 #[cfg(test)]
 mod tests {
-    use super::{append_ledger_fields, format_human_xrp_drops};
+    use super::{append_ledger_fields, decimal_xrp};
     use app::ApplicationRoot;
     use ledger::{Fees, Ledger, LedgerHeader};
     use protocol::JsonValue;
@@ -184,11 +166,19 @@ mod tests {
         Arc::new(ledger)
     }
 
+    /// rippled `decimalXRP()` is a `double`, so human server_info sends JSON
+    /// numbers (`1e-05`, `0.2`), not strings.
     #[test]
-    fn human_xrp_drop_formatter_trims_fractional_zeros() {
-        assert_eq!(format_human_xrp_drops(1_000_000), "1");
-        assert_eq!(format_human_xrp_drops(2_500_000), "2.5");
-        assert_eq!(format_human_xrp_drops(1_234_560), "1.23456");
+    fn human_xrp_amounts_are_json_numbers() {
+        let raw = |drops| match decimal_xrp(drops) {
+            JsonValue::Raw(raw) => raw.as_str().to_owned(),
+            other => panic!("expected a raw JSON number, got {other:?}"),
+        };
+        assert_eq!(raw(1_000_000), "1");
+        assert_eq!(raw(2_500_000), "2.5");
+        assert_eq!(raw(1_234_560), "1.23456");
+        assert_eq!(raw(10), "1e-05");
+        assert_eq!(raw(200_000), "0.2");
     }
 
     #[test]

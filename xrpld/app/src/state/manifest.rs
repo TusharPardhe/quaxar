@@ -239,6 +239,17 @@ impl ManifestCache {
             .unwrap_or(*master_key)
     }
 
+    /// The current signing key of `master_key`'s manifest, if one is held
+    /// (rippled `forEachManifest` + `manifest.signingKey`).
+    pub fn manifest_signing_key(&self, master_key: &PublicKey) -> Option<PublicKey> {
+        let state = self.state.read().expect("manifest cache read lock");
+        state
+            .manifests
+            .get(master_key)
+            .filter(|manifest| !manifest.revoked())
+            .and_then(|manifest| manifest.signing_key)
+    }
+
     pub fn get_master_key(&self, signing_key: &PublicKey) -> PublicKey {
         let state = self.state.read().expect("manifest cache read lock");
         state

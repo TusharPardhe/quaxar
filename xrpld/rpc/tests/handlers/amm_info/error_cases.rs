@@ -28,6 +28,15 @@ fn amm_info_account_not_found() {
         result.get("error"),
         Some(&JsonValue::String("actMalformed".to_owned()))
     );
+    // rippled AMMInfo.cpp injects the error into the lookupLedger result, so
+    // the ledger fields stay. Quaxar used to drop them.
+    for key in ["ledger_hash", "validated"] {
+        assert!(result.contains_key(key), "missing {key}: {result:?}");
+    }
+    assert!(
+        result.contains_key("ledger_index") || result.contains_key("ledger_current_index"),
+        "{result:?}"
+    );
 }
 
 #[test]

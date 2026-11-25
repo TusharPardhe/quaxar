@@ -442,8 +442,28 @@ fn trusted_publisher_acceptance_surfaces_listed_and_trusted_public_api_output() 
     let json = list.get_json();
     match json {
         JsonValue::Object(fields) => {
-            assert_eq!(fields.get("list_threshold"), Some(&JsonValue::Unsigned(1)));
-            assert_eq!(fields.get("quorum"), Some(&JsonValue::Unsigned(1)));
+            // rippled ValidatorList::getJson has no top-level list_threshold or
+            // quorum (the threshold is validator_list.validator_list_threshold).
+            assert_eq!(fields.get("list_threshold"), None);
+            assert_eq!(fields.get("quorum"), None);
+            for key in ["publisher_lists", "signing_keys", "local_static_keys"] {
+                assert!(fields.contains_key(key), "missing {key}");
+            }
+            let Some(JsonValue::Array(publishers)) = fields.get("publisher_lists") else {
+                panic!("publisher_lists should be an array");
+            };
+            let Some(JsonValue::Object(publisher)) = publishers.first() else {
+                panic!("the trusted publisher should be listed");
+            };
+            assert_eq!(publisher.get("available"), Some(&JsonValue::Bool(true)));
+            let Some(JsonValue::Array(keys)) = publisher.get("list") else {
+                panic!("publisher list should be an array");
+            };
+            assert!(!keys.is_empty());
+            assert!(
+                fields.contains_key("NegativeUNL"),
+                "non-empty negative UNL is listed"
+            );
             assert_eq!(
                 fields.get("validation_quorum"),
                 Some(&JsonValue::Unsigned(1))

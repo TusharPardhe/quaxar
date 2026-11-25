@@ -10,6 +10,27 @@ fn main() {
         .unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=QUAXAR_GIT_COMMIT={}", commit.trim());
 
+    // Full commit hash and branch for server_info `git` (rippled
+    // xrpl::git::getCommitHash / getBuildBranch).
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_owned())
+            .unwrap_or_default()
+    };
+    println!(
+        "cargo:rustc-env=QUAXAR_GIT_HASH={}",
+        git(&["rev-parse", "HEAD"])
+    );
+    println!(
+        "cargo:rustc-env=QUAXAR_GIT_BRANCH={}",
+        git(&["rev-parse", "--abbrev-ref", "HEAD"])
+    );
+
     // Rustc version
     let rustc = Command::new("rustc")
         .args(["--version"])

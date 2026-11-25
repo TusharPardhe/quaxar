@@ -179,6 +179,8 @@ fn no_ripple_check_reports_gateway_problems_and_transactions() {
     let JsonValue::Object(object) = response else {
         panic!("expected object response");
     };
+    // rippled NoRippleCheck.cpp has no top-level `account` (quaxar added one).
+    assert_eq!(object.get("account"), None);
     let JsonValue::Array(problems) = object.get("problems").expect("problems") else {
         panic!("problems should be an array");
     };

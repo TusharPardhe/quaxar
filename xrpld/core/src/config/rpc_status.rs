@@ -59,6 +59,8 @@ pub enum RpcErrorCode {
     StreamMalformed,
     NotStandalone,
     NotImplemented,
+    TxSigned,
+    HighFee,
 }
 
 impl RpcErrorCode {
@@ -115,6 +117,8 @@ impl RpcErrorCode {
             Self::StreamMalformed => 71,
             Self::NotStandalone => 76,
             Self::NotImplemented => 74, // Same as NotImpl
+            Self::TxSigned => 96,
+            Self::HighFee => 11,
         }
     }
 
@@ -171,6 +175,8 @@ impl RpcErrorCode {
             Self::StreamMalformed => "malformedStream",
             Self::NotStandalone => "notStandAlone",
             Self::NotImplemented => "notImplemented",
+            Self::TxSigned => "transactionSigned",
+            Self::HighFee => "highFee",
         }
     }
 
@@ -226,6 +232,8 @@ impl RpcErrorCode {
             Self::StreamMalformed => "Stream malformed.",
             Self::NotStandalone => "Operation only allowed in standalone mode.",
             Self::NotImplemented => "Not implemented.",
+            Self::TxSigned => "Transaction should not be signed.",
+            Self::HighFee => "Current transaction fee exceeds your limit.",
         }
     }
 }

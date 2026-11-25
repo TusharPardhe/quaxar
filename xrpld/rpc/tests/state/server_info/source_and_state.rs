@@ -222,35 +222,35 @@ fn server_info_reads_application_owner_state_boundary() {
     assert_eq!(last_close.get("proposers"), Some(&JsonValue::Unsigned(5)));
     assert_eq!(
         last_close.get("converge_time_s"),
-        Some(&JsonValue::String("1.5".to_owned()))
+        Some(&JsonValue::Raw(protocol::RawJson::from_trusted("1.5")))
     );
     assert_eq!(
         info.get("load_factor"),
-        Some(&JsonValue::String("3".to_owned()))
+        Some(&JsonValue::Raw(protocol::RawJson::from_trusted("3")))
     );
     assert_eq!(
         info.get("load_factor_server"),
-        Some(&JsonValue::String("2.5".to_owned()))
+        Some(&JsonValue::Raw(protocol::RawJson::from_trusted("2.5")))
     );
     assert_eq!(
         info.get("load_factor_fee_escalation"),
-        Some(&JsonValue::String("3".to_owned()))
+        Some(&JsonValue::Raw(protocol::RawJson::from_trusted("3")))
     );
     assert_eq!(
         info.get("load_factor_fee_queue"),
-        Some(&JsonValue::String("2".to_owned()))
+        Some(&JsonValue::Raw(protocol::RawJson::from_trusted("2")))
     );
     assert_eq!(
         info.get("load_factor_local"),
-        Some(&JsonValue::String("2.5".to_owned()))
+        Some(&JsonValue::Raw(protocol::RawJson::from_trusted("2.5")))
     );
     assert_eq!(
         info.get("load_factor_net"),
-        Some(&JsonValue::String("2".to_owned()))
+        Some(&JsonValue::Raw(protocol::RawJson::from_trusted("2")))
     );
     assert_eq!(
         info.get("load_factor_cluster"),
-        Some(&JsonValue::String("1.5".to_owned()))
+        Some(&JsonValue::Raw(protocol::RawJson::from_trusted("1.5")))
     );
     assert_eq!(
         info.get("node_size"),
@@ -301,15 +301,15 @@ fn server_info_reads_application_owner_state_boundary() {
     assert_eq!(validated_ledger.get("seq"), Some(&JsonValue::Unsigned(101)));
     assert_eq!(
         validated_ledger.get("base_fee_xrp"),
-        Some(&JsonValue::String("0.00001".to_owned()))
+        Some(&JsonValue::Raw(protocol::RawJson::from_trusted("1e-05")))
     );
     assert_eq!(
         validated_ledger.get("reserve_base_xrp"),
-        Some(&JsonValue::String("2".to_owned()))
+        Some(&JsonValue::Raw(protocol::RawJson::from_trusted("2")))
     );
     assert_eq!(
         validated_ledger.get("reserve_inc_xrp"),
-        Some(&JsonValue::String("0.2".to_owned()))
+        Some(&JsonValue::Raw(protocol::RawJson::from_trusted("0.2")))
     );
     assert!(matches!(
         validated_ledger.get("age"),

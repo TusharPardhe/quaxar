@@ -223,10 +223,11 @@ impl<V: AppServerInfoView> ServerInfoSource for ApplicationServerInfo<V> {
 
         // Pruned (fjall) store health, when that path is active, so operators
         // see the retained floor and a verify failure (design Case 11) directly
-        // in server_info rather than only via get_counts.
-        if let Some(metrics) = self
-            .view
-            .app()
+        // in server_info rather than only via get_counts. Quaxar-only (rippled
+        // has no such key), so it is reported to admin callers only.
+        if let Some(metrics) = admin
+            .then(|| self.view.app())
+            .flatten()
             .and_then(|app| app.shamap_store_service())
             .and_then(|service| service.component().pruned_metrics())
         {
@@ -704,7 +705,11 @@ fn find_ledger_header_by_seq<V: AppServerInfoView>(
     {
         return Some(header(&ledger));
     }
-    let stored = app.ledger_db()?.get_ledger_info_by_seq(seq).ok()??.to_header()?;
+    let stored = app
+        .ledger_db()?
+        .get_ledger_info_by_seq(seq)
+        .ok()??
+        .to_header()?;
     Some((
         *stored.hash.as_uint256(),
         NetClockTimePoint::new(stored.close_time),
@@ -2208,10 +2213,12 @@ impl<V: AppServerInfoView> crate::handlers::book_changes::BookChangesSource
             .ok()?;
         let transactions = snapshot
             .into_iter()
-            .map(|(tx, meta)| crate::handlers::book_changes::BookChangesTransaction {
-                txn: (*tx).clone(),
-                meta,
-            })
+            .map(
+                |(tx, meta)| crate::handlers::book_changes::BookChangesTransaction {
+                    txn: (*tx).clone(),
+                    meta,
+                },
+            )
             .collect();
 
         Some(crate::handlers::book_changes::BookChangesLedger {

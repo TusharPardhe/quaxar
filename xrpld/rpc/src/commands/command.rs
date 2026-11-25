@@ -154,18 +154,11 @@ where
         "subscribe" => do_subscribe(context),
         "unsubscribe" => do_unsubscribe(context),
         "version" => {
-            let mut version_obj = BTreeMap::new();
-            version_obj.insert("first".to_owned(), JsonValue::Unsigned(1));
-            // rippled `setVersion`: beta version when `[beta_rpc_api]` is on.
-            let last = if protocol::beta_rpc_api() {
-                protocol::API_BETA_VERSION
-            } else {
-                protocol::API_MAXIMUM_SUPPORTED_VERSION
-            };
-            version_obj.insert("last".to_owned(), JsonValue::Unsigned(u64::from(last)));
-            let mut result = BTreeMap::new();
-            result.insert("version".to_owned(), JsonValue::Object(version_obj));
-            JsonValue::Object(result)
+            // rippled VersionHandler::writeResult -> setVersion: strings
+            // "1.0.0" for an unspecified (v1) request, numbers otherwise.
+            let mut result = JsonValue::Object(BTreeMap::new());
+            protocol::set_version(&mut result, context.api_version, protocol::beta_rpc_api());
+            result
         }
         _ => rpc_error(RpcErrorCode::UnknownCommand),
     }

@@ -379,12 +379,32 @@ fn builtin_dispatcher_routes_ping_and_server_info() {
     metadata.role = rpc::RpcRole::Admin;
     metadata.unlimited = true;
 
+    let ping_json = |metadata: &RequestMetadata| match dispatcher.dispatch(RpcRequest {
+        method: "ping",
+        params: &JsonValue::Object(BTreeMap::new()),
+        metadata,
+        session: None,
+    }) {
+        server::RpcReply::Result(value) => from_protocol_json(&value),
+        other => panic!("unexpected rpc reply: {other:?}"),
+    };
+    // rippled doPing reports `unlimited` only through a WebSocket session's
+    // InfoSub consumer; an HTTP admin ping has no `unlimited` (quaxar added
+    // it, mainnet 2026-11-24).
+    let http_ping = ping_json(&metadata);
+    assert_eq!(
+        http_ping["role"],
+        serde_json::Value::String("admin".to_owned())
+    );
+    assert!(http_ping.get("unlimited").is_none(), "{http_ping}");
+    metadata.is_websocket = true;
     let ping = dispatcher.dispatch(RpcRequest {
         method: "ping",
         params: &JsonValue::Object(BTreeMap::new()),
         metadata: &metadata,
         session: None,
     });
+    metadata.is_websocket = false;
     let ping = match ping {
         server::RpcReply::Result(value) => value,
         other => panic!("unexpected rpc reply: {other:?}"),
@@ -470,19 +490,16 @@ fn builtin_dispatcher_routes_ping_and_server_info() {
     );
     assert!(
         from_protocol_json(&server_info)["info"]["load"]
-            .get("jobs")
-            .is_some()
-            || from_protocol_json(&server_info)["info"]["load"]
-                .get("load_events")
-                .is_some()
-            || from_protocol_json(&server_info)["info"]["load"]
+            .get("job_types")
+            .is_some_and(serde_json::Value::is_array)
+            && from_protocol_json(&server_info)["info"]["load"]
                 .get("threads")
                 .is_some(),
         "server_info load must expose the application job-queue schema"
     );
     assert_eq!(
         from_protocol_json(&server_info)["info"]["last_close"]["converge_time_s"],
-        serde_json::Value::String("1.25".to_owned())
+        serde_json::json!(1.25)
     );
     assert_eq!(
         from_protocol_json(&server_info)["info"]["closed_ledger"]["seq"],
@@ -604,12 +621,9 @@ fn builtin_dispatcher_routes_ping_and_server_info() {
     );
     assert!(
         from_protocol_json(&server_state)["state"]["load"]
-            .get("jobs")
-            .is_some()
-            || from_protocol_json(&server_state)["state"]["load"]
-                .get("load_events")
-                .is_some()
-            || from_protocol_json(&server_state)["state"]["load"]
+            .get("job_types")
+            .is_some_and(serde_json::Value::is_array)
+            && from_protocol_json(&server_state)["state"]["load"]
                 .get("threads")
                 .is_some(),
         "server_state load must expose the application job-queue schema"

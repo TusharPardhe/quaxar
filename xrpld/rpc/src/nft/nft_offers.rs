@@ -214,7 +214,7 @@ fn enumerate_nft_offers<S: NFTOffersSource>(
         api_version: request.api_version,
         role: request.role,
     };
-    let (ledger, mut result) = match lookup_ledger_with_result(&context) {
+    let (ledger, _) = match lookup_ledger_with_result(&context) {
         Ok(value) => value,
         Err(status) => {
             let mut json = JsonValue::Object(BTreeMap::new());
@@ -311,16 +311,17 @@ fn enumerate_nft_offers<S: NFTOffersSource>(
         append_nft_offer_json(offer, &mut offers);
     }
 
-    let JsonValue::Object(object) = &mut result else {
-        return result;
-    };
+    // rippled NFTOffersHandlerBase::writeResult: nft_id, offers and, on a
+    // partial page, limit and marker. The ledger lookup's ledger_hash,
+    // ledger_index and validated are not part of the response.
+    let mut object = BTreeMap::new();
     object.insert("nft_id".to_owned(), JsonValue::String(nft_id.to_string()));
     object.insert("offers".to_owned(), JsonValue::Array(offers));
     if let Some(marker) = marker_value {
         object.insert("limit".to_owned(), JsonValue::Unsigned(u64::from(limit)));
         object.insert("marker".to_owned(), JsonValue::String(marker));
     }
-    result
+    JsonValue::Object(object)
 }
 
 pub fn do_nft_buy_offers<S: NFTOffersSource>(

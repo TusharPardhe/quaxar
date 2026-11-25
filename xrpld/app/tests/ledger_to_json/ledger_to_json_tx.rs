@@ -652,7 +652,11 @@ fn ledger_to_json_tx_expanded_entries_carry_ctid() {
     let server = Some(JsonValue::String("C000002C00020005".to_owned()));
     let own = Some(JsonValue::String("C000002C00020009".to_owned()));
     for (api_version, binary) in [(1, false), (2, false), (1, true), (2, true)] {
-        assert_eq!(ctid_of(&txs, api_version, binary), server, "v{api_version} binary={binary}");
+        assert_eq!(
+            ctid_of(&txs, api_version, binary),
+            server,
+            "v{api_version} binary={binary}"
+        );
         assert_eq!(
             ctid_of(&networked_txs, api_version, binary),
             own,

@@ -474,35 +474,151 @@ pub fn channel_authorize<Runtime: RpcRuntime, Source>(
     Ok(JsonValue::Object(ret))
 }
 
+/// rippled Simulate.cpp `autofillSignature`: empty `SigningPubKey` and
+/// `TxnSignature` (also per multisig signer); a signed transaction is
+/// rejected with `transactionSigned`.
+fn autofill_signature(
+    sig_object: &mut BTreeMap<String, JsonValue>,
+    field_prefix: &str,
+) -> Result<(), Status> {
+    sig_object
+        .entry(jss::SigningPubKey.to_owned())
+        .or_insert_with(|| JsonValue::String(String::new()));
+
+    if let Some(signers) = sig_object.get_mut(jss::Signers) {
+        let JsonValue::Array(signers) = signers else {
+            return Err(Status::invalid_field_error(format!(
+                "{field_prefix}.Signers"
+            )));
+        };
+        for (index, signer) in signers.iter_mut().enumerate() {
+            let Some(JsonValue::Object(signer)) = (match signer {
+                JsonValue::Object(outer) => outer.get_mut(jss::Signer),
+                _ => None,
+            }) else {
+                return Err(Status::invalid_field_error(format!(
+                    "{field_prefix}.Signers[{index}]"
+                )));
+            };
+            signer
+                .entry(jss::SigningPubKey.to_owned())
+                .or_insert_with(|| JsonValue::String(String::new()));
+            check_unsigned(signer)?;
+        }
+    }
+
+    check_unsigned(sig_object)
+}
+
+fn check_unsigned(sig_object: &mut BTreeMap<String, JsonValue>) -> Result<(), Status> {
+    match sig_object.get(jss::TxnSignature) {
+        None => {
+            sig_object.insert(
+                jss::TxnSignature.to_owned(),
+                JsonValue::String(String::new()),
+            );
+            Ok(())
+        }
+        Some(JsonValue::String(signature)) if signature.is_empty() => Ok(()),
+        Some(_) => Err(Status::new(RpcErrorCode::TxSigned)),
+    }
+}
+
+/// rippled Simulate.cpp `autofillTx`: signature fields, `Sequence`
+/// (`TxQ::nextQueuableSeq` on the open ledger, 0 with a ticket),
+/// `NetworkID` above 1024, then `Fee` (`getCurrentNetworkFee`, capped at 10x
+/// the transaction's base fee).
 pub fn autofill_tx<Runtime: RpcRuntime>(
     tx_json: &mut protocol::JsonValue,
-    _ctx: &RpcRequestContext<'_, SimulateSource, Runtime>,
+    ctx: &RpcRequestContext<'_, SimulateSource, Runtime>,
 ) -> Result<(), Status> {
     let JsonValue::Object(map) = tx_json else {
         return Ok(());
     };
-    if !map.contains_key(jss::Fee) {
-        // Parity: ../rippled/src/xrpld/rpc/handlers/transaction/Simulate.cpp::
-        // simulateTxn copies OpenLedger and uses TxQ's live fee context.
-        let fee = _ctx
-            .runtime
-            .app()
-            .map(|app| app.open_ledger().current().base_fee_drops)
-            .unwrap_or(10);
-        map.insert(jss::Fee.to_string(), JsonValue::String(fee.to_string()));
+    autofill_signature(map, "tx")?;
+    if let Some(sponsor) = map.get_mut("SponsorSignature") {
+        let JsonValue::Object(sponsor) = sponsor else {
+            return Err(Status::expected_field_error("SponsorSignature", "object"));
+        };
+        autofill_signature(sponsor, "tx.SponsorSignature")?;
     }
+
+    let app = ctx.runtime.app();
     if !map.contains_key(jss::Sequence) {
-        let seq = _ctx
-            .runtime
-            .app()
-            .and_then(|app| match map.get("Account") {
-                Some(JsonValue::String(account)) => protocol::parse_base58_account_id(account)
-                    .and_then(|account| app.network_ops_current_account_seq(&account))
-                    .map(u64::from),
-                _ => None,
-            })
-            .unwrap_or(1);
-        map.insert(jss::Sequence.to_string(), JsonValue::Unsigned(seq));
+        let account = match map.get(jss::Account) {
+            Some(JsonValue::String(account)) => {
+                parse_base58_account_id(account).ok_or_else(|| {
+                    Status::with_message(
+                        RpcErrorCode::SrcActMalformed,
+                        invalid_field_message("tx.Account"),
+                    )
+                })?
+            }
+            _ => return Err(Status::invalid_field_error("tx.Account")),
+        };
+        let seq = if map.contains_key("TicketSequence") {
+            0
+        } else {
+            match app {
+                Some(app) => {
+                    let probe = STTx::new(protocol::TxType::PAYMENT, |tx| {
+                        tx.set_account_id(get_field_by_symbol("sfAccount"), account);
+                    });
+                    app.network_ops_next_account_seq_for_tx(&probe)
+                        .ok_or_else(|| Status::new(RpcErrorCode::SrcActNotFound))?
+                }
+                None => 1,
+            }
+        };
+        map.insert(
+            jss::Sequence.to_owned(),
+            JsonValue::Unsigned(u64::from(seq)),
+        );
+    }
+
+    if !map.contains_key(jss::NetworkID) {
+        let network_id = app.map(|app| app.network_id()).unwrap_or(0);
+        if network_id > 1024 {
+            map.insert(
+                jss::NetworkID.to_owned(),
+                JsonValue::String(network_id.to_string()),
+            );
+        }
+    }
+
+    if !map.contains_key(jss::Fee) {
+        let fee = match app {
+            Some(app) => {
+                // rippled getTxFee parses a copy with Fee 0 so the fee
+                // estimator sees the full transaction shape.
+                let mut probe = map.clone();
+                probe.insert(jss::Fee.to_owned(), JsonValue::String("0".to_owned()));
+                let (fee, fee_default) = match parse_sttx_from_json_value(&JsonValue::Object(probe))
+                {
+                    Ok(probe) => app.current_network_fee_drops(&probe, is_unlimited(ctx.role)),
+                    Err(_) => {
+                        let reference = app.open_ledger().current().base_fee_drops;
+                        let fee = app
+                            .current_network_fee_drops(
+                                &STTx::new(protocol::TxType::PAYMENT, |_| {}),
+                                is_unlimited(ctx.role),
+                            )
+                            .0;
+                        (fee, reference)
+                    }
+                };
+                let limit = fee_default.saturating_mul(10);
+                if fee > limit {
+                    return Err(Status::with_message(
+                        RpcErrorCode::HighFee,
+                        format!("Fee of {fee} exceeds the requested tx limit of {limit}"),
+                    ));
+                }
+                fee
+            }
+            None => 10,
+        };
+        map.insert(jss::Fee.to_owned(), JsonValue::String(fee.to_string()));
     }
     Ok(())
 }

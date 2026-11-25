@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use app::{StatusRpcLastClose, StatusRpcSnapshot};
 use protocol::JsonValue;
 
-use crate::state::app_server_info_fee::format_human_ratio;
+use crate::state::app_server_info_fee::json_double;
 use crate::state::app_server_info_source::AppServerInfoView;
 
 fn duration_millis_u64(duration: std::time::Duration) -> u64 {
@@ -23,7 +23,8 @@ fn append_last_close(
     if human {
         value.insert(
             "converge_time_s".to_owned(),
-            JsonValue::String(format_human_ratio(converge_millis, 1_000)),
+            // rippled: duration<double>{prevRoundTime}.count(), a number.
+            json_double(last_close.converge_time.as_secs_f64()),
         );
     } else {
         value.insert(

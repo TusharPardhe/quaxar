@@ -64,7 +64,11 @@ fn account_tx(
         "account".to_owned(),
         JsonValue::String(SQL_ACCOUNT.to_owned()),
     )]);
-    params.extend(extra.into_iter().map(|(key, value)| (key.to_owned(), value)));
+    params.extend(
+        extra
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value)),
+    );
     let JsonValue::Object(result) = do_account_tx(
         &JsonValue::Object(params),
         RpcRole::Admin,
@@ -117,7 +121,11 @@ fn account_tx_marker_is_first_row_of_next_page() {
             2,
         );
         assert_eq!(entries(&page).len(), 1);
-        assert_eq!(page.get("marker"), Some(&marker(2, second)), "forward={forward}");
+        assert_eq!(
+            page.get("marker"),
+            Some(&marker(2, second)),
+            "forward={forward}"
+        );
 
         let page = account_tx(
             &app,
@@ -129,7 +137,11 @@ fn account_tx_marker_is_first_row_of_next_page() {
             2,
         );
         assert_eq!(entries(&page).len(), 1, "resume includes the marker row");
-        assert_eq!(page.get("marker"), Some(&marker(2, third)), "forward={forward}");
+        assert_eq!(
+            page.get("marker"),
+            Some(&marker(2, third)),
+            "forward={forward}"
+        );
 
         let page = account_tx(
             &app,

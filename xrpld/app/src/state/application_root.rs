@@ -8350,7 +8350,7 @@ impl ApplicationRoot {
     }
 
     pub fn current_server_time_string(&self) -> String {
-        basics::chrono::to_string(OffsetDateTime::now_utc())
+        basics::chrono::to_string_micros(OffsetDateTime::now_utc())
     }
 
     pub fn current_close_time_seconds(&self) -> u32 {
@@ -8976,6 +8976,55 @@ impl ApplicationRoot {
             return None;
         }
         (fee_and_seq.account_seq != 0).then_some(fee_and_seq.available_seq)
+    }
+
+    /// rippled `rpc::getCurrentNetworkFee` (TransactionSign.cpp) before the
+    /// caller's limit check: the larger of `tx`'s base fee scaled by the local
+    /// load and the open ledger's escalated fee,
+    /// `toDrops(openLedgerFeeLevel - 1, baseFee) + 1`. Returns
+    /// `(fee, fee_default)`, where `fee_default` is `tx`'s base fee
+    /// (rippled `getTxFee`) that the caller's limit multiplies.
+    pub fn current_network_fee_drops(&self, tx: &STTx, unlimited: bool) -> (u64, u64) {
+        fn base_fee<V: ReadView>(view: &V, tx: &STTx) -> u64 {
+            calculate_sttx_base_fee(view, tx).unwrap_or_else(|_| view.fees().base)
+        }
+        let fee_default = match self.open_ledger_sandbox.lock() {
+            Ok(holder) if holder.is_some() => {
+                base_fee(holder.as_ref().expect("checked above"), tx)
+            }
+            _ => self
+                .ledger_master_state
+                .latest_ledger()
+                .map(|ledger| base_fee(ledger.as_ref(), tx))
+                .unwrap_or_else(|| self.open_ledger().current().base_fee_drops),
+        };
+
+        let track = self.load_fee_track();
+        let (fee_factor, remote_fee_factor) = track.scaling_factors();
+        let load_fee = crate::state::invoke_preclaim::scale_fee_load(
+            fee_drops_as_i64(fee_default),
+            fee_factor,
+            remote_fee_factor,
+            track.load_base(),
+            unlimited,
+        );
+        let load_fee = u64::try_from(load_fee).unwrap_or(0);
+
+        let report = self.tx_q_rpc_report();
+        let open_level = report.levels.open_ledger_level.parse::<u64>().unwrap_or(0);
+        let base_level = report
+            .levels
+            .reference_level
+            .parse::<u64>()
+            .ok()
+            .filter(|level| *level != 0)
+            .unwrap_or(256);
+        let ledger_base = self.open_ledger().current().base_fee_drops;
+        let escalated = (u128::from(open_level.saturating_sub(1)) * u128::from(ledger_base)
+            / u128::from(base_level))
+        .saturating_add(1);
+        let escalated = u64::try_from(escalated).unwrap_or(u64::MAX);
+        (load_fee.max(escalated), fee_default)
     }
 
     /// Get the account's current sequence from the network ops pending state.

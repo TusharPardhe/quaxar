@@ -58,7 +58,7 @@ fn account_info_renders_account_data_flags_and_v1_signer_lists() {
     assert_eq!(
         account_data.get("urlgravatar"),
         Some(&JsonValue::String(
-            "http://www.gravatar.com/avatar/deadbeefcafebabe445566778899aabb".to_owned()
+            "https://www.gravatar.com/avatar/deadbeefcafebabe445566778899aabb".to_owned()
         ))
     );
     assert!(matches!(

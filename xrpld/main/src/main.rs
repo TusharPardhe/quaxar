@@ -1635,6 +1635,12 @@ fn bind_server_runtime_into_root<D>(
 ) where
     D: server::RpcDispatcher + Clone + Send + Sync + 'static,
 {
+    // rippled server_info `git`: the build's commit hash and branch.
+    let non_empty = |value: &str| (!value.is_empty()).then(|| value.to_owned());
+    let _ = root.set_status_rpc_git_info(Some(app::StatusRpcGitInfo {
+        hash: non_empty(env!("QUAXAR_GIT_HASH")),
+        branch: non_empty(env!("QUAXAR_GIT_BRANCH")),
+    }));
     let handler = root.server_handler();
     let app_for_runtime = root.clone();
     let configured_ports: Vec<String> = root

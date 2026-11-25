@@ -13,7 +13,6 @@ use crate::handlers::ledger_lookup::{
     lookup_ledger_with_result,
 };
 
-
 pub struct LedgerHeaderRequest<'a> {
     pub params: &'a JsonValue,
     pub api_version: u32,

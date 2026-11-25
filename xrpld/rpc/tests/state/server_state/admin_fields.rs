@@ -98,14 +98,13 @@ fn server_state_admin_includes_validator_expiry_and_load_queue() {
     let JsonValue::Object(load) = state.get("load").expect("load must exist") else {
         panic!("load must be object");
     };
-    // Our load object uses "jobs", "load_events", "threads" fields
-    // (matching our JobQueue reporting), not rippled's job_count/process_count.
+    // rippled JobQueue::getJson: `threads` and a `job_types` array (quaxar
+    // used to send `jobs` and `load_events`).
     assert!(
-        load.contains_key("jobs")
-            || load.contains_key("load_events")
-            || load.contains_key("threads"),
-        "load object should contain at least one known field, got: {load:?}"
+        matches!(load.get("job_types"), Some(JsonValue::Array(_))) && load.contains_key("threads"),
+        "load must carry rippled's job_types and threads, got: {load:?}"
     );
+    assert!(!load.contains_key("jobs") && !load.contains_key("load_events"));
 }
 
 #[test]
