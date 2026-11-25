@@ -355,6 +355,27 @@ impl LedgerPersistenceRuntime for AppLedgerPersistenceRuntime {
     }
 
     fn save_validated_ledger(&self, ledger: Arc<Ledger>, _is_current: bool) -> ValidatedLedgerSave {
+        // rippled `saveValidatedLedger`: store the prefixed header in the node
+        // store first, keyed by the ledger hash, for every saved ledger.
+        // Acquisition stores it for ledgers fetched from peers; ledgers built
+        // here had none.
+        if let Some(crate::SHAMapStoreNodeStore::Single(database)) = self.node_store.as_ref() {
+            let header = ledger.header();
+            if let Err(error) = database.store(
+                NodeStoreObjectType::Ledger,
+                protocol::serialize_prefixed_ledger_header(&header, false),
+                *header.hash.as_uint256(),
+                header.seq,
+            ) {
+                tracing::warn!(
+                    target: "ledger",
+                    seq = header.seq,
+                    hash = %header.hash,
+                    %error,
+                    "ledger header object not stored"
+                );
+            }
+        }
         // Write header to SQLite Ledgers table (compatibility: the reference source kADD_LEDGER).
         // This is the primary bootstrap source on restart — mirrors reference getLastFullLedger().
         if let Some(db) = self.ledger_db.as_ref()
