@@ -1255,12 +1255,11 @@ pub fn get_seed_from_rpc(params: &JsonValue) -> Result<Seed, Status> {
     } else if seed_type == jss::seed {
         protocol::decode_base58_token(text, protocol::TokenType::FamilySeed)
             .and_then(|bytes| Seed::from_slice(&bytes).ok())
-    } else if text.len() == 32 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
-        hex::decode(text)
-            .ok()
-            .and_then(|bytes| Seed::from_slice(&bytes).ok())
     } else {
-        None
+        // UInt128::parseHex: 32 hex digits, or "0".
+        basics::base_uint::Uint128::from_hex(text)
+            .ok()
+            .and_then(|value| Seed::from_slice(value.data()).ok())
     };
     seed.ok_or_else(|| Status::new(RpcErrorCode::BadSeed))
 }

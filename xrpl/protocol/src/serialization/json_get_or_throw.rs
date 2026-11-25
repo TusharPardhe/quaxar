@@ -4,10 +4,7 @@ use std::fmt;
 
 use basics::{buffer::Buffer, string_utilities::str_unhex};
 
-use crate::{
-    AccountID, Asset, JsonValue, MPTAmount, PublicKey, SField, STAmount, XRPAmount,
-    asset_from_json, normalized_parts_from_string, parse_base58_account_id,
-};
+use crate::{AccountID, JsonValue, PublicKey, SField, STAmount, parse_base58_account_id};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonMissingKeyError {
@@ -219,35 +216,7 @@ impl JsonFieldRead for STAmount {
 }
 
 fn parse_st_amount(field: &'static SField, value: &JsonValue) -> Result<STAmount, &'static str> {
-    match value {
-        JsonValue::String(text) => {
-            let runtime = normalized_parts_from_string(text).map_err(|_| "STAmount")?;
-            let xrp = XRPAmount::from_number(runtime).map_err(|_| "STAmount")?;
-            Ok(STAmount::from_xrp_amount(xrp))
-        }
-        JsonValue::Object(object) => {
-            let Some(JsonValue::String(value_text)) = object.get("value") else {
-                return Err("STAmount");
-            };
-            let asset = asset_from_json(value).map_err(|_| "STAmount")?;
-            let runtime = normalized_parts_from_string(value_text).map_err(|_| "STAmount")?;
-            match asset {
-                Asset::Issue(issue) if issue.native() => {
-                    let xrp = XRPAmount::from_number(runtime).map_err(|_| "STAmount")?;
-                    Ok(STAmount::from_xrp_amount(xrp))
-                }
-                Asset::Issue(issue) => {
-                    let amount = crate::IOUAmount::from_number(runtime).map_err(|_| "STAmount")?;
-                    Ok(STAmount::from_iou_amount(field, amount, issue))
-                }
-                Asset::MPTIssue(issue) => {
-                    let amount = MPTAmount::from_number(runtime).map_err(|_| "STAmount")?;
-                    Ok(STAmount::from_mpt_amount(field, amount, issue))
-                }
-            }
-        }
-        _ => Err("STAmount"),
-    }
+    crate::amount_from_json(field, value).map_err(|_| "STAmount")
 }
 
 #[cfg(test)]
@@ -262,14 +231,21 @@ mod tests {
         let field = get_field_by_symbol("sfAmount");
         let json = JsonValue::Object(BTreeMap::from([(
             field.name().to_owned(),
-            JsonValue::Object(BTreeMap::from([
-                ("currency".to_owned(), JsonValue::String("XRP".to_owned())),
-                ("value".to_owned(), JsonValue::String("100".to_owned())),
-            ])),
+            JsonValue::String("100".to_owned()),
         )]));
 
         let amount = get_or_throw::<STAmount>(&json, field).expect("amount should parse");
         assert_eq!(amount.text(), "100");
         assert!(get_optional::<STAmount>(&json, field).is_some());
+
+        // rippled amountFromJson: XRP may not be specified as an object.
+        let xrp_object = JsonValue::Object(BTreeMap::from([(
+            field.name().to_owned(),
+            JsonValue::Object(BTreeMap::from([
+                ("currency".to_owned(), JsonValue::String("XRP".to_owned())),
+                ("value".to_owned(), JsonValue::String("100".to_owned())),
+            ])),
+        )]));
+        assert!(get_or_throw::<STAmount>(&xrp_object, field).is_err());
     }
 }

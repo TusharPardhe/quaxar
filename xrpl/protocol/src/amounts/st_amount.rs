@@ -1126,6 +1126,189 @@ impl StBase for STAmount {
     }
 }
 
+/// rippled `amountFromJson` (STAmount.cpp). An amount is an integer (XRP
+/// drops), a string `"value[ currency[ issuer]]"` split on whitespace, `,` or
+/// `/`, an array `[value, currency, issuer]`, or an object with `value` and
+/// either `currency`/`issuer` or `mpt_issuance_id`. XRP may not be an object,
+/// and XRP and MPT values must be integral.
+pub fn amount_from_json(field: &'static SField, v: &JsonValue) -> Result<STAmount, String> {
+    let mut is_mpt = false;
+    let (value, currency, issuer) = match v {
+        JsonValue::Null => {
+            return Err("XRP may not be specified with a null Json value".to_owned());
+        }
+        JsonValue::Object(object) => {
+            let valid = if object.contains_key("mpt_issuance_id") {
+                !(object.contains_key("currency") || object.contains_key("issuer"))
+            } else {
+                object.contains_key("currency")
+            };
+            if !valid {
+                return Err("Invalid Asset's Json specification".to_owned());
+            }
+            let member = |name: &str| object.get(name).cloned().unwrap_or(JsonValue::Null);
+            if object.contains_key("mpt_issuance_id") {
+                is_mpt = true;
+                (member("value"), member("mpt_issuance_id"), JsonValue::Null)
+            } else {
+                (member("value"), member("currency"), member("issuer"))
+            }
+        }
+        JsonValue::Array(items) => {
+            let item = |index: usize| items.get(index).cloned().unwrap_or(JsonValue::Null);
+            (
+                items.first().cloned().unwrap_or(JsonValue::Unsigned(0)),
+                item(1),
+                item(2),
+            )
+        }
+        JsonValue::String(text) => {
+            // boost::split keeps empty elements between adjacent separators.
+            let elements: Vec<&str> = text
+                .split(|c: char| matches!(c, '\t' | '\n' | '\r' | ' ' | ',' | '/'))
+                .collect();
+            if elements.len() > 3 {
+                return Err("invalid amount string".to_owned());
+            }
+            let element = |index: usize| {
+                elements
+                    .get(index)
+                    .map_or(JsonValue::Null, |s| JsonValue::String((*s).to_owned()))
+            };
+            (element(0), element(1), element(2))
+        }
+        other => (other.clone(), JsonValue::Null, JsonValue::Null),
+    };
+
+    let currency_text = match &currency {
+        JsonValue::String(text) => Some(text.as_str()),
+        _ => None,
+    };
+    let native = currency_text.is_none_or(|text| text.is_empty() || text == "XRP");
+    let asset = if native {
+        if matches!(v, JsonValue::Object(_) | JsonValue::Null) {
+            return Err("XRP may not be specified as an object".to_owned());
+        }
+        Asset::Issue(xrp_issue())
+    } else {
+        let currency_text = currency_text.expect("not native, so a string");
+        if is_mpt {
+            let id = crate::MPTID::from_hex(currency_text)
+                .map_err(|_| "invalid MPTokenIssuanceID".to_owned())?;
+            Asset::MPTIssue(MPTIssue::new(id))
+        } else {
+            let mut code = crate::Currency::zero();
+            if !crate::to_currency(&mut code, currency_text) {
+                return Err("invalid currency".to_owned());
+            }
+            let mut account = crate::AccountID::zero();
+            let valid_issuer =
+                matches!(&issuer, JsonValue::String(text) if crate::to_issuer(&mut account, text));
+            if !valid_issuer {
+                return Err("invalid issuer".to_owned());
+            }
+            let issue = Issue::new(code, account);
+            if issue.native() {
+                return Err("invalid issuer".to_owned());
+            }
+            Asset::Issue(issue)
+        }
+    };
+
+    let (mantissa, exponent, negative) = match &value {
+        JsonValue::Signed(number) => (number.unsigned_abs(), 0, *number < 0),
+        JsonValue::Unsigned(number) => (*number, 0, false),
+        JsonValue::String(text) => {
+            let parts = crate::parts_from_string(text).map_err(|error| format!("{error:?}"))?;
+            if (asset.native() || matches!(asset, Asset::MPTIssue(_))) && parts.exponent < 0 {
+                return Err("XRP and MPT must be specified as integral amount.".to_owned());
+            }
+            (parts.mantissa, parts.exponent, parts.negative)
+        }
+        _ => return Err("invalid amount type".to_owned()),
+    };
+    STAmount::try_new_with_asset(field, asset, mantissa, exponent, negative)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod amount_from_json_tests {
+    use super::amount_from_json;
+    use crate::{JsonValue, json, sf_generic, to_base58, xrp_account};
+
+    const ISSUER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+
+    fn parse(value: JsonValue) -> Result<String, String> {
+        amount_from_json(sf_generic(), &value).map(|amount| format!("{amount:?}"))
+    }
+
+    #[test]
+    fn xrp_accepts_integers_and_integral_strings() {
+        assert_eq!(parse(json!(10u64)), parse(json!("10")));
+        assert!(parse(json!(10u64)).is_ok());
+        assert!(parse(json!(-10i64)).is_ok());
+        assert_eq!(parse(json!("1e3")), parse(json!(1000u64)));
+        assert_eq!(
+            parse(json!("1.5")),
+            Err("XRP and MPT must be specified as integral amount.".to_owned())
+        );
+        assert_eq!(
+            parse(json!({ "currency": "XRP", "value": "10" })),
+            Err("XRP may not be specified as an object".to_owned())
+        );
+        assert_eq!(
+            parse(JsonValue::Null),
+            Err("XRP may not be specified with a null Json value".to_owned())
+        );
+    }
+
+    #[test]
+    fn issued_amounts_have_string_array_and_object_forms() {
+        let object = parse(json!({ "currency": "USD", "issuer": ISSUER, "value": "1.5" }));
+        assert!(object.is_ok(), "{object:?}");
+        assert_eq!(parse(json!(format!("1.5/USD/{ISSUER}"))), object);
+        assert_eq!(parse(json!(format!("1.5 USD {ISSUER}"))), object);
+        assert_eq!(parse(json!(["1.5", "USD", ISSUER])), object);
+        assert_eq!(
+            parse(json!({ "currency": "USD", "issuer": ISSUER, "value": 2u64 })),
+            parse(json!({ "currency": "USD", "issuer": ISSUER, "value": "2" }))
+        );
+        assert_eq!(
+            parse(json!(format!("1/USD/{ISSUER}/x"))),
+            Err("invalid amount string".to_owned())
+        );
+        assert_eq!(
+            parse(json!({ "currency": "USD", "value": "1" })),
+            Err("invalid issuer".to_owned())
+        );
+        let zero_currency = "0000000000000000000000000000000000000000";
+        let xrp_issuer = to_base58(xrp_account());
+        assert_eq!(
+            parse(json!({ "currency": zero_currency, "issuer": xrp_issuer, "value": "1" })),
+            Err("invalid issuer".to_owned())
+        );
+        assert_eq!(
+            parse(json!({ "value": "1" })),
+            Err("Invalid Asset's Json specification".to_owned())
+        );
+    }
+
+    #[test]
+    fn mpt_values_are_integral() {
+        let id = "00000001B5F762798A53D543A014CAF8B297CFF8F2F937E8";
+        assert!(parse(json!({ "mpt_issuance_id": id, "value": "5" })).is_ok());
+        assert!(parse(json!({ "mpt_issuance_id": id, "value": 5u64 })).is_ok());
+        assert_eq!(
+            parse(json!({ "mpt_issuance_id": id, "value": "0.5" })),
+            Err("XRP and MPT must be specified as integral amount.".to_owned())
+        );
+        assert_eq!(
+            parse(json!({ "mpt_issuance_id": id, "currency": "USD", "value": "5" })),
+            Err("Invalid Asset's Json specification".to_owned())
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
