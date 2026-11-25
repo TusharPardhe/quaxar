@@ -259,10 +259,13 @@ impl<V: AppServerInfoView> ServerInfoSource for ApplicationServerInfo<V> {
 }
 
 impl<V: AppServerInfoView> FeeSource for ApplicationServerInfo<V> {
+    /// rippled `doFee` -> `TxQ::doRPC`: the queue and open ledger now. The
+    /// published snapshot is only refreshed at each close, so its
+    /// `current_ledger_size` and fee levels lagged the open ledger.
     fn fee_json(&self) -> JsonValue {
         self.view
-            .status_snapshot()
-            .queue_report
+            .live_queue_report()
+            .or_else(|| self.view.status_snapshot().queue_report)
             .map(fee_json_from_report)
             .unwrap_or(JsonValue::Null)
     }

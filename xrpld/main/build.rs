@@ -22,6 +22,23 @@ fn main() {
             .map(|s| s.trim().to_owned())
             .unwrap_or_default()
     };
+    // Re-run when HEAD moves (a new commit or a branch switch), so a build of
+    // new code never reports the previous commit. Paths come from git so
+    // worktrees resolve to their own HEAD.
+    let head_ref = git(&["rev-parse", "--symbolic-full-name", "HEAD"]);
+    let mut watched = vec![git(&["rev-parse", "--git-path", "HEAD"])];
+    if head_ref.starts_with("refs/") {
+        watched.push(git(&["rev-parse", "--git-path", &head_ref]));
+    }
+    watched.push(git(&["rev-parse", "--git-path", "packed-refs"]));
+    // Declaring any rerun-if-changed drops cargo's default of re-running on
+    // every package file change; keep that for the sources.
+    watched.push("src".to_owned());
+    for path in watched {
+        if !path.is_empty() && std::path::Path::new(&path).exists() {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
     println!(
         "cargo:rustc-env=QUAXAR_GIT_HASH={}",
         git(&["rev-parse", "HEAD"])

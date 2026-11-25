@@ -804,12 +804,54 @@ impl Deref for SharedAppOpenLedger {
     }
 }
 
+/// The application TxQ behind its mutex, plus the last fee report computed
+/// from it. Read-only RPC reports use that copy while a queue operation holds
+/// the mutex (see [`SharedAppTxQ::current_rpc_report_nonblocking`]).
 #[derive(Clone)]
-pub struct SharedAppTxQ(Arc<Mutex<AppTxQ>>);
+pub struct SharedAppTxQ(
+    Arc<Mutex<AppTxQ>>,
+    Arc<Mutex<Option<tx::QueueTxQRpcReport>>>,
+);
 
 impl SharedAppTxQ {
     pub fn new(tx_q: AppTxQ) -> Self {
-        Self(Arc::new(Mutex::new(tx_q)))
+        Self(Arc::new(Mutex::new(tx_q)), Arc::new(Mutex::new(None)))
+    }
+
+    fn remember_rpc_report(&self, report: &tx::QueueTxQRpcReport) {
+        if let Ok(mut last) = self.1.lock() {
+            *last = Some(report.clone());
+        }
+    }
+
+    /// The fee report for RPC readers (`fee`, `server_info`) without waiting
+    /// on the queue mutex. rippled's `TxQ::doRPC` takes the same mutex that
+    /// `apply` and `accept` hold while they run; on mainnet quaxar's `fee`
+    /// then waited up to 2.1 s behind them (p99 33 ms, 2026-11-25). When the
+    /// mutex is busy this returns the last report computed from the queue:
+    /// the state as of a moment before the running operation, which is a
+    /// valid reading for a request that arrived while it ran. It blocks only
+    /// before any report exists.
+    pub fn current_rpc_report_nonblocking(
+        &self,
+        current: &AppOpenLedgerView,
+    ) -> tx::QueueTxQRpcReport {
+        match self.0.try_lock() {
+            Ok(tx_q) => {
+                let mut lock = AppTxQLock;
+                let report = tx_q.get_rpc_fee_report(&mut lock, current);
+                drop(tx_q);
+                self.remember_rpc_report(&report);
+                report
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let last = self.1.lock().ok().and_then(|last| last.clone());
+                last.unwrap_or_else(|| self.current_rpc_report(current))
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                panic!("app txq mutex must not be poisoned")
+            }
+        }
     }
 
     pub fn set_standalone(&self, standalone: bool) {
@@ -902,7 +944,9 @@ impl SharedAppTxQ {
         Lock: QueueAcceptLockScope,
         View: QueueTxQRpcView,
     {
-        self.lock().get_rpc_fee_report(lock, view)
+        let report = self.lock().get_rpc_fee_report(lock, view);
+        self.remember_rpc_report(&report);
+        report
     }
 
     /// Mirrors `TxQ::getTxRequiredFeeAndSeq` from rippled: returns the open
@@ -1543,6 +1587,30 @@ mod tests {
     use std::sync::Arc;
     use time::Duration as TimeDuration;
     use xrpl_core::{HashRouterFlags, LoadMonitorJournalFactory, NetworkIDService};
+
+    /// RPC fee reports must not wait behind a queue operation holding the
+    /// TxQ mutex (mainnet `fee` waited up to 2.1 s, 2026-11-25). While it is
+    /// held they return the last report computed from the queue.
+    #[test]
+    fn txq_rpc_report_does_not_wait_on_a_busy_queue() {
+        let tx_q = super::default_app_tx_q();
+        let view = super::AppOpenLedgerView::default();
+        let before = tx_q.current_rpc_report_nonblocking(&view);
+
+        let held = tx_q.0.lock().expect("txq mutex");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = tx_q.clone();
+        std::thread::spawn(move || {
+            let report =
+                reader.current_rpc_report_nonblocking(&super::AppOpenLedgerView::default());
+            let _ = sender.send(report);
+        });
+        let during = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the reader must not wait for the held TxQ mutex");
+        drop(held);
+        assert_eq!(during, before, "the last computed report is returned");
+    }
 
     #[test]
     fn relay_untrusted_policy_defaults_and_parser_match_rippled() {

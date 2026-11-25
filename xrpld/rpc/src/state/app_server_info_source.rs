@@ -27,6 +27,12 @@ pub trait AppServerInfoView {
     }
 
     fn status_snapshot(&self) -> StatusRpcSnapshot;
+    /// The TxQ fee report for the current open ledger now (rippled
+    /// `TxQ::doRPC`), not as of the last close. `None` where the view has no
+    /// live queue.
+    fn live_queue_report(&self) -> Option<QueueTxQRpcReport> {
+        None
+    }
     fn status_metrics(&self) -> Option<Arc<dyn StatusMetricsSource>>;
     fn overlay_status(&self) -> Option<Arc<dyn OverlayStatusSource>>;
     fn published_server_ports(&self) -> Option<Arc<dyn PublishedServerPortsSource>>;
@@ -72,16 +78,18 @@ pub trait AppServerInfoView {
     }
 }
 
+/// Fills what the published snapshot lacks from the live open ledger and
+/// TxQ, computing each only when it is missing.
 fn merge_live_status_fallbacks(
     mut snapshot: StatusRpcSnapshot,
-    current_ledger_index: Option<u32>,
-    queue_report: Option<QueueTxQRpcReport>,
+    current_ledger_index: impl FnOnce() -> Option<u32>,
+    queue_report: impl FnOnce() -> QueueTxQRpcReport,
 ) -> StatusRpcSnapshot {
     if snapshot.current_ledger_index.is_none() {
-        snapshot.current_ledger_index = current_ledger_index;
+        snapshot.current_ledger_index = current_ledger_index();
     }
     if snapshot.queue_report.is_none() {
-        snapshot.queue_report = queue_report;
+        snapshot.queue_report = Some(queue_report());
     }
     snapshot
 }
@@ -91,7 +99,7 @@ fn live_queue_report(
     tx_q: &SharedAppTxQ,
 ) -> tx::QueueTxQRpcReport {
     let current = open_ledger.current();
-    tx_q.current_rpc_report(current.as_ref())
+    tx_q.current_rpc_report_nonblocking(current.as_ref())
 }
 
 impl<T: AppServerInfoView + ?Sized> AppServerInfoView for &T {
@@ -101,6 +109,10 @@ impl<T: AppServerInfoView + ?Sized> AppServerInfoView for &T {
 
     fn status_snapshot(&self) -> StatusRpcSnapshot {
         (**self).status_snapshot()
+    }
+
+    fn live_queue_report(&self) -> Option<QueueTxQRpcReport> {
+        (**self).live_queue_report()
     }
 
     fn status_metrics(&self) -> Option<Arc<dyn StatusMetricsSource>> {
@@ -317,11 +329,19 @@ impl AppServerInfoView for ApplicationRoot {
     }
 
     fn status_snapshot(&self) -> StatusRpcSnapshot {
+        // The live fallbacks are computed only when the published snapshot
+        // lacks them. Computing the queue report eagerly took the TxQ mutex
+        // on every status read (ledger_current, ledger lookups) and then
+        // threw the result away.
         merge_live_status_fallbacks(
             self.status_rpc_state().snapshot(),
-            self.live_current_ledger_index(),
-            Some(self.tx_q_rpc_report()),
+            || self.live_current_ledger_index(),
+            || self.tx_q_rpc_report_nonblocking(),
         )
+    }
+
+    fn live_queue_report(&self) -> Option<QueueTxQRpcReport> {
+        Some(self.tx_q_rpc_report_nonblocking())
     }
 
     fn status_metrics(&self) -> Option<Arc<dyn StatusMetricsSource>> {
@@ -484,9 +504,13 @@ impl AppServerInfoView for OwnedApplicationServerInfo {
     fn status_snapshot(&self) -> StatusRpcSnapshot {
         merge_live_status_fallbacks(
             self.status_rpc_state.snapshot(),
-            self.open_ledger.live_current_ledger_index(),
-            Some(live_queue_report(&self.open_ledger, &self.tx_q)),
+            || self.open_ledger.live_current_ledger_index(),
+            || live_queue_report(&self.open_ledger, &self.tx_q),
         )
+    }
+
+    fn live_queue_report(&self) -> Option<QueueTxQRpcReport> {
+        Some(live_queue_report(&self.open_ledger, &self.tx_q))
     }
 
     fn status_metrics(&self) -> Option<Arc<dyn StatusMetricsSource>> {
