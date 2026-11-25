@@ -17,6 +17,7 @@ mod full_pipeline;
 mod ledger_entry;
 mod ledger_entry_types;
 mod ledger_operations;
+mod ledger_owner_funds;
 mod ledger_rpc;
 mod misc_operations;
 mod no_ripple_check;

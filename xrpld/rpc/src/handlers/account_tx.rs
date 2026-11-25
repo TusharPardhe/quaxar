@@ -57,6 +57,18 @@ pub struct AccountTxPage {
     pub limit: u32,
     pub marker: Option<AccountTxMarker>,
     pub transactions: Vec<TxRecord>,
+    /// Binary requests: the stored blobs as read, without parsing them
+    /// (rippled `accountTxPage` binary path). Sources that fill this leave
+    /// `transactions` empty.
+    pub binary_transactions: Vec<AccountTxBinaryRow>,
+}
+
+/// One binary `account_tx` row: the stored transaction and metadata blobs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountTxBinaryRow {
+    pub tx_blob: Vec<u8>,
+    pub meta_blob: Vec<u8>,
+    pub ledger_index: u32,
 }
 
 pub trait AccountTxSource: LedgerLookupSource {
@@ -275,6 +287,21 @@ fn make_owner(record: &TxRecord) -> Transaction {
 /// rippled AccountTx `populateJsonResponse`, binary branch (all versions):
 /// `tx_blob`, `meta` (v1) or `meta_blob` (v2) as hex, `ledger_index`,
 /// `validated`. Nothing else.
+fn insert_binary_row(target: &mut JsonValue, row: &AccountTxBinaryRow, api_version: u32) {
+    let object = ensure_object(target);
+    object.insert(
+        "tx_blob".to_owned(),
+        JsonValue::String(str_hex(&row.tx_blob)),
+    );
+    let key = if api_version > 1 { "meta_blob" } else { "meta" };
+    object.insert(key.to_owned(), JsonValue::String(str_hex(&row.meta_blob)));
+    object.insert(
+        "ledger_index".to_owned(),
+        JsonValue::Unsigned(u64::from(row.ledger_index)),
+    );
+    object.insert("validated".to_owned(), JsonValue::Bool(true));
+}
+
 fn insert_binary_transaction(target: &mut JsonValue, record: &TxRecord, api_version: u32) {
     let object = ensure_object(target);
     object.insert(
@@ -445,6 +472,11 @@ pub fn do_account_tx<S: AccountTxSource>(
         else {
             unreachable!("transactions should be an array");
         };
+        for row in &page.binary_transactions {
+            let mut tx = JsonValue::Object(BTreeMap::new());
+            insert_binary_row(&mut tx, row, api_version);
+            transactions.push(tx);
+        }
         for record in &page.transactions {
             let mut tx = JsonValue::Object(BTreeMap::new());
             if binary {
