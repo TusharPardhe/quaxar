@@ -732,7 +732,7 @@ fn resolve_lookup_ledger<V: AppServerInfoView>(
     // node store, so attach one. Ledgers that already have it are returned
     // as they are.
     Some(match view.app() {
-        Some(app) => app.ledger_with_node_fetcher(resolved),
+        Some(app) => app.rpc_ledger_with_node_fetcher(resolved),
         None => resolved,
     })
 }

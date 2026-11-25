@@ -568,6 +568,9 @@ pub(crate) struct LedgerAdvanceWorker {
     passes: std::sync::atomic::AtomicU64,
 }
 
+/// Older ledgers `rpc_ledger_with_node_fetcher` keeps.
+const FETCHER_ATTACHED_LEDGERS: usize = 4;
+
 #[derive(Clone)]
 pub struct ApplicationRoot {
     registry: ApplicationRegistryOwners,
@@ -591,6 +594,8 @@ pub struct ApplicationRoot {
     load_fee_track: Arc<SharedLoadFeeTrack>,
     /// Configured `[voting]` fee targets supplied to the consensus adaptor.
     fee_vote_setup: FeeSetup,
+    /// Recent results of `rpc_ledger_with_node_fetcher`, most recent last.
+    fetcher_attached_ledgers: Arc<Mutex<Vec<Arc<Ledger>>>>,
     ledger_fetch_depth: u32,
     /// Lifecycle-safe server fee reporter shared with LoadManager and the
     /// normal NetworkOps/consensus paths.
@@ -5142,6 +5147,7 @@ impl ApplicationRoot {
             load_manager: Arc::new(load_manager),
             load_fee_track,
             fee_vote_setup: fee_setup,
+            fetcher_attached_ledgers: Arc::new(Mutex::new(Vec::new())),
             ledger_fetch_depth,
             fee_change_reporter,
             registry,
@@ -6711,6 +6717,7 @@ impl ApplicationRoot {
         &mut self,
         node_store: Option<crate::shamap::shamap_store_backend::SHAMapStoreNodeStore>,
     ) -> Option<crate::shamap::shamap_store_backend::SHAMapStoreNodeStore> {
+        self.clear_rpc_attached_ledgers();
         // Also populate the shared consensus node store so ConsensusLedgerAcceptor
         // can access it (it was created before the node store was attached).
         if let Some(ref ns) = node_store {
@@ -6868,6 +6875,7 @@ impl ApplicationRoot {
         &mut self,
         node_family: Arc<dyn NodeFamilyRuntime>,
     ) -> Option<Arc<dyn NodeFamilyRuntime>> {
+        self.clear_rpc_attached_ledgers();
         self.node_family.replace(node_family)
     }
 
@@ -8642,6 +8650,51 @@ impl ApplicationRoot {
     /// fetcher/writer plumbing or re-run state-map setup on every promotion.
     /// Once a ledger already has both seams attached, keep the owner path hot and
     /// return it unchanged.
+    /// [`Self::ledger_with_node_fetcher`] for RPC reads, which call it for
+    /// every read of a ledger. Attaching clones the ledger and re-reads its
+    /// fee and amendment objects; on mainnet that made `account_lines` on a
+    /// ledger 300 back 4x slower than on the validated one (2026-11-25).
+    /// The last few attached ledgers are kept by hash. Their trees share
+    /// nodes with the original, so this keeps no extra tree memory. Only a
+    /// ledger whose setup succeeded is kept, and the cache is cleared when
+    /// the node store or family changes.
+    pub fn rpc_ledger_with_node_fetcher(&self, ledger: Arc<Ledger>) -> Arc<Ledger> {
+        let hash = ledger.header().hash;
+        let mut cache = self
+            .fetcher_attached_ledgers
+            .lock()
+            .expect("fetcher_attached_ledgers mutex");
+        if let Some(attached) = cache.iter().rev().find(|l| l.header().hash == hash) {
+            return Arc::clone(attached);
+        }
+        drop(cache);
+        let attached = self.ledger_with_node_fetcher(Arc::clone(&ledger));
+        // Unchanged (already wired or unbacked): nothing to keep.
+        if Arc::ptr_eq(&attached, &ledger) || !attached.has_node_fetcher() {
+            return attached;
+        }
+        if attached.fees().base == 0 {
+            // Setup did not complete; let the next read retry it.
+            return attached;
+        }
+        cache = self
+            .fetcher_attached_ledgers
+            .lock()
+            .expect("fetcher_attached_ledgers mutex");
+        if cache.len() >= FETCHER_ATTACHED_LEDGERS {
+            cache.remove(0);
+        }
+        cache.push(Arc::clone(&attached));
+        attached
+    }
+
+    fn clear_rpc_attached_ledgers(&self) {
+        self.fetcher_attached_ledgers
+            .lock()
+            .expect("fetcher_attached_ledgers mutex")
+            .clear();
+    }
+
     pub fn ledger_with_node_fetcher(&self, ledger: Arc<Ledger>) -> Arc<Ledger> {
         let has_shared_family = self.node_family().is_some();
         if (ledger.has_node_fetcher()

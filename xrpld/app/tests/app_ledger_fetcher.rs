@@ -451,3 +451,35 @@ fn application_root_does_not_renormalize_fully_wired_ledger_with_shared_family()
         "a fully wired closed ledger must not be cloned and synchronously re-setup merely because a shared node family exists"
     );
 }
+
+/// RPC handlers attach the node store for every read of an older ledger.
+/// `rpc_ledger_with_node_fetcher` keeps the attached ledger, so the clone
+/// and its fee/amendment setup happen once per ledger, not once per read.
+#[test]
+fn rpc_reads_reuse_the_attached_older_ledger() {
+    let (_dir, node_store) = node_store_bootstrap();
+    let fees = Fees {
+        base: 10,
+        reserve: 1_000_000,
+        increment: 200_000,
+    };
+    let ledger = Arc::new(backed_fee_ledger_without_fetcher(102, fees, &node_store));
+
+    let mut root = ApplicationRoot::new(0).expect("root");
+    root.attach_node_store(Some(node_store.clone()));
+
+    let first = root.rpc_ledger_with_node_fetcher(Arc::clone(&ledger));
+    assert!(first.has_node_fetcher());
+    assert_eq!(first.fees(), fees);
+    let second = root.rpc_ledger_with_node_fetcher(Arc::clone(&ledger));
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "second read reuses the attached ledger"
+    );
+
+    // A new node store invalidates what was attached to the old one.
+    root.attach_node_store(Some(node_store));
+    let third = root.rpc_ledger_with_node_fetcher(ledger);
+    assert!(!Arc::ptr_eq(&first, &third));
+    assert_eq!(third.fees(), fees);
+}
