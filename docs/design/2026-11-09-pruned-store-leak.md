@@ -135,3 +135,10 @@ fails without the `unclaimed_seq` check. Also
 
 The ~44M nodes already leaked are not tracked and stay in the store. Removing
 them needs an offline copy of only the window's reachable nodes, or a resync.
+
+**Done 2026-11-25** with `fjall-rebuild --reachable` (docs/RUNNING.md): 45.8M
+untracked nodes (26.0 GB) dropped, 30.4M kept; `fjall_live_mb` went from
+21,130 to 6,105. The walk found every state and transaction tree of the 513
+retained ledgers complete, but 168 of them had no ledger header object in the
+store (their headers are only in SQL). That predates the rebuild and is kept
+as it was.

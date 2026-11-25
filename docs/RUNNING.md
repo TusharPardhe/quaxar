@@ -541,11 +541,19 @@ sudo systemctl start quaxar
 ```
 
 `--reachable-dry-run <store> <db-dir>` walks and counts without writing. It can
-run beside a live node on a hard-linked copy of the store (journals and
-version files copied, `keyspaces/*/tables` linked with `cp -al`) and of the
-SQLite files. Set `FJALL_REBUILD_THREADS=4 FJALL_REBUILD_CACHE_MB=128` there
-to limit its load. The walk's node set takes about 50 bytes per kept node
-(about 1.5 GB at 30M nodes).
+run on a hard-linked copy of the store (journals and version files copied,
+`keyspaces/*/tables` linked with `cp -al`) and of the SQLite files. The walk's
+node set takes about 75 bytes per node (2.2 GB at 30M nodes), plus the block
+cache (`FJALL_REBUILD_CACHE_MB`, default 2048). Beside a live node on an 8 GB
+host that does not fit: a dry run there with a 2.2 GB cap was killed at the
+end of the claimed tree walk.
+
+Measured on mainnet (2026-11-25, 4-core ARM, NVMe): 30.4M of 76.3M nodes kept
+(11.3 GB of 37.3 GB), the store went from 28.0 GB to 6.4 GB on disk, and the
+run took 22.5 minutes: 10.5 min walking, 2 min copying, 1 min compacting,
+8.7 min verifying. Peak memory was 6.1 GB. The walk is bound by random reads
+(about 48k nodes/s with 16 threads, `FJALL_REBUILD_THREADS`). The node was
+proposing 3 minutes after the start.
 
 ## Priming the NodeStore from a Snapshot
 
