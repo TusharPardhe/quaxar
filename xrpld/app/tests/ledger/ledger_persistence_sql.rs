@@ -276,3 +276,57 @@ fn failed_header_write_is_counted_and_recovery_resets_the_run() {
     ));
     assert_eq!(persistence.save_failure_counts(), (0, 2));
 }
+
+/// rippled `saveValidatedLedger` stores the prefixed ledger header in the
+/// node store, keyed by the ledger hash, for every saved ledger. Quaxar only
+/// stored it for ledgers acquired from peers, so the headers of the ledgers
+/// it built were missing (mainnet, 2026-11-25: 168 of 513 retained ledgers).
+#[test]
+fn saving_a_validated_ledger_stores_its_header_object() {
+    use nodestore::{DummyScheduler, FetchType, Manager, ManagerImp, NodeObjectType, NullJournal};
+
+    let manager = ManagerImp::new();
+    let mut config = basics::basic_config::Section::new("node_db");
+    config.set("type", "Memory");
+    config.set("path", "saved-ledger-header-object");
+    let database = manager
+        .make_database(
+            0,
+            Arc::new(DummyScheduler),
+            1,
+            &config,
+            Arc::new(NullJournal),
+        )
+        .expect("database");
+    let database: Arc<dyn nodestore::Database> = database;
+    let persistence = Arc::new(AppLedgerPersistenceRuntime::new(
+        None,
+        Some(app::SHAMapStoreNodeStore::Single(Arc::clone(&database))),
+        Arc::new(TransactionMaster::new()),
+        0,
+        None,
+    ));
+    let ledger = immutable_ledger_with_txs(&[], 9001);
+    let header = ledger.header();
+
+    assert!(pend_save_validated(
+        persistence,
+        Arc::clone(&ledger),
+        false,
+        true
+    ));
+
+    let stored = database
+        .fetch_node_object(
+            header.hash.as_uint256(),
+            header.seq,
+            FetchType::Synchronous,
+            false,
+        )
+        .expect("the header object is stored under the ledger hash");
+    assert_eq!(stored.object_type(), NodeObjectType::Ledger);
+    assert_eq!(
+        stored.data(),
+        protocol::serialize_prefixed_ledger_header(&header, false).as_slice()
+    );
+}
