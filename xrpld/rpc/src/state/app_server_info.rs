@@ -899,8 +899,9 @@ fn succ_lookup_ledger_key<V: AppServerInfoView>(
     let resolved = resolve_lookup_ledger(view, ledger)?;
     match resolved.succ(key, last) {
         Ok(Some(entry)) => Some(entry),
-        // As for reads: no successor in a loaded state map is final.
-        Ok(None) if state_map_is_loaded(&resolved) => None,
+        // Unlike a point read, the in-memory successor walk can answer
+        // "none" when the branch holding the next key is not loaded (an older
+        // ledger read from disk), so a miss here still goes to the store.
         Ok(None) | Err(_) => view
             .app()
             .and_then(|app| succ_lookup_ledger_key_with_family(app, resolved.as_ref(), key, last)),
@@ -1745,13 +1746,45 @@ fn view_is_validated_hash<V: AppServerInfoView>(view: &V, seq: u32, hash: SHAMap
     let Some(reference) = reference else {
         return false;
     };
+    if seq > reference.header().seq {
+        return false;
+    }
     let found = match runtime.as_ref() {
         Some(runtime) => runtime
             .ledger_master()
             .walk_hash_by_seq_from(&reference, seq),
         None => reference.hash_of_seq(seq, &ledger::NullLedgerJournal),
     };
-    found.is_some_and(|found| found == hash)
+    match found {
+        Some(found) => found == hash,
+        // More than 256 ledgers back the walk reads the covering flag
+        // ledger's skip list, which for a ledger loaded from disk is usually
+        // not in memory (rippled acquires it). Quaxar's record of validated
+        // ledgers answers instead: the ledger history's validated index,
+        // then the ledger database, which holds only validated ledgers.
+        None => validated_hash_by_seq(view, seq).is_some_and(|found| found == hash),
+    }
+}
+
+/// The hash of the validated ledger `seq` from quaxar's validated-ledger
+/// records: the ledger history's by-sequence index (populated only for
+/// validated ledgers) and then the ledger database (saved validated ledgers).
+fn validated_hash_by_seq<V: AppServerInfoView>(view: &V, seq: u32) -> Option<SHAMapHash> {
+    let app = view.app()?;
+    if let Some(runtime) = app.ledger_master_runtime()
+        && let Some(ledger) = runtime
+            .ledger_master()
+            .ledger_history()
+            .get_cached_ledger_by_seq(seq)
+    {
+        return Some(ledger.header().hash);
+    }
+    let stored = app
+        .ledger_db()?
+        .get_ledger_info_by_seq(seq)
+        .ok()??
+        .to_header()?;
+    Some(stored.hash)
 }
 
 impl<V: AppServerInfoView> app::LedgerToJsonContext for RpcLedgerJsonContext<'_, V> {
@@ -1786,13 +1819,22 @@ impl<V: AppServerInfoView> app::LedgerToJsonContext for RpcLedgerJsonContext<'_,
         account: protocol::AccountID,
         amount: &protocol::STAmount,
     ) -> Option<String> {
-        ledger::account_funds_text(
-            ledger,
-            account,
-            amount,
-            ledger::FreezeHandling::IgnoreFreeze,
-        )
-        .ok()
+        let funds = |ledger: &ledger::Ledger| {
+            ledger::account_funds_text(
+                ledger,
+                account,
+                amount,
+                ledger::FreezeHandling::IgnoreFreeze,
+            )
+            .ok()
+        };
+        // The owner's trust line or account root is often not in memory;
+        // read it through the node store then (rippled reads through its
+        // node-store-backed SHAMap).
+        funds(ledger).or_else(|| {
+            let app = self.view.app()?;
+            funds(&app.ledger_with_node_fetcher(std::sync::Arc::new(ledger.clone())))
+        })
     }
 }
 
