@@ -355,3 +355,24 @@ fn key_parameters_follow_keypair_for_signature() {
     .expect("passphrase with key_type signs");
     assert!(result.contains_key("tx_blob"));
 }
+
+/// rippled `amountFromJson` takes an integer Fee and an issued amount
+/// written as `"value/currency/issuer"`.
+#[test]
+fn amount_forms_follow_amount_from_json() {
+    let app = standalone_app();
+    let tx = payment(&[("Fee", json!(15u64))]);
+    let result = sign(&app, &request(tx, &[])).expect("integer Fee");
+    assert_eq!(tx_json(&result).get("Fee"), Some(&json!("15")));
+
+    let tx = payment(&[
+        ("Amount", json!(format!("1.5/USD/{GENESIS}"))),
+        ("Fee", json!("10")),
+    ]);
+    let result = sign(&app, &request(tx, &[])).expect("string issued amount");
+    // API v2 shows a Payment's Amount as DeliverMax.
+    assert_eq!(
+        tx_json(&result).get("DeliverMax"),
+        Some(&json!({ "currency": "USD", "issuer": GENESIS, "value": "1.5" }))
+    );
+}

@@ -10,10 +10,9 @@ use crate::{
     JsonValue, LedgerFormats, Permission, SOEStyle, STAccount, STAmount, STArray, STBlob,
     STCurrency, STInt32, STIssue, STNumber, STObject, STUInt8, STUInt16, STUInt32, STUInt64,
     STUInt128, STUInt160, STUInt192, STUInt256, STVector256, SerializedTypeId,
-    TxFormats, TxType, asset_from_json, currency_from_string, get_field_by_name,
-    get_field_by_symbol, make_param_error, normalized_parts_from_json_input,
-    normalized_parts_from_string, parse_base58_account_id, st_issue_from_json,
-    st_path_set_from_json,
+    TxFormats, TxType, currency_from_string, get_field_by_name, get_field_by_symbol,
+    make_param_error, normalized_parts_from_json_input, parse_base58_account_id,
+    st_issue_from_json, st_path_set_from_json,
 };
 
 #[derive(Debug, Clone)]
@@ -330,56 +329,12 @@ fn parse_blob_field(field: &'static crate::SField, value: &JsonValue) -> Result<
     Ok(STBlob::from_buffer(field, Buffer::from_bytes(&bytes)))
 }
 
+/// rippled `amountFromJson`; any failure is "invalid data" for the field.
 fn parse_amount_field(
     field: &'static crate::SField,
     value: &JsonValue,
 ) -> Result<STAmount, String> {
-    match value {
-        JsonValue::String(text) => {
-            let runtime = normalized_parts_from_string(text).map_err(|_| field_invalid(field))?;
-            let xrp = crate::XRPAmount::from_number(runtime).map_err(|_| field_invalid(field))?;
-            STAmount::try_new_with_asset(
-                field,
-                crate::xrp_issue(),
-                xrp.drops().unsigned_abs(),
-                0,
-                xrp.drops() < 0,
-            )
-            .map_err(|_| field_invalid(field))
-        }
-        JsonValue::Object(object) => {
-            let Some(JsonValue::String(text)) = object.get("value") else {
-                return Err(field_invalid(field));
-            };
-            let asset = asset_from_json(value).map_err(|_| field_invalid(field))?;
-            let runtime = normalized_parts_from_string(text).map_err(|_| field_invalid(field))?;
-            match asset {
-                crate::Asset::Issue(issue) if issue.native() => {
-                    let xrp =
-                        crate::XRPAmount::from_number(runtime).map_err(|_| field_invalid(field))?;
-                    STAmount::try_new_with_asset(
-                        field,
-                        issue,
-                        xrp.drops().unsigned_abs(),
-                        0,
-                        xrp.drops() < 0,
-                    )
-                    .map_err(|_| field_invalid(field))
-                }
-                crate::Asset::Issue(issue) => {
-                    let amount =
-                        crate::IOUAmount::from_number(runtime).map_err(|_| field_invalid(field))?;
-                    Ok(STAmount::from_iou_amount(field, amount, issue))
-                }
-                crate::Asset::MPTIssue(issue) => {
-                    let amount =
-                        crate::MPTAmount::from_number(runtime).map_err(|_| field_invalid(field))?;
-                    Ok(STAmount::from_mpt_amount(field, amount, issue))
-                }
-            }
-        }
-        _ => Err(field_invalid(field)),
-    }
+    crate::amount_from_json(field, value).map_err(|_| field_invalid(field))
 }
 
 fn parse_number_field(
