@@ -108,7 +108,7 @@ impl Ord for Job {
 /// Per-job-type dynamic counters. Matches the dynamic portion of the
 /// reference's `JobTypeData` (the static portion lives in
 /// [`crate::job::job_types::JobTypeInfo`]).
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct JobTypeCounters {
     waiting: usize,
     running: usize,
@@ -119,6 +119,9 @@ struct JobTypeCounters {
     /// reference's `JobTypeData::updateLatency`'s event count, minus the
     /// latency histogram itself (see module-level deviation note).
     load_events: u64,
+    /// rippled `JobTypeData::load_`: rate and latency of finished jobs and
+    /// recorded load events, against the type's latency targets.
+    load: crate::load::load_monitor::LoadMonitor,
 }
 
 /// Shared mutable state protected by [`JobQueue`]'s mutex. Matches the
@@ -144,7 +147,16 @@ impl State {
     }
 
     fn counters_mut(&mut self, jt: JobType) -> &mut JobTypeCounters {
-        self.counters.entry(jt).or_default()
+        self.counters.entry(jt).or_insert_with(|| {
+            let info = jt.info();
+            JobTypeCounters {
+                load: crate::load::load_monitor::LoadMonitor::new(
+                    info.avg_latency,
+                    info.peak_latency,
+                ),
+                ..JobTypeCounters::default()
+            }
+        })
     }
 
     /// Pop and return the highest-priority job whose type is under its
@@ -298,7 +310,7 @@ impl RunningJob {
         self.finished = true;
 
         let mut guard = self.inner.state.lock();
-        let promoted_deferred = finish_job(&mut guard, self.job_type);
+        let promoted_deferred = finish_job(&mut guard, self.job_type, self.queue_time);
         guard.process_count -= 1;
         let now_idle = guard.process_count == 0 && guard.queue.is_empty();
         drop(guard);
@@ -496,12 +508,15 @@ impl JobQueue {
     /// histogram this port omits (see module-level deviation note) --
     /// only the count is tracked, which is enough to detect a queue
     /// that never stops accumulating load.
-    pub fn add_load_events(&self, job_type: JobType, count: u64, _elapsed: std::time::Duration) {
+    pub fn add_load_events(&self, job_type: JobType, count: u64, elapsed: std::time::Duration) {
         self.inner
             .load_events
             .fetch_add(count, AtomicOrdering::Relaxed);
         let mut state = self.inner.state.lock();
-        state.counters_mut(job_type).load_events += count;
+        let counters = state.counters_mut(job_type);
+        counters.load_events += count;
+        // rippled `JobQueue::addLoadEvents`: `load().addSamples(count, elapsed)`.
+        counters.load.add_samples(count, elapsed);
     }
 
     /// Reserve the highest-priority runnable job without running it,
@@ -584,24 +599,46 @@ impl JobQueue {
     /// rippled's per-second rate or latency figures (`per_second`,
     /// `peak_time`, `avg_time`, `over_target`; see the module-level deviation
     /// note), so those keys are absent.
+    /// rippled `JobQueue::getJson`: every type except `generic` with a
+    /// recent rate, latency or queued or running jobs.
     pub fn get_json(&self, _threshold: u32) -> serde_json::Value {
-        let state = self.inner.state.lock();
-        let job_types: Vec<serde_json::Value> = state
-            .counters
-            .iter()
-            .filter(|&(_, c)| c.waiting > 0 || c.running > 0 || c.load_events > 0)
-            .map(|(&job_type, c)| {
-                let mut entry = serde_json::Map::new();
-                entry.insert("job_type".to_owned(), job_type.name().into());
-                if c.waiting != 0 {
-                    entry.insert("waiting".to_owned(), c.waiting.into());
-                }
-                if c.running != 0 {
-                    entry.insert("in_progress".to_owned(), c.running.into());
-                }
-                serde_json::Value::Object(entry)
-            })
-            .collect();
+        let mut state = self.inner.state.lock();
+        let mut job_types = Vec::new();
+        for (&job_type, counters) in state.counters.iter_mut() {
+            if job_type == JobType::JtGeneric {
+                continue;
+            }
+            let stats = counters.load.stats();
+            if stats.count == 0
+                && counters.waiting == 0
+                && stats.latency_peak_ms == 0
+                && counters.running == 0
+            {
+                continue;
+            }
+            let mut entry = serde_json::Map::new();
+            entry.insert("job_type".to_owned(), job_type.name().into());
+            if stats.is_overloaded {
+                entry.insert("over_target".to_owned(), true.into());
+            }
+            if counters.waiting != 0 {
+                entry.insert("waiting".to_owned(), counters.waiting.into());
+            }
+            if stats.count != 0 {
+                entry.insert("per_second".to_owned(), stats.count.into());
+            }
+            if stats.latency_peak_ms != 0 {
+                entry.insert("peak_time".to_owned(), stats.latency_peak_ms.into());
+            }
+            if stats.latency_avg_ms != 0 {
+                entry.insert("avg_time".to_owned(), stats.latency_avg_ms.into());
+            }
+            if counters.running != 0 {
+                entry.insert("in_progress".to_owned(), counters.running.into());
+            }
+            job_types.push(serde_json::Value::Object(entry));
+        }
+        drop(state);
         serde_json::json!({
             "threads": self.worker_thread_count(),
             "job_types": job_types,
@@ -721,13 +758,14 @@ fn worker_loop(instance: usize, inner: Arc<JobQueueInner>) {
         // their job closure instead of relying on unwinding.
         let job_type = job.job_type;
         let job_name = job.name.clone();
+        let queue_time = job.queue_time;
         if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job.func)) {
             let message = panic_message(&payload);
             tracing::error!(job_type = ?job_type, name = %job_name, %message, "JobQueue: job panicked");
         }
 
         let mut guard = inner.state.lock();
-        let promoted_deferred = finish_job(&mut guard, job_type);
+        let promoted_deferred = finish_job(&mut guard, job_type, queue_time);
         guard.process_count -= 1;
         let now_idle = guard.process_count == 0 && guard.queue.is_empty();
         drop(guard);
@@ -763,8 +801,11 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// Returns whether a deferred job was promoted, so the caller knows
 /// whether it's worth waking another worker to check for newly-runnable
 /// work of this type.
-fn finish_job(state: &mut State, job_type: JobType) -> bool {
+fn finish_job(state: &mut State, job_type: JobType, queue_time: Instant) -> bool {
     let counters = state.counters_mut(job_type);
+    // rippled `Job::doJob` ends its `LoadEvent`, which adds the job's wait
+    // plus run time to the type's `LoadMonitor`.
+    counters.load.add_load_sample(queue_time.elapsed());
     let promoted = counters.deferred > 0;
     if promoted {
         counters.deferred -= 1;
