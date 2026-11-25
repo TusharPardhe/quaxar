@@ -141,6 +141,33 @@ impl<NodeId, LedgerId, Position> ConsensusProposal<NodeId, LedgerId, Position> {
     }
 }
 
+impl<NodeId, LedgerId: ToString, Position: ToString> ConsensusProposal<NodeId, LedgerId, Position> {
+    /// rippled `ConsensusProposal::getJson`. `close_time` is a string of
+    /// network-clock seconds; a bowed-out proposal has no position.
+    pub fn get_json(&self) -> std::collections::BTreeMap<String, protocol::JsonValue> {
+        use protocol::JsonValue;
+        let mut ret = std::collections::BTreeMap::from([(
+            "previous_ledger".to_owned(),
+            JsonValue::String(self.previous_ledger.to_string()),
+        )]);
+        if !self.is_bow_out() {
+            ret.insert(
+                "transaction_hash".to_owned(),
+                JsonValue::String(self.position.to_string()),
+            );
+            ret.insert(
+                "propose_seq".to_owned(),
+                JsonValue::Unsigned(u64::from(self.propose_seq)),
+            );
+        }
+        ret.insert(
+            "close_time".to_owned(),
+            JsonValue::String(self.close_time.as_seconds().to_string()),
+        );
+        ret
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

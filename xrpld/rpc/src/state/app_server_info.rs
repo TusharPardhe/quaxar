@@ -2248,9 +2248,14 @@ impl<V: AppServerInfoView> crate::handlers::unl_list::UnlListSource for Applicat
 impl<V: AppServerInfoView> crate::handlers::consensus_info::ConsensusInfoSource
     for ApplicationServerInfo<V>
 {
+    /// rippled `NetworkOPs::getConsensusInfo`: `RCLConsensus::getJson(true)`,
+    /// answered by the consensus strand. Empty when consensus is not running.
     fn get_consensus_info(&self) -> JsonValue {
-        // Consensus state is not yet exposed on the view.
-        JsonValue::Object(BTreeMap::new())
+        self.view
+            .app()
+            .and_then(|app| app.consensus_runtime())
+            .and_then(|runtime| runtime.consensus_info(std::time::Duration::from_secs(2)))
+            .unwrap_or_else(|| JsonValue::Object(BTreeMap::new()))
     }
 }
 

@@ -951,6 +951,9 @@ fn strand_loop(
                     last_timer_tick = Instant::now();
                     tracing::info!(target: "consensus", "Consensus started via external command");
                 }
+                ConsensusCommand::Info(reply) => {
+                    let _ = reply.try_send(runner.get_json(true));
+                }
                 ConsensusCommand::Stop => {
                     tracing::info!(target: "consensus", "Strand received Stop command");
                     return;

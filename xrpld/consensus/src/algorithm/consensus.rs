@@ -414,6 +414,127 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
         self.mode.get()
     }
 
+    /// rippled `Consensus::getJson`. `node_key` renders a node id as rippled
+    /// `to_string(NodeID)` and `peer_json` renders a peer position
+    /// (`PeerPosition::getJson`). Maps with no entries are omitted, as in
+    /// rippled; `acquired` is sorted because rippled's order is a hash map's.
+    pub fn get_json(
+        &self,
+        full: bool,
+        node_key: &dyn Fn(&A::NodeId) -> String,
+        peer_json: &dyn Fn(&A::PeerPos) -> protocol::JsonValue,
+    ) -> std::collections::BTreeMap<String, protocol::JsonValue> {
+        use protocol::JsonValue;
+        use std::collections::BTreeMap;
+
+        let count = |n: usize| JsonValue::Unsigned(n as u64);
+        let millis =
+            |d: Duration| JsonValue::Unsigned(u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let mut ret = BTreeMap::new();
+        ret.insert(
+            "proposing".to_owned(),
+            JsonValue::Bool(self.mode.get() == ConsensusMode::Proposing),
+        );
+        ret.insert(
+            "proposers".to_owned(),
+            count(self.curr_peer_positions.len()),
+        );
+        if self.mode.get() != ConsensusMode::WrongLedger {
+            ret.insert("synched".to_owned(), JsonValue::Bool(true));
+            let seq: u64 = self.previous_ledger.seq().into();
+            ret.insert("ledger_seq".to_owned(), JsonValue::Unsigned(seq + 1));
+            ret.insert(
+                "close_granularity".to_owned(),
+                JsonValue::Unsigned(self.close_resolution.as_secs()),
+            );
+        } else {
+            ret.insert("synched".to_owned(), JsonValue::Bool(false));
+        }
+        ret.insert(
+            "phase".to_owned(),
+            JsonValue::String(self.phase.to_string()),
+        );
+        if let Some(result) = &self.result {
+            if !result.disputes.is_empty() && !full {
+                ret.insert("disputes".to_owned(), count(result.disputes.len()));
+            }
+            ret.insert(
+                "our_position".to_owned(),
+                JsonValue::Object(result.position.get_json()),
+            );
+        }
+        if !full {
+            return ret;
+        }
+
+        if let Some(result) = &self.result {
+            ret.insert("current_ms".to_owned(), millis(result.round_time.read()));
+        }
+        ret.insert(
+            "converge_percent".to_owned(),
+            JsonValue::Signed(self.converge_percent),
+        );
+        ret.insert(
+            "close_resolution".to_owned(),
+            JsonValue::Unsigned(self.close_resolution.as_secs()),
+        );
+        ret.insert(
+            "have_time_consensus".to_owned(),
+            JsonValue::Bool(self.have_close_time_consensus),
+        );
+        ret.insert("previous_proposers".to_owned(), count(self.prev_proposers));
+        ret.insert("previous_mseconds".to_owned(), millis(self.prev_round_time));
+        if !self.curr_peer_positions.is_empty() {
+            let positions = self
+                .curr_peer_positions
+                .iter()
+                .map(|(node, position)| (node_key(node), peer_json(position)))
+                .collect();
+            ret.insert("peer_positions".to_owned(), JsonValue::Object(positions));
+        }
+        if !self.acquired.is_empty() {
+            let mut acquired: Vec<String> = self.acquired.keys().map(ToString::to_string).collect();
+            acquired.sort();
+            ret.insert(
+                "acquired".to_owned(),
+                JsonValue::Array(acquired.into_iter().map(JsonValue::String).collect()),
+            );
+        }
+        if let Some(result) = &self.result
+            && !result.disputes.is_empty()
+        {
+            let disputes = result
+                .disputes
+                .iter()
+                .map(|(id, dispute)| (id.to_string(), dispute.get_json(node_key)))
+                .collect();
+            ret.insert("disputes".to_owned(), JsonValue::Object(disputes));
+        }
+        if !self.raw_close_times.peers.is_empty() {
+            let close_times = self
+                .raw_close_times
+                .peers
+                .iter()
+                .map(|(time, votes)| {
+                    (
+                        time.as_seconds().to_string(),
+                        JsonValue::Signed(i64::from(*votes)),
+                    )
+                })
+                .collect();
+            ret.insert("close_times".to_owned(), JsonValue::Object(close_times));
+        }
+        if !self.dead_nodes.is_empty() {
+            let mut dead: Vec<String> = self.dead_nodes.iter().map(node_key).collect();
+            dead.sort();
+            ret.insert(
+                "dead_nodes".to_owned(),
+                JsonValue::Array(dead.into_iter().map(JsonValue::String).collect()),
+            );
+        }
+        ret
+    }
+
     /// Kick off the next round of consensus. Matches `startRound`.
     ///
     /// `prev_ledger_id` is not required to match `prev_ledger.id()`, since
@@ -2021,5 +2142,103 @@ mod tests {
         assert!(result.disputes.contains_key(&7));
         // We don't have tx 7, so our initial vote on the dispute is "no".
         assert!(!result.disputes.get(&7).unwrap().get_our_vote());
+    }
+
+    /// rippled `Consensus::getJson` field set, with a peer position, an
+    /// acquired set and a dispute in the establish phase.
+    #[test]
+    fn get_json_reports_the_round_like_rippled() {
+        use protocol::JsonValue;
+
+        let adaptor = MockAdaptor::new();
+        let mut c: Consensus<MockAdaptor> = Consensus::new();
+        let start = NetClockTimePoint::new(1000);
+        c.start_round(
+            &adaptor,
+            start,
+            0,
+            genesis_ledger(),
+            &HashSet::default(),
+            true,
+        );
+        let effective_idle = adaptor
+            .parms
+            .ledger_idle_interval
+            .max(Duration::from_secs(10) * 2);
+        let closed_at = start + time::Duration::seconds(effective_idle.as_secs() as i64 + 1);
+        c.timer_entry(&adaptor, closed_at);
+        let peer_set = MockTxSet::with(&[7]);
+        let peer_set_id = peer_set.id();
+        adaptor
+            .state
+            .borrow_mut()
+            .tx_sets
+            .insert(peer_set_id, peer_set);
+        let peer_proposal = ConsensusProposal::new(0, 1, peer_set_id, closed_at, closed_at, 99);
+        assert!(c.peer_proposal(
+            &adaptor,
+            closed_at,
+            &MockPeerPos {
+                proposal: peer_proposal,
+            },
+        ));
+
+        let node_key = |node: &NodeId| format!("node{node}");
+        let peer_json = |pos: &MockPeerPos| JsonValue::Object(pos.proposal.get_json());
+        let full = c.get_json(true, &node_key, &peer_json);
+        assert_eq!(full.get("proposing"), Some(&JsonValue::Bool(true)));
+        assert_eq!(full.get("proposers"), Some(&JsonValue::Unsigned(1)));
+        assert_eq!(full.get("synched"), Some(&JsonValue::Bool(true)));
+        let next_seq = u64::from(genesis_ledger().seq()) + 1;
+        assert_eq!(full.get("ledger_seq"), Some(&JsonValue::Unsigned(next_seq)));
+        assert_eq!(
+            full.get("phase"),
+            Some(&JsonValue::String("establish".to_owned()))
+        );
+        for key in [
+            "close_granularity",
+            "our_position",
+            "current_ms",
+            "converge_percent",
+            "close_resolution",
+            "have_time_consensus",
+            "previous_proposers",
+            "previous_mseconds",
+        ] {
+            assert!(full.contains_key(key), "missing {key}");
+        }
+        let Some(JsonValue::Object(peers)) = full.get("peer_positions") else {
+            panic!("peer_positions: {full:?}");
+        };
+        let Some(JsonValue::Object(peer)) = peers.get("node99") else {
+            panic!("peer 99: {peers:?}");
+        };
+        assert_eq!(peer.get("propose_seq"), Some(&JsonValue::Unsigned(1)));
+        assert_eq!(
+            peer.get("close_time"),
+            Some(&JsonValue::String(closed_at.as_seconds().to_string()))
+        );
+        // Our own (empty) position and the peer's set.
+        let Some(JsonValue::Array(acquired)) = full.get("acquired") else {
+            panic!("acquired: {full:?}");
+        };
+        assert!(acquired.contains(&JsonValue::String(peer_set_id.to_string())));
+        let Some(JsonValue::Object(disputes)) = full.get("disputes") else {
+            panic!("disputes: {full:?}");
+        };
+        let Some(JsonValue::Object(dispute)) = disputes.get("7") else {
+            panic!("dispute 7: {disputes:?}");
+        };
+        assert_eq!(dispute.get("our_vote"), Some(&JsonValue::Bool(false)));
+        assert_eq!(dispute.get("yays"), Some(&JsonValue::Signed(1)));
+        assert!(
+            matches!(dispute.get("votes"), Some(JsonValue::Object(votes)) if votes.contains_key("node99"))
+        );
+
+        // Not full: disputes is a count and the full-only fields are absent.
+        let brief = c.get_json(false, &node_key, &peer_json);
+        assert_eq!(brief.get("disputes"), Some(&JsonValue::Unsigned(1)));
+        assert!(!brief.contains_key("peer_positions"));
+        assert!(!brief.contains_key("current_ms"));
     }
 }

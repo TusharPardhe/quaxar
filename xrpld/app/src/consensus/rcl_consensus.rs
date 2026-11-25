@@ -1653,6 +1653,11 @@ pub trait ConsensusRunner: Send {
 
     /// Prev ledger id accessor.
     fn prev_ledger_id(&self) -> Uint256;
+
+    /// rippled `RCLConsensus::getJson`, for `consensus_info`.
+    fn get_json(&self, _full: bool) -> protocol::JsonValue {
+        protocol::JsonValue::Object(Default::default())
+    }
 }
 
 /// Concrete single-strand consensus driver. Owns `Consensus<AppRclConsensusAdaptor>`
@@ -2888,6 +2893,34 @@ impl ConsensusRunner for AppConsensus {
     fn prev_ledger_id(&self) -> Uint256 {
         *self.state.prev_ledger_id()
     }
+
+    /// rippled `RCLConsensus::getJson`: the engine's `getJson` plus
+    /// `validating`. Node ids are rippled `NodeID`s (`calcNodeID` of the
+    /// master key) in hex.
+    fn get_json(&self, full: bool) -> protocol::JsonValue {
+        let node_key = |key: &PublicKey| protocol::calc_node_id(key).to_string();
+        let mut ret = self.state.get_json(full, &node_key, &rcl_peer_pos_json);
+        ret.insert(
+            "validating".to_owned(),
+            protocol::JsonValue::Bool(self.adaptor.is_validating()),
+        );
+        protocol::JsonValue::Object(ret)
+    }
+}
+
+/// rippled `RCLCxPeerPos::getJson`: the proposal plus the signing key.
+fn rcl_peer_pos_json(position: &RclCxPeerPos) -> protocol::JsonValue {
+    let mut ret = position.proposal().get_json();
+    if !position.public_key().as_bytes().is_empty() {
+        ret.insert(
+            "peer_id".to_owned(),
+            protocol::JsonValue::String(protocol::encode_base58_token(
+                protocol::TokenType::NodePublic,
+                position.public_key().as_bytes(),
+            )),
+        );
+    }
+    protocol::JsonValue::Object(ret)
 }
 
 #[cfg(test)]
@@ -3024,5 +3057,49 @@ mod sync_tree_conversion_tests {
         }
 
         assert_eq!(adopted.id(), rebuilt.id());
+    }
+}
+
+#[cfg(test)]
+mod consensus_info_json_tests {
+    use super::{Proposal, RclCxPeerPos, rcl_peer_pos_json};
+    use basics::base_uint::Uint256;
+    use basics::chrono::NetClockTimePoint;
+    use protocol::{JsonValue, KeyType, Seed};
+
+    /// rippled `RCLCxPeerPos::getJson`: the proposal fields and the signing
+    /// key as a node public key.
+    #[test]
+    fn peer_position_json_matches_rippled() {
+        let seed = Seed::from_slice(&[7; 16]).expect("seed");
+        let (public_key, _) = protocol::generate_key_pair(KeyType::Secp256k1, &seed).expect("keys");
+        let proposal = Proposal::new(
+            Uint256::from_array([1; 32]),
+            3,
+            Uint256::from_array([2; 32]),
+            NetClockTimePoint::new(817_000_000),
+            NetClockTimePoint::new(817_000_001),
+            public_key,
+        );
+        let position = RclCxPeerPos::new(public_key, vec![1; 64], Uint256::zero(), proposal);
+        let JsonValue::Object(json) = rcl_peer_pos_json(&position) else {
+            panic!("object");
+        };
+        assert_eq!(
+            json.get("previous_ledger"),
+            Some(&JsonValue::String(Uint256::from_array([1; 32]).to_string()))
+        );
+        assert_eq!(
+            json.get("transaction_hash"),
+            Some(&JsonValue::String(Uint256::from_array([2; 32]).to_string()))
+        );
+        assert_eq!(json.get("propose_seq"), Some(&JsonValue::Unsigned(3)));
+        assert_eq!(
+            json.get("close_time"),
+            Some(&JsonValue::String("817000000".to_owned()))
+        );
+        let expected_peer =
+            protocol::encode_base58_token(protocol::TokenType::NodePublic, public_key.as_bytes());
+        assert_eq!(json.get("peer_id"), Some(&JsonValue::String(expected_peer)));
     }
 }
