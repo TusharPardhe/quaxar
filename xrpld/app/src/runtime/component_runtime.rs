@@ -475,10 +475,16 @@ impl AppConsensusRuntime {
     }
 
     /// rippled `NetworkOPs::getConsensusInfo`. The engine lives on the
-    /// strand without a lock, so the strand answers between commands. `None`
-    /// when the strand is not running, its queue is full, or it does not
-    /// answer within `timeout`.
-    pub fn consensus_info(&self, timeout: std::time::Duration) -> Option<protocol::JsonValue> {
+    /// strand without a lock, so the strand answers between commands. `wake`
+    /// wakes the strand after the request is queued; without it the request
+    /// waited for the strand's 50 ms idle timeout (mainnet 2026-11-25:
+    /// p50 4.9 ms, p90 50 ms). `None` when the strand is not running, its
+    /// queue is full, or it does not answer within `timeout`.
+    pub fn consensus_info(
+        &self,
+        timeout: std::time::Duration,
+        wake: &dyn Fn(),
+    ) -> Option<protocol::JsonValue> {
         let (reply, answer) = std::sync::mpsc::sync_channel(1);
         self.cmd_tx
             .lock()
@@ -486,6 +492,7 @@ impl AppConsensusRuntime {
             .as_ref()?
             .try_send(ConsensusCommand::Info(reply))
             .ok()?;
+        wake();
         answer.recv_timeout(timeout).ok()
     }
 
@@ -708,7 +715,10 @@ mod consensus_info_tests {
     #[test]
     fn consensus_info_is_answered_by_the_strand() {
         let runtime = AppConsensusRuntime::new();
-        assert_eq!(runtime.consensus_info(Duration::from_millis(10)), None);
+        assert_eq!(
+            runtime.consensus_info(Duration::from_millis(10), &|| {}),
+            None
+        );
 
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
         runtime.set_cmd_sender(tx);
@@ -718,7 +728,16 @@ mod consensus_info_tests {
             ConsensusCommand::Info(reply) => reply.send(answer).expect("reply"),
             _ => panic!("expected an Info command"),
         });
-        assert_eq!(runtime.consensus_info(Duration::from_secs(5)), Some(info));
+        let woken = std::sync::atomic::AtomicBool::new(false);
+        let wake = || woken.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            runtime.consensus_info(Duration::from_secs(5), &wake),
+            Some(info)
+        );
+        assert!(
+            woken.load(std::sync::atomic::Ordering::SeqCst),
+            "the strand is woken"
+        );
         strand.join().expect("strand");
     }
 }

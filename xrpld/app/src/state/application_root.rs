@@ -5346,6 +5346,14 @@ impl ApplicationRoot {
     /// Narrow wake capability for background producers which must notify the
     /// serialized NetworkOps owner without retaining an ApplicationRoot clone
     /// (and therefore without forming a component ownership cycle).
+    /// rippled `NetworkOPs::getConsensusInfo`, answered by the consensus
+    /// strand, which is woken for it.
+    pub fn consensus_info(&self, timeout: std::time::Duration) -> Option<protocol::JsonValue> {
+        let runtime = self.consensus_runtime()?;
+        let wake = self.consensus_wake_callback();
+        runtime.consensus_info(timeout, &*wake)
+    }
+
     pub(crate) fn consensus_wake_callback(&self) -> Arc<dyn Fn() + Send + Sync> {
         let notify = Arc::clone(&self.consensus_notify);
         Arc::new(move || {

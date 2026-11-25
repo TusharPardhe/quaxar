@@ -2253,8 +2253,7 @@ impl<V: AppServerInfoView> crate::handlers::consensus_info::ConsensusInfoSource
     fn get_consensus_info(&self) -> JsonValue {
         self.view
             .app()
-            .and_then(|app| app.consensus_runtime())
-            .and_then(|runtime| runtime.consensus_info(std::time::Duration::from_secs(2)))
+            .and_then(|app| app.consensus_info(std::time::Duration::from_secs(2)))
             .unwrap_or_else(|| JsonValue::Object(BTreeMap::new()))
     }
 }
