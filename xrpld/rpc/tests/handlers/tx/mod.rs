@@ -221,3 +221,4 @@ pub(super) fn found_record_with_network(
 mod account_tx_sql;
 mod formatting;
 mod lookup;
+mod validated_records;
