@@ -11,3 +11,6 @@ publish = false
 [dependencies]
 fjall = "=3.1.12"
 lsm-tree = "=3.1.10"
+# Reads the Ledgers tables for the retained roots (--reachable). Same version
+# as quaxar's rdb crate; bundled so the host needs no SQLite library.
+rusqlite = { version = "0.31", features = ["bundled"] }
