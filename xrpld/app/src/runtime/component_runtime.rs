@@ -290,6 +290,8 @@ pub enum ConsensusCommand {
         network_closed: basics::base_uint::Uint256,
         prev_ledger: consensus::RclCxLedger,
     },
+    /// `consensus_info`: reply with `ConsensusRunner::get_json(true)`.
+    Info(std::sync::mpsc::SyncSender<protocol::JsonValue>),
     Stop,
 }
 
@@ -470,6 +472,21 @@ impl AppConsensusRuntime {
                 prev_ledger,
             });
         }
+    }
+
+    /// rippled `NetworkOPs::getConsensusInfo`. The engine lives on the
+    /// strand without a lock, so the strand answers between commands. `None`
+    /// when the strand is not running, its queue is full, or it does not
+    /// answer within `timeout`.
+    pub fn consensus_info(&self, timeout: std::time::Duration) -> Option<protocol::JsonValue> {
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        self.cmd_tx
+            .lock()
+            .expect("cmd_tx mutex")
+            .as_ref()?
+            .try_send(ConsensusCommand::Info(reply))
+            .ok()?;
+        answer.recv_timeout(timeout).ok()
     }
 
     /// Send a stop command to the strand thread.
@@ -678,5 +695,30 @@ impl ManagedComponent for AppPerfLogRuntime {
             return;
         }
         self.perf_log.stop();
+    }
+}
+
+#[cfg(test)]
+mod consensus_info_tests {
+    use super::{AppConsensusRuntime, ConsensusCommand};
+    use std::time::Duration;
+
+    /// `consensus_info` is answered by the strand that owns the engine, and
+    /// is `None` when no strand is running.
+    #[test]
+    fn consensus_info_is_answered_by_the_strand() {
+        let runtime = AppConsensusRuntime::new();
+        assert_eq!(runtime.consensus_info(Duration::from_millis(10)), None);
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        runtime.set_cmd_sender(tx);
+        let info = protocol::json!({ "phase": "open", "validating": true });
+        let answer = info.clone();
+        let strand = std::thread::spawn(move || match rx.recv().expect("command") {
+            ConsensusCommand::Info(reply) => reply.send(answer).expect("reply"),
+            _ => panic!("expected an Info command"),
+        });
+        assert_eq!(runtime.consensus_info(Duration::from_secs(5)), Some(info));
+        strand.join().expect("strand");
     }
 }

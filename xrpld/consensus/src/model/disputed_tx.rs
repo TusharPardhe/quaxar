@@ -236,6 +236,26 @@ where
         self.our_vote = new_position;
         true
     }
+
+    /// rippled `DisputedTx::getJson`. `node_key` renders a peer as rippled
+    /// `to_string(NodeID)`.
+    pub fn get_json(&self, node_key: &dyn Fn(&NodeId) -> String) -> protocol::JsonValue {
+        use protocol::JsonValue;
+        let mut ret = BTreeMap::from([
+            ("yays".to_owned(), JsonValue::Signed(i64::from(self.yays))),
+            ("nays".to_owned(), JsonValue::Signed(i64::from(self.nays))),
+            ("our_vote".to_owned(), JsonValue::Bool(self.our_vote)),
+        ]);
+        if !self.votes.is_empty() {
+            let votes = self
+                .votes
+                .iter()
+                .map(|(node, vote)| (node_key(node), JsonValue::Bool(*vote)))
+                .collect();
+            ret.insert("votes".to_owned(), JsonValue::Object(votes));
+        }
+        JsonValue::Object(ret)
+    }
 }
 
 #[cfg(test)]
