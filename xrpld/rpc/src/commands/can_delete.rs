@@ -51,10 +51,9 @@ pub fn do_can_delete<Runtime: RpcRuntime>(
             } else if seq_str.len() == 64 {
                 let hash = Uint256::from_hex(&seq_str)
                     .map_err(|_| Status::new(RpcErrorCode::InvalidParams))?;
-                let seq = ctx
-                    .runtime
-                    .can_delete_seq_by_hash(hash)
-                    .ok_or_else(|| Status::new(RpcErrorCode::LedgerNotFound))?;
+                let seq = ctx.runtime.can_delete_seq_by_hash(hash).ok_or_else(|| {
+                    Status::with_message(RpcErrorCode::LedgerNotFound, "ledgerNotFound")
+                })?;
                 let status = ctx.runtime.can_delete_set(seq);
                 if !status.is_ok() {
                     return Err(status);
@@ -294,6 +293,8 @@ mod tests {
         let error = do_can_delete(&request(&params, &runtime)).expect_err("must reject");
 
         assert_eq!(error.error_code(), Some(RpcErrorCode::LedgerNotFound));
+        // rippled CanDelete.cpp: makeError(RpcLgrNotFound, "ledgerNotFound").
+        assert_eq!(error.message(), "ledgerNotFound");
     }
 
     #[test]

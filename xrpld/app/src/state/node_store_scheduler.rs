@@ -190,9 +190,9 @@ mod tests {
 
         let json = queue.get_json(0);
         assert!(
-            json["jobs"]
+            json["job_types"]
                 .as_array()
-                .expect("jobs should be an array")
+                .expect("job_types should be an array")
                 .iter()
                 .any(|entry| entry["job_type"] == "AsyncReadNode")
         );

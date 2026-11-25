@@ -510,7 +510,9 @@ where
                             user: &request.metadata.user,
                             forwarded_for: &request.metadata.forwarded_for,
                         },
-                        unlimited: request.metadata.unlimited,
+                        // rippled doPing reports `unlimited` only through a
+                        // WebSocket session's InfoSub consumer.
+                        unlimited: request.metadata.is_websocket && request.metadata.unlimited,
                     };
                     RpcReply::result(rpc::do_ping(&context))
                 }
@@ -656,7 +658,14 @@ where
                     };
                     RpcReply::result(rpc::do_consensus_info(&context))
                 }
-                "ledger_header" => RpcReply::result(rpc::do_ledger_header(&self.source)),
+                "ledger_header" => RpcReply::result(rpc::do_ledger_header(
+                    &rpc::LedgerHeaderRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                )),
                 "account_channels" => RpcReply::result(rpc::do_account_channels(
                     &rpc::AccountChannelsRequest {
                         params: &params,
@@ -894,12 +903,15 @@ where
                     }
                 }
                 "version" => {
-                    let mut version_obj = std::collections::BTreeMap::new();
-                    version_obj.insert("first".to_string(), JsonValue::Unsigned(1));
-                    version_obj.insert("last".to_string(), JsonValue::Unsigned(2));
-                    let mut result = std::collections::BTreeMap::new();
-                    result.insert("version".to_string(), JsonValue::Object(version_obj));
-                    RpcReply::result(JsonValue::Object(result))
+                    // rippled VersionHandler -> setVersion: strings "1.0.0"
+                    // for an unspecified (v1) request, numbers otherwise.
+                    let mut result = JsonValue::Object(std::collections::BTreeMap::new());
+                    protocol::set_version(
+                        &mut result,
+                        request.metadata.api_version,
+                        protocol::beta_rpc_api(),
+                    );
+                    RpcReply::result(result)
                 }
                 "connect"
                 | "peers"

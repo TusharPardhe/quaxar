@@ -558,12 +558,21 @@ fn account_tx_v1_uses_flat_tx_fields_not_tx_json() {
     let JsonValue::Object(entry) = &transactions[0] else {
         panic!("entry must be an object");
     };
-    // v1 flattens tx fields at top level (no "tx_json" wrapper)
+    // rippled AccountTx.cpp populateJsonResponse (apiVersion 1): exactly
+    // {validated, tx, meta}; the transaction lives under "tx".
     assert!(!entry.contains_key("tx_json"), "v1 should NOT have tx_json");
-    assert!(entry.contains_key("meta"), "should have meta");
+    let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec!["meta", "tx", "validated"]);
     assert_eq!(entry.get("validated"), Some(&JsonValue::Bool(true)));
-    // v1 has TransactionType at top level
-    assert!(entry.contains_key("TransactionType") || entry.contains_key("hash"));
+    let JsonValue::Object(tx) = entry.get("tx").expect("tx") else {
+        panic!("tx must be an object");
+    };
+    assert_eq!(
+        tx.get("TransactionType"),
+        Some(&JsonValue::String("Payment".to_owned()))
+    );
+    assert!(tx.contains_key("hash"), "v1 tx carries its hash");
 }
 
 #[test]

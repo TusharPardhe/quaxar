@@ -91,8 +91,42 @@ pub(crate) fn fill_json_tx_entry(
         fill_json_tx_v1(&mut tx_json, fill, txn, meta);
     }
 
+    insert_ctid(&mut tx_json, fill, txn, meta);
     insert_owner_funds(&mut tx_json, fill, txn);
     tx_json
+}
+
+/// rippled develop LedgerToJson `fillJsonTx` (#6401): every expanded
+/// transaction (JSON v1, v2 and binary) carries `ctid` when its metadata has
+/// `TransactionIndex`. A transaction's own `NetworkID` overrides the server's.
+fn insert_ctid(
+    tx_json: &mut JsonValue,
+    fill: &AppLedgerFill<'_>,
+    txn: &STTx,
+    meta: Option<&TxMeta>,
+) {
+    let Some(meta) = meta else {
+        return;
+    };
+    let index_field = get_field_by_symbol("sfTransactionIndex");
+    if !meta.get_as_object().is_field_present(index_field) {
+        return;
+    }
+    let network_id_field = get_field_by_symbol("sfNetworkID");
+    let Some(network_id) = (if txn.is_field_present(network_id_field) {
+        Some(txn.get_field_u32(network_id_field))
+    } else {
+        fill.context.and_then(|context| context.network_id())
+    }) else {
+        return;
+    };
+    let txn_index = meta.get_as_object().get_field_u32(index_field);
+    if let (Some(ctid), JsonValue::Object(object)) = (
+        crate::tx_queue::transaction::encode_ctid(fill.ledger.header().seq, txn_index, network_id),
+        tx_json,
+    ) {
+        object.insert("ctid".to_owned(), JsonValue::String(ctid));
+    }
 }
 
 fn fill_json_tx_binary(

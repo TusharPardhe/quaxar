@@ -89,6 +89,7 @@ impl LedgerSource for TestSource {
         &self,
         ledger: LedgerLookupLedger,
         options: LedgerFillOptions,
+        _api_version: u32,
     ) -> Result<JsonValue, RpcStatus> {
         self.selected_calls
             .borrow_mut()
@@ -351,6 +352,11 @@ fn ledger_not_found_by_seq() {
             RpcErrorCode::LedgerNotFound.token().to_owned()
         ))
     );
+    // rippled RPCLedgerHelpers getLedger: {RpcLgrNotFound, "ledgerNotFound"}.
+    assert_eq!(
+        result.get("error_message"),
+        Some(&JsonValue::String("ledgerNotFound".to_owned()))
+    );
 }
 
 #[test]
@@ -370,6 +376,11 @@ fn ledger_not_found_by_hash() {
         Some(&JsonValue::String(
             RpcErrorCode::LedgerNotFound.token().to_owned()
         ))
+    );
+    // rippled RPCLedgerHelpers getLedger: {RpcLgrNotFound, "ledgerNotFound"}.
+    assert_eq!(
+        result.get("error_message"),
+        Some(&JsonValue::String("ledgerNotFound".to_owned()))
     );
 }
 

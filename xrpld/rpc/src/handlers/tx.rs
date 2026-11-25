@@ -138,7 +138,14 @@ fn parse_selector<S: TxSource>(params: &JsonValue, source: &S) -> Result<TxSelec
 
 fn make_transaction_owner(record: &TxRecord) -> Transaction {
     let mut owner = Transaction::new(Arc::clone(&record.txn));
-    owner.set_status_with_ledger(TransStatus::COMMITTED, record.ledger_index, None, None);
+    // rippled Transaction::getJson writes `ctid` inside the transaction when
+    // its index and the network ID are known (v1 flat, v2 under tx_json).
+    owner.set_status_with_ledger(
+        TransStatus::COMMITTED,
+        record.ledger_index,
+        record.txn_index,
+        record.network_id,
+    );
     owner
 }
 

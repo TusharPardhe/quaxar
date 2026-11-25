@@ -276,6 +276,12 @@ fn nft_buy_offers_paginates_and_includes_marker_offer() {
         &source,
     );
     let first_object = json_object(&first_page);
+    // rippled NFTOffersHandlerBase::writeResult writes only nft_id, offers,
+    // limit and marker. Quaxar used to add the lookup's ledger_hash,
+    // ledger_index and validated (mainnet, 2026-11-24).
+    let mut keys: Vec<&str> = first_object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["limit", "marker", "nft_id", "offers"]);
     let JsonValue::Array(first_offers) = first_object.get("offers").expect("offers") else {
         panic!("offers should be array");
     };

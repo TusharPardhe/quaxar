@@ -518,7 +518,7 @@ impl AppServerInfoView for OwnedApplicationServerInfo {
     }
 
     fn current_server_time_string(&self) -> String {
-        basics::chrono::to_string(OffsetDateTime::now_utc())
+        basics::chrono::to_string_micros(OffsetDateTime::now_utc())
     }
 
     fn current_close_time_seconds(&self) -> u32 {

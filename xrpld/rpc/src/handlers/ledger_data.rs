@@ -266,7 +266,9 @@ pub fn do_ledger_data<S: LedgerDataSource>(
     merge_object_fields(object, resolved.base_json);
 
     if marker.is_none() {
-        object.insert("ledger".to_owned(), resolved.ledger_json);
+        let mut ledger_json = resolved.ledger_json;
+        crate::handlers::ledger::set_ledger_index_type(&mut ledger_json, request.api_version);
+        object.insert("ledger".to_owned(), ledger_json);
     }
 
     let mut nodes = Vec::new();

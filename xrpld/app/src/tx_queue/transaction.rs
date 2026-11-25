@@ -459,7 +459,8 @@ impl Transaction {
     }
 }
 
-fn encode_ctid(ledger_seq: u32, txn_index: u32, network_id: u32) -> Option<String> {
+/// rippled `RPC::encodeCTID`.
+pub fn encode_ctid(ledger_seq: u32, txn_index: u32, network_id: u32) -> Option<String> {
     const MAX_LEDGER_SEQ: u32 = 0x0FFF_FFFF;
     const MAX_TXN_INDEX: u32 = 0xFFFF;
     const MAX_NETWORK_ID: u32 = 0xFFFF;

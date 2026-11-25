@@ -784,14 +784,9 @@ impl<C: ValidatorListClock> ValidatorList<C> {
         let state = self.state.read().expect("validator list read lock");
         let mut result = BTreeMap::new();
         let status_snapshot = self.status_snapshot_locked(&state);
-        result.insert(
-            "list_threshold".to_owned(),
-            JsonValue::Unsigned(state.list_threshold as u64),
-        );
-        result.insert(
-            "quorum".to_owned(),
-            JsonValue::Unsigned(state.quorum as u64),
-        );
+        // rippled ValidatorList::getJson: validation_quorum, validator_list,
+        // local_static_keys, publisher_lists, trusted_validator_keys,
+        // signing_keys and (when non-empty) NegativeUNL.
         result.insert(
             "validation_quorum".to_owned(),
             JsonValue::Unsigned(state.quorum as u64),
@@ -838,6 +833,17 @@ impl<C: ValidatorListClock> ValidatorList<C> {
                     .collect(),
             ),
         );
+        let mut publishers: Vec<_> = state.publisher_lists.iter().collect();
+        publishers.sort_by_key(|(public_key, _)| public_key.to_hex());
+        result.insert(
+            "publisher_lists".to_owned(),
+            JsonValue::Array(
+                publishers
+                    .into_iter()
+                    .map(|(public_key, collection)| publisher_list_json(*public_key, collection))
+                    .collect(),
+            ),
+        );
         result.insert(
             "trusted_validator_keys".to_owned(),
             JsonValue::Array(
@@ -848,6 +854,37 @@ impl<C: ValidatorListClock> ValidatorList<C> {
                     .collect(),
             ),
         );
+        result.insert(
+            "signing_keys".to_owned(),
+            JsonValue::Object(
+                state
+                    .key_listings
+                    .keys()
+                    .filter_map(|master| {
+                        self.validator_manifests
+                            .manifest_signing_key(master)
+                            .map(|signing| {
+                                (
+                                    master.to_node_public_base58(),
+                                    JsonValue::String(signing.to_node_public_base58()),
+                                )
+                            })
+                    })
+                    .collect(),
+            ),
+        );
+        if !state.negative_unl.is_empty() {
+            result.insert(
+                "NegativeUNL".to_owned(),
+                JsonValue::Array(
+                    state
+                        .negative_unl
+                        .iter()
+                        .map(|public_key| JsonValue::String(public_key.to_node_public_base58()))
+                        .collect(),
+                ),
+            );
+        }
         JsonValue::Object(result)
     }
 
@@ -1202,6 +1239,66 @@ struct ValidatorListState {
     negative_unl: HashSet<PublicKey>,
     unl_blocked: bool,
     data_path: PathBuf,
+}
+
+/// rippled ValidatorList::getJson `appendList` for one publisher list.
+fn append_publisher_list_json(list: &PublisherList, target: &mut BTreeMap<String, JsonValue>) {
+    target.insert("uri".to_owned(), JsonValue::String(list.site_uri.clone()));
+    if list.valid_until != 0 {
+        target.insert("seq".to_owned(), JsonValue::Unsigned(list.sequence as u64));
+        target.insert(
+            "expiration".to_owned(),
+            JsonValue::String(to_string(NetClockTimePoint::new(list.valid_until))),
+        );
+    }
+    if list.valid_from != 0 {
+        target.insert(
+            "effective".to_owned(),
+            JsonValue::String(to_string(NetClockTimePoint::new(list.valid_from))),
+        );
+    }
+    target.insert(
+        "list".to_owned(),
+        JsonValue::Array(
+            list.list
+                .iter()
+                .map(|key| JsonValue::String(key.to_node_public_base58()))
+                .collect(),
+        ),
+    );
+}
+
+/// rippled ValidatorList::getJson, one `publisher_lists` entry.
+fn publisher_list_json(public_key: PublicKey, collection: &PublisherListCollection) -> JsonValue {
+    let mut entry = BTreeMap::new();
+    entry.insert(
+        "pubkey_publisher".to_owned(),
+        JsonValue::String(public_key.to_hex()),
+    );
+    entry.insert(
+        "available".to_owned(),
+        JsonValue::Bool(collection.status == PublisherStatus::Available),
+    );
+    append_publisher_list_json(&collection.current, &mut entry);
+    if collection.current.valid_until != 0 {
+        entry.insert(
+            "version".to_owned(),
+            JsonValue::Unsigned(u64::from(collection.raw_version)),
+        );
+    }
+    let remaining: Vec<JsonValue> = collection
+        .remaining
+        .values()
+        .map(|future| {
+            let mut target = BTreeMap::new();
+            append_publisher_list_json(future, &mut target);
+            JsonValue::Object(target)
+        })
+        .collect();
+    if !remaining.is_empty() {
+        entry.insert("remaining".to_owned(), JsonValue::Array(remaining));
+    }
+    JsonValue::Object(entry)
 }
 
 fn update_publisher_list(

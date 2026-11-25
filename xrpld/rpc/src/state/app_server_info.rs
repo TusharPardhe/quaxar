@@ -223,10 +223,11 @@ impl<V: AppServerInfoView> ServerInfoSource for ApplicationServerInfo<V> {
 
         // Pruned (fjall) store health, when that path is active, so operators
         // see the retained floor and a verify failure (design Case 11) directly
-        // in server_info rather than only via get_counts.
-        if let Some(metrics) = self
-            .view
-            .app()
+        // in server_info rather than only via get_counts. Quaxar-only (rippled
+        // has no such key), so it is reported to admin callers only.
+        if let Some(metrics) = admin
+            .then(|| self.view.app())
+            .flatten()
             .and_then(|app| app.shamap_store_service())
             .and_then(|service| service.component().pruned_metrics())
         {
@@ -663,23 +664,56 @@ fn best_non_open_ledger<V: AppServerInfoView>(view: &V) -> Option<std::sync::Arc
 }
 
 fn find_ledger_hash_by_seq<V: AppServerInfoView>(view: &V, seq: u32) -> Option<Uint256> {
-    find_ledger_by_seq(view, seq).map(|ledger| ledger.hash)
+    find_ledger_header_by_seq(view, seq).map(|(hash, _)| hash)
 }
 
 fn find_close_time_by_seq<V: AppServerInfoView>(view: &V, seq: u32) -> Option<NetClockTimePoint> {
-    view.validated_ledger()
-        .filter(|ledger| ledger.header().seq == seq)
-        .map(|ledger| NetClockTimePoint::new(ledger.header().close_time))
-        .or_else(|| {
-            view.closed_ledger()
-                .filter(|ledger| ledger.header().seq == seq)
-                .map(|ledger| NetClockTimePoint::new(ledger.header().close_time))
-        })
-        .or_else(|| {
-            view.published_ledger()
-                .filter(|ledger| ledger.header().seq == seq)
-                .map(|ledger| NetClockTimePoint::new(ledger.header().close_time))
-        })
+    find_ledger_header_by_seq(view, seq).map(|(_, close_time)| close_time)
+}
+
+/// rippled `LedgerMaster::getHashBySeq` / `getCloseTimeBySeq`: the ledgers in
+/// memory, then LedgerHistory's validated index, then the Ledgers table. The
+/// in-memory ledgers alone cover only the newest few, so history requests
+/// (account_tx, tx) lost `ledger_hash`, `date` and `close_time_iso`.
+fn find_ledger_header_by_seq<V: AppServerInfoView>(
+    view: &V,
+    seq: u32,
+) -> Option<(Uint256, NetClockTimePoint)> {
+    let header = |ledger: &ledger::Ledger| {
+        (
+            *ledger.header().hash.as_uint256(),
+            NetClockTimePoint::new(ledger.header().close_time),
+        )
+    };
+    if let Some(ledger) = [
+        view.validated_ledger(),
+        view.closed_ledger(),
+        view.published_ledger(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|ledger| ledger.header().seq == seq)
+    {
+        return Some(header(&ledger));
+    }
+    let app = view.app()?;
+    if let Some(runtime) = app.ledger_master_runtime()
+        && let Some(ledger) = runtime
+            .ledger_master()
+            .ledger_history()
+            .get_cached_ledger_by_seq(seq)
+    {
+        return Some(header(&ledger));
+    }
+    let stored = app
+        .ledger_db()?
+        .get_ledger_info_by_seq(seq)
+        .ok()??
+        .to_header()?;
+    Some((
+        *stored.hash.as_uint256(),
+        NetClockTimePoint::new(stored.close_time),
+    ))
 }
 
 fn resolve_lookup_ledger<V: AppServerInfoView>(
@@ -1013,11 +1047,19 @@ impl<V: AppServerInfoView> LedgerLookupSource for ApplicationServerInfo<V> {
     }
 
     fn get_validated_ledger(&self) -> Option<LedgerLookupLedger> {
-        best_non_open_ledger(&self.view).map(|ledger| ledger_lookup_ledger(ledger.as_ref(), false))
+        // rippled getValidatedLedger is the validated ledger itself, never a
+        // newer closed one. Views without one (standalone, tests) keep the
+        // newest non-open ledger.
+        self.view
+            .validated_ledger()
+            .or_else(|| best_non_open_ledger(&self.view))
+            .map(|ledger| ledger_lookup_ledger(ledger.as_ref(), false))
     }
 
     fn get_valid_ledger_index(&self) -> u32 {
-        best_non_open_ledger(&self.view)
+        self.view
+            .validated_ledger()
+            .or_else(|| best_non_open_ledger(&self.view))
             .map(|ledger| ledger.header().seq)
             .unwrap_or_default()
     }
@@ -1027,11 +1069,16 @@ impl<V: AppServerInfoView> LedgerLookupSource for ApplicationServerInfo<V> {
     }
 
     fn is_validated(&self, ledger: &LedgerLookupLedger) -> bool {
-        !ledger.open
-            && best_non_open_ledger(&self.view).is_some_and(|candidate| {
-                candidate.header().seq == ledger.seq
-                    && *candidate.header().hash.as_uint256() == ledger.hash
-            })
+        if ledger.open {
+            return false;
+        }
+        if self.view.app().is_some() {
+            return view_is_validated_hash(&self.view, ledger.seq, SHAMapHash::new(ledger.hash));
+        }
+        best_non_open_ledger(&self.view).is_some_and(|candidate| {
+            candidate.header().seq == ledger.seq
+                && *candidate.header().hash.as_uint256() == ledger.hash
+        })
     }
 
     fn standalone(&self) -> bool {
@@ -1221,7 +1268,7 @@ impl<V: AppServerInfoView> AccountTxSource for ApplicationServerInfo<V> {
                      FROM AccountTransactions a \
                      JOIN Transactions t ON t.TransID = a.TransID \
                      WHERE a.Account = ?1 AND a.LedgerSeq BETWEEN ?2 AND ?3 \
-                     AND (a.LedgerSeq > ?5 OR (a.LedgerSeq = ?5 AND a.TxnSeq > ?6)) \
+                     AND (a.LedgerSeq > ?5 OR (a.LedgerSeq = ?5 AND a.TxnSeq >= ?6)) \
                      ORDER BY a.LedgerSeq ASC, a.TxnSeq ASC \
                      LIMIT ?4"
                 }
@@ -1230,7 +1277,7 @@ impl<V: AppServerInfoView> AccountTxSource for ApplicationServerInfo<V> {
                      FROM AccountTransactions a \
                      JOIN Transactions t ON t.TransID = a.TransID \
                      WHERE a.Account = ?1 AND a.LedgerSeq BETWEEN ?2 AND ?3 \
-                     AND (a.LedgerSeq < ?5 OR (a.LedgerSeq = ?5 AND a.TxnSeq < ?6)) \
+                     AND (a.LedgerSeq < ?5 OR (a.LedgerSeq = ?5 AND a.TxnSeq <= ?6)) \
                      ORDER BY a.LedgerSeq DESC, a.TxnSeq DESC \
                      LIMIT ?4"
                 }
@@ -1300,7 +1347,13 @@ impl<V: AppServerInfoView> AccountTxSource for ApplicationServerInfo<V> {
             };
             drop(connection);
 
+            // One header lookup per ledger, not per transaction.
+            let mut headers: std::collections::HashMap<u32, Option<(Uint256, NetClockTimePoint)>> =
+                std::collections::HashMap::new();
             for (ledger_seq, txn_seq, status, raw_txn, raw_meta) in raw_rows {
+                let header = *headers
+                    .entry(ledger_seq)
+                    .or_insert_with(|| find_ledger_header_by_seq(&self.view, ledger_seq));
                 let mut converted = Vec::new();
                 app::convert_blobs_to_tx_result(
                     &mut converted,
@@ -1318,8 +1371,8 @@ impl<V: AppServerInfoView> AccountTxSource for ApplicationServerInfo<V> {
                             txn: std::sync::Arc::clone(entry.transaction.get_s_transaction()),
                             meta: Some(entry.meta),
                             ledger_index: ledger_seq,
-                            close_time: find_close_time_by_seq(&self.view, ledger_seq),
-                            ledger_hash: find_ledger_hash_by_seq(&self.view, ledger_seq),
+                            close_time: header.map(|(_, close_time)| close_time),
+                            ledger_hash: header.map(|(hash, _)| hash),
                             validated: true,
                             txn_index: Some(txn_seq),
                             network_id: Some(self.view.network_id()),
@@ -1333,10 +1386,12 @@ impl<V: AppServerInfoView> AccountTxSource for ApplicationServerInfo<V> {
             }
         }
 
+        // rippled accountTxPage: the marker is the first row of the next
+        // page (the limit+1-th row), and a request resumes at it inclusively.
         let mut marker = None;
         if page_rows.len() > query.limit as usize {
             marker = page_rows
-                .get(query.limit as usize - 1)
+                .get(query.limit as usize)
                 .map(|(_, marker)| *marker);
             page_rows.truncate(query.limit as usize);
         }
@@ -1607,17 +1662,79 @@ fn get_ledger_obj<V: AppServerInfoView>(
     None
 }
 
+/// rippled `LedgerFill::context` for the RPC layer: API version, whether the
+/// ledger is validated (expanded transactions carry `validated`,
+/// `ledger_index`, `close_time_iso`), and close times by sequence.
+struct RpcLedgerJsonContext<'a, V: AppServerInfoView> {
+    view: &'a V,
+    api_version: u32,
+}
+
+/// rippled `LedgerMaster::isValidated` / `walkHashBySeq`: `(seq, hash)` is
+/// validated when it is in the chain of the validated ledger, not only when it
+/// is the newest validated ledger. The reference is the application's
+/// validated ledger (what `get_validated_ledger` reports); the ledger master's
+/// own validated ledger is the fallback. The ledger master resolves sequences
+/// outside the reference's skip lists through the covering flag ledger.
+fn view_is_validated_hash<V: AppServerInfoView>(view: &V, seq: u32, hash: SHAMapHash) -> bool {
+    let runtime = view.app().and_then(|app| app.ledger_master_runtime());
+    let reference = view.validated_ledger().or_else(|| {
+        runtime
+            .as_ref()
+            .and_then(|runtime| runtime.ledger_master().validated_ledger())
+    });
+    let Some(reference) = reference else {
+        return false;
+    };
+    let found = match runtime.as_ref() {
+        Some(runtime) => runtime
+            .ledger_master()
+            .walk_hash_by_seq_from(&reference, seq),
+        None => reference.hash_of_seq(seq, &ledger::NullLedgerJournal),
+    };
+    found.is_some_and(|found| found == hash)
+}
+
+impl<V: AppServerInfoView> app::LedgerToJsonContext for RpcLedgerJsonContext<'_, V> {
+    fn api_version(&self) -> u32 {
+        self.api_version
+    }
+
+    fn is_validated(&self, ledger: &ledger::Ledger) -> bool {
+        if !ledger.is_immutable() {
+            return false;
+        }
+        if ledger.header().validated {
+            return true;
+        }
+        view_is_validated_hash(self.view, ledger.header().seq, ledger.header().hash)
+    }
+
+    fn get_close_time_by_seq(&self, ledger_seq: u32) -> Option<NetClockTimePoint> {
+        find_close_time_by_seq(self.view, ledger_seq)
+    }
+
+    fn network_id(&self) -> Option<u32> {
+        Some(self.view.network_id())
+    }
+}
+
 impl<V: AppServerInfoView> LedgerSource for ApplicationServerInfo<V> {
     fn render_selected_ledger(
         &self,
         ledger_lookup: crate::handlers::ledger_lookup::LedgerLookupLedger,
         options: LedgerFillOptions,
+        api_version: u32,
     ) -> Result<JsonValue, RpcStatus> {
         if ledger_lookup.open {
             return self.render_open_ledger();
         }
         let ledger = get_ledger_obj(&self.view, ledger_lookup.seq, ledger_lookup.hash)
             .ok_or_else(|| RpcStatus::new(RpcErrorCode::LedgerNotFound))?;
+        let context = RpcLedgerJsonContext {
+            view: &self.view,
+            api_version,
+        };
 
         // For full/state/transaction dumps, use the family-aware path so
         // traversal can fetch released nodes from the NodeStore rather than
@@ -1629,13 +1746,13 @@ impl<V: AppServerInfoView> LedgerSource for ApplicationServerInfo<V> {
             if let Some(app) = self.view.app()
                 && let Some(family) = build_rpc_state_family(app)
             {
-                let app_fill = app::AppLedgerFill::new(&ledger, options);
+                let app_fill = app::AppLedgerFill::new(&ledger, options).with_context(&context);
                 return app::get_json_with_family(&app_fill, &family)
                     .map_err(|_| RpcStatus::new(RpcErrorCode::Internal));
             }
         }
 
-        let fill = AppLedgerFill::new(&ledger, options);
+        let fill = AppLedgerFill::new(&ledger, options).with_context(&context);
         app_get_json(&fill).map_err(|_| RpcStatus::new(RpcErrorCode::Internal))
     }
 
@@ -1945,12 +2062,15 @@ impl<V: AppServerInfoView> crate::handlers::validators::ValidatorsSource
 impl<V: AppServerInfoView> crate::handlers::validator_list_sites::ValidatorListSitesSource
     for ApplicationServerInfo<V>
 {
+    /// rippled `doValidatorListSites`: `getValidatorSites().getJson()`.
     fn get_validator_list_sites(&self) -> JsonValue {
-        // ValidatorSite is not stored on the view — return empty for now.
-        JsonValue::Object(BTreeMap::from([(
-            "validator_sites".to_owned(),
-            JsonValue::Array(Vec::new()),
-        )]))
+        match self.view.app() {
+            Some(app) => app.validator_sites().get_json(),
+            None => JsonValue::Object(BTreeMap::from([(
+                "validator_sites".to_owned(),
+                JsonValue::Array(Vec::new()),
+            )])),
+        }
     }
 }
 
@@ -1974,26 +2094,8 @@ impl<V: AppServerInfoView> crate::handlers::consensus_info::ConsensusInfoSource
 impl<V: AppServerInfoView> crate::handlers::ledger_header::LedgerHeaderSource
     for ApplicationServerInfo<V>
 {
-    fn resolve_ledger_header(
-        &self,
-    ) -> Result<crate::handlers::ledger_header::LedgerHeaderResolved, crate::status::RpcStatus>
-    {
-        let ledger = self
-            .view
-            .validated_ledger()
-            .or_else(|| self.view.closed_ledger())
-            .ok_or_else(|| {
-                crate::status::RpcStatus::new(crate::status::RpcErrorCode::LedgerNotFound)
-            })?;
-        let validated = self.view.validated_ledger().is_some();
-        let mut base_json = BTreeMap::new();
-        if validated {
-            base_json.insert("validated".to_owned(), JsonValue::Bool(true));
-        }
-        Ok(crate::handlers::ledger_header::LedgerHeaderResolved {
-            base_json: JsonValue::Object(base_json),
-            header: ledger.header(),
-        })
+    fn ledger_header(&self, ledger: &LedgerLookupLedger) -> Option<protocol::LedgerHeader> {
+        resolve_lookup_ledger(&self.view, ledger).map(|resolved| resolved.header())
     }
 }
 
@@ -2097,24 +2199,27 @@ impl<V: AppServerInfoView> crate::handlers::book_changes::BookChangesSource
         let resolved = resolve_lookup_ledger(&self.view, &ledger_lookup)?;
         let ledger_time = resolved.header().close_time;
 
-        // Walk the transaction map and extract (STTx, TxMeta) pairs.
-        let mut transactions = Vec::new();
-        if let Ok(txs) = ledger::ReadView::txs(resolved.as_ref()) {
-            for read_view_tx in txs {
-                let (tx_arc, meta_arc_opt) = read_view_tx.into_parts();
-                let Some(meta_arc) = meta_arc_opt else {
-                    continue;
-                };
-                let tx = (*tx_arc).clone();
-                let meta = protocol::TxMeta::from_stobject(
-                    Uint256::zero(),
-                    resolved.header().seq,
-                    (*meta_arc).clone(),
-                );
-                transactions
-                    .push(crate::handlers::book_changes::BookChangesTransaction { txn: tx, meta });
-            }
-        }
+        // rippled computeBookChanges walks every transaction of the ledger.
+        // An older ledger's transaction map is usually not in memory, and
+        // the memory-only walk then saw no transactions and reported no
+        // changes (mainnet ledger 108548865, 2026-11-24). Read through the
+        // node store; without one, use the in-memory walk.
+        let snapshot = self
+            .view
+            .app()
+            .and_then(build_rpc_state_family)
+            .map(|family| resolved.tx_snapshot_with_family(&family))
+            .unwrap_or_else(|| resolved.tx_snapshot())
+            .ok()?;
+        let transactions = snapshot
+            .into_iter()
+            .map(
+                |(tx, meta)| crate::handlers::book_changes::BookChangesTransaction {
+                    txn: (*tx).clone(),
+                    meta,
+                },
+            )
+            .collect();
 
         Some(crate::handlers::book_changes::BookChangesLedger {
             ledger_time,
@@ -2622,7 +2727,9 @@ impl<V: AppServerInfoView + Sync> crate::handlers::ledger_data::LedgerDataSource
         if binary {
             options |= ledger::LedgerFillOptions::BINARY;
         }
-        let ledger_json = self.render_selected_ledger(*ledger, options)?;
+        // The header only; the handler sets ledger_index for the request's
+        // API version.
+        let ledger_json = self.render_selected_ledger(*ledger, options, 2)?;
         let mut entries = Vec::new();
         let remaining = limit;
 

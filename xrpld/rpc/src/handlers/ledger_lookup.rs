@@ -51,6 +51,11 @@ enum LedgerRequest {
     Index(LedgerIndexRequest),
 }
 
+/// rippled RPCLedgerHelpers `getLedger`: `{RpcLgrNotFound, "ledgerNotFound"}`.
+fn ledger_not_found() -> RpcStatus {
+    RpcStatus::with_message(RpcErrorCode::LedgerNotFound, "ledgerNotFound")
+}
+
 fn is_validated_old<S: LedgerLookupSource>(source: &S) -> bool {
     if source.standalone() {
         return false;
@@ -65,34 +70,34 @@ fn ledger_by_shortcut<S: LedgerLookupSource>(
 ) -> Result<LedgerLookupLedger, RpcStatus> {
     if is_validated_old(source) {
         return Err(if api_version == 1 {
-            RpcStatus::new(RpcErrorCode::NoNetwork)
+            RpcStatus::with_message(RpcErrorCode::NoNetwork, "InsufficientNetworkMode")
         } else {
-            RpcStatus::new(RpcErrorCode::NotSynced)
+            RpcStatus::with_message(RpcErrorCode::NotSynced, "notSynced")
         });
     }
 
     match request {
         LedgerIndexRequest::Validated => source.get_validated_ledger().ok_or_else(|| {
             if api_version == 1 {
-                RpcStatus::new(RpcErrorCode::NoNetwork)
+                RpcStatus::with_message(RpcErrorCode::NoNetwork, "InsufficientNetworkMode")
             } else {
-                RpcStatus::new(RpcErrorCode::NotSynced)
+                RpcStatus::with_message(RpcErrorCode::NotSynced, "notSynced")
             }
         }),
         LedgerIndexRequest::Current => {
             let ledger = source.get_current_ledger().ok_or_else(|| {
                 if api_version == 1 {
-                    RpcStatus::new(RpcErrorCode::NoNetwork)
+                    RpcStatus::with_message(RpcErrorCode::NoNetwork, "InsufficientNetworkMode")
                 } else {
-                    RpcStatus::new(RpcErrorCode::NotSynced)
+                    RpcStatus::with_message(RpcErrorCode::NotSynced, "notSynced")
                 }
             })?;
 
             if ledger.seq + 10 < source.get_valid_ledger_index() {
                 return Err(if api_version == 1 {
-                    RpcStatus::new(RpcErrorCode::NoNetwork)
+                    RpcStatus::with_message(RpcErrorCode::NoNetwork, "InsufficientNetworkMode")
                 } else {
-                    RpcStatus::new(RpcErrorCode::NotSynced)
+                    RpcStatus::with_message(RpcErrorCode::NotSynced, "notSynced")
                 });
             }
 
@@ -101,17 +106,17 @@ fn ledger_by_shortcut<S: LedgerLookupSource>(
         LedgerIndexRequest::Closed => {
             let ledger = source.get_closed_ledger().ok_or_else(|| {
                 if api_version == 1 {
-                    RpcStatus::new(RpcErrorCode::NoNetwork)
+                    RpcStatus::with_message(RpcErrorCode::NoNetwork, "InsufficientNetworkMode")
                 } else {
-                    RpcStatus::new(RpcErrorCode::NotSynced)
+                    RpcStatus::with_message(RpcErrorCode::NotSynced, "notSynced")
                 }
             })?;
 
             if ledger.seq + 10 < source.get_valid_ledger_index() {
                 return Err(if api_version == 1 {
-                    RpcStatus::new(RpcErrorCode::NoNetwork)
+                    RpcStatus::with_message(RpcErrorCode::NoNetwork, "InsufficientNetworkMode")
                 } else {
-                    RpcStatus::new(RpcErrorCode::NotSynced)
+                    RpcStatus::with_message(RpcErrorCode::NotSynced, "notSynced")
                 });
             }
 
@@ -119,9 +124,9 @@ fn ledger_by_shortcut<S: LedgerLookupSource>(
         }
         LedgerIndexRequest::Sequence(seq) => source.get_ledger_by_seq(seq).ok_or_else(|| {
             if api_version == 1 {
-                RpcStatus::new(RpcErrorCode::NoNetwork)
+                RpcStatus::with_message(RpcErrorCode::NoNetwork, "InsufficientNetworkMode")
             } else {
-                RpcStatus::new(RpcErrorCode::NotSynced)
+                RpcStatus::with_message(RpcErrorCode::NotSynced, "notSynced")
             }
         }),
     }
@@ -218,7 +223,7 @@ fn resolve_ledger<S: LedgerLookupSource>(
             LedgerRequest::Hash(hash) => context
                 .source
                 .get_ledger_by_hash(hash)
-                .ok_or_else(|| RpcStatus::new(RpcErrorCode::LedgerNotFound)),
+                .ok_or_else(ledger_not_found),
             LedgerRequest::Index(LedgerIndexRequest::Sequence(seq)) => {
                 let mut ledger = context.source.get_ledger_by_seq(seq);
                 if ledger.is_none() {
@@ -228,14 +233,14 @@ fn resolve_ledger<S: LedgerLookupSource>(
                         .filter(|current| current.seq == seq);
                 }
 
-                let ledger = ledger.ok_or_else(|| RpcStatus::new(RpcErrorCode::LedgerNotFound))?;
+                let ledger = ledger.ok_or_else(ledger_not_found)?;
                 if ledger.seq > context.source.get_valid_ledger_index()
                     && is_validated_old(context.source)
                 {
                     return Err(if context.api_version == 1 {
-                        RpcStatus::new(RpcErrorCode::NoNetwork)
+                        RpcStatus::with_message(RpcErrorCode::NoNetwork, "InsufficientNetworkMode")
                     } else {
-                        RpcStatus::new(RpcErrorCode::NotSynced)
+                        RpcStatus::with_message(RpcErrorCode::NotSynced, "notSynced")
                     });
                 }
                 Ok(ledger)
@@ -255,7 +260,7 @@ fn resolve_ledger<S: LedgerLookupSource>(
         return context
             .source
             .get_ledger_by_hash(hash)
-            .ok_or_else(|| RpcStatus::new(RpcErrorCode::LedgerNotFound));
+            .ok_or_else(ledger_not_found);
     }
 
     let request = if let Some(index) = object.get("ledger_index") {
@@ -274,14 +279,14 @@ fn resolve_ledger<S: LedgerLookupSource>(
                     .filter(|current| current.seq == seq);
             }
 
-            let ledger = ledger.ok_or_else(|| RpcStatus::new(RpcErrorCode::LedgerNotFound))?;
+            let ledger = ledger.ok_or_else(ledger_not_found)?;
             if ledger.seq > context.source.get_valid_ledger_index()
                 && is_validated_old(context.source)
             {
                 return Err(if context.api_version == 1 {
-                    RpcStatus::new(RpcErrorCode::NoNetwork)
+                    RpcStatus::with_message(RpcErrorCode::NoNetwork, "InsufficientNetworkMode")
                 } else {
-                    RpcStatus::new(RpcErrorCode::NotSynced)
+                    RpcStatus::with_message(RpcErrorCode::NotSynced, "notSynced")
                 });
             }
             Ok(ledger)

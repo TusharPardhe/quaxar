@@ -367,7 +367,7 @@ fn gravatar_url(account_root: &AccountRoot) -> Option<JsonValue> {
     );
     md5.make_ascii_lowercase();
     Some(JsonValue::String(format!(
-        "http://www.gravatar.com/avatar/{md5}"
+        "https://www.gravatar.com/avatar/{md5}"
     )))
 }
 

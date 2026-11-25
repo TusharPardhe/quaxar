@@ -13,27 +13,44 @@ struct QueueLoadStatus {
     escalated_load_factor: u64,
 }
 
-fn format_human_load_factor(factor: u32, base: u32) -> String {
-    format_human_ratio(u64::from(factor), u64::from(base))
-}
-
-pub(crate) fn format_human_ratio(numerator: u64, denominator: u64) -> String {
-    if denominator == 0 {
+/// rippled `json::valueToString(double)`: `std::to_chars` general format
+/// with 16 significant digits (`%.16g`): trailing zeros dropped, scientific
+/// notation below 1e-4 or from 1e16, two-digit exponent (`1e-05`).
+pub(crate) fn format_json_double(value: f64) -> String {
+    if !value.is_finite() || value == 0.0 {
         return "0".to_owned();
     }
-
-    let whole = numerator / denominator;
-    let remainder = numerator % denominator;
-    if remainder == 0 {
-        return whole.to_string();
+    let scientific = format!("{value:.15e}");
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .expect("`{:e}` output has an exponent");
+    let exponent: i32 = exponent.parse().expect("`{:e}` exponent is an integer");
+    let trim = |text: &str| -> String {
+        if text.contains('.') {
+            text.trim_end_matches('0').trim_end_matches('.').to_owned()
+        } else {
+            text.to_owned()
+        }
+    };
+    if !(-4..16).contains(&exponent) {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        return format!("{}e{sign}{:02}", trim(mantissa), exponent.unsigned_abs());
     }
+    let precision = usize::try_from(15 - exponent).unwrap_or(0);
+    trim(&format!("{value:.precision$}"))
+}
 
-    let fractional = ((remainder as u128) * 1_000_000) / (denominator as u128);
-    let mut formatted = format!("{whole}.{fractional:06}");
-    while formatted.ends_with('0') {
-        formatted.pop();
+/// A JSON number rendered as rippled renders a `double`.
+pub(crate) fn json_double(value: f64) -> JsonValue {
+    JsonValue::Raw(protocol::RawJson::from_trusted(format_json_double(value)))
+}
+
+/// rippled `static_cast<double>(numerator) / denominator` as a JSON number.
+pub(crate) fn json_ratio(numerator: u64, denominator: u64) -> JsonValue {
+    if denominator == 0 {
+        return json_double(0.0);
     }
-    formatted
+    json_double(numerator as f64 / denominator as f64)
 }
 
 fn parse_u64_string(value: &str) -> Option<u64> {
@@ -82,13 +99,13 @@ pub(crate) fn append_load_factor_fields<V: AppServerInfoView>(
     if human {
         info.insert(
             "load_factor".to_owned(),
-            JsonValue::String(format_human_ratio(load_factor, load_base_u64)),
+            json_ratio(load_factor, load_base_u64),
         );
 
         if load_factor_server != load_factor {
             info.insert(
                 "load_factor_server".to_owned(),
-                JsonValue::String(format_human_ratio(load_factor_server, load_base_u64)),
+                json_ratio(load_factor_server, load_base_u64),
             );
         }
 
@@ -97,7 +114,7 @@ pub(crate) fn append_load_factor_fields<V: AppServerInfoView>(
             if local != load_base {
                 info.insert(
                     "load_factor_local".to_owned(),
-                    JsonValue::String(format_human_load_factor(local, load_base)),
+                    json_ratio(u64::from(local), load_base_u64),
                 );
             }
 
@@ -105,7 +122,7 @@ pub(crate) fn append_load_factor_fields<V: AppServerInfoView>(
             if remote != load_base {
                 info.insert(
                     "load_factor_net".to_owned(),
-                    JsonValue::String(format_human_load_factor(remote, load_base)),
+                    json_ratio(u64::from(remote), load_base_u64),
                 );
             }
 
@@ -113,7 +130,7 @@ pub(crate) fn append_load_factor_fields<V: AppServerInfoView>(
             if cluster != load_base {
                 info.insert(
                     "load_factor_cluster".to_owned(),
-                    JsonValue::String(format_human_load_factor(cluster, load_base)),
+                    json_ratio(u64::from(cluster), load_base_u64),
                 );
             }
         }
@@ -124,20 +141,14 @@ pub(crate) fn append_load_factor_fields<V: AppServerInfoView>(
             {
                 info.insert(
                     "load_factor_fee_escalation".to_owned(),
-                    JsonValue::String(format_human_ratio(
-                        queue_load.open_ledger_level,
-                        queue_load.reference_level,
-                    )),
+                    json_ratio(queue_load.open_ledger_level, queue_load.reference_level),
                 );
             }
 
             if queue_load.minimum_level != queue_load.reference_level {
                 info.insert(
                     "load_factor_fee_queue".to_owned(),
-                    JsonValue::String(format_human_ratio(
-                        queue_load.minimum_level,
-                        queue_load.reference_level,
-                    )),
+                    json_ratio(queue_load.minimum_level, queue_load.reference_level),
                 );
             }
         }
@@ -171,12 +182,22 @@ pub(crate) fn append_load_factor_fields<V: AppServerInfoView>(
 
 #[cfg(test)]
 mod tests {
-    use super::format_human_ratio;
+    use super::format_json_double;
 
+    /// rippled renders server_info's human-mode ratios and XRP amounts as
+    /// JSON numbers (`double`, `%.16g`). Quaxar used to send strings such as
+    /// `"1"` and `"0.00001"` (mainnet, 2026-11-24).
     #[test]
-    fn format_human_ratio_trims_fractional_zeros() {
-        assert_eq!(format_human_ratio(256, 256), "1");
-        assert_eq!(format_human_ratio(768, 256), "3");
-        assert_eq!(format_human_ratio(1250, 1000), "1.25");
+    fn json_doubles_match_rippled_formatting() {
+        assert_eq!(format_json_double(256.0 / 256.0), "1");
+        assert_eq!(format_json_double(768.0 / 256.0), "3");
+        assert_eq!(format_json_double(1250.0 / 1000.0), "1.25");
+        assert_eq!(format_json_double(10.0 / 1_000_000.0), "1e-05");
+        assert_eq!(format_json_double(200_000.0 / 1_000_000.0), "0.2");
+        assert_eq!(format_json_double(3001.0 / 1000.0), "3.001");
+        assert_eq!(format_json_double(1.0 / 3.0), "0.3333333333333333");
+        assert_eq!(format_json_double(0.0001), "0.0001");
+        assert_eq!(format_json_double(1e16), "1e+16");
+        assert_eq!(format_json_double(0.0), "0");
     }
 }

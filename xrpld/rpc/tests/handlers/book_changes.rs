@@ -343,3 +343,149 @@ fn book_changes_response_structure_validated() {
     assert_eq!(result.get("ledger_time"), Some(&JsonValue::Unsigned(666)));
     assert!(result.contains_key("changes"));
 }
+
+fn memory_node_store(label: &str) -> app::SHAMapStoreNodeStore {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "quaxar-rpc-book-changes-{label}-{}-{unique}",
+        std::process::id()
+    ));
+    let mut config = basics::basic_config::BasicConfig::new();
+    config.set_legacy("database_path", dir.join("sql").to_string_lossy());
+    let node_db = config.section_mut("node_db");
+    node_db.set("type", "Memory");
+    node_db.set("path", dir.join("node").to_string_lossy());
+    app::bootstrap_shamap_store(
+        &config,
+        false,
+        128,
+        1,
+        8,
+        64,
+        2,
+        &nodestore::ManagerImp::new(),
+        std::sync::Arc::new(nodestore::DummyScheduler) as std::sync::Arc<dyn nodestore::Scheduler>,
+        std::sync::Arc::new(nodestore::NullJournal),
+    )
+    .expect("node store bootstrap")
+    .node_store
+}
+
+/// A ledger whose transaction map holds one offer-changing transaction, with
+/// the map's nodes in `node_store` and only its root in memory: the shape of
+/// an older ledger loaded from disk.
+fn store_backed_offer_ledger(node_store: &app::SHAMapStoreNodeStore) -> ledger::Ledger {
+    use shamap::sync::{SHAMapType, SyncState, SyncTree};
+
+    let seq = 90;
+    let tx = payment_tx(1);
+    let meta = offer_change_meta(None);
+    let mut payload = protocol::Serializer::new(0);
+    payload.add_vl(tx.get_serializer().data());
+    payload.add_vl(meta.get_as_object().get_serializer().data());
+    let mut tx_tree = shamap::mutation::MutableTree::new(seq);
+    tx_tree
+        .add_item(
+            shamap::tree_node::SHAMapNodeType::TransactionMd,
+            shamap::item::SHAMapItem::new(tx.get_transaction_id(), payload.data().to_vec()),
+        )
+        .expect("TransactionMd leaf should insert");
+    let header = ledger::LedgerHeader {
+        seq,
+        close_time: 666,
+        tx_hash: tx_tree.root().get_hash(),
+        ..ledger::LedgerHeader::default()
+    };
+    let mut full = ledger::Ledger::from_maps(
+        header.clone(),
+        SyncTree::new_with_type(SHAMapType::State, true, seq),
+        SyncTree::from_root_with_type(
+            tx_tree.root(),
+            SHAMapType::Transaction,
+            true,
+            seq,
+            SyncState::Modifying,
+        ),
+    );
+    let writer = node_store.clone();
+    full.set_node_writer(std::sync::Arc::new(
+        move |object_type: ledger::LedgerNodeObjectType,
+              hash: Uint256,
+              data: Vec<u8>,
+              ledger_seq: u32| {
+            let object_type = match object_type {
+                ledger::LedgerNodeObjectType::AccountNode => nodestore::NodeObjectType::AccountNode,
+                ledger::LedgerNodeObjectType::TransactionNode => {
+                    nodestore::NodeObjectType::TransactionNode
+                }
+            };
+            match &writer {
+                app::SHAMapStoreNodeStore::Single(db) => db
+                    .store(object_type, data, hash, ledger_seq)
+                    .expect("test node store write should succeed"),
+            }
+        },
+    ));
+    full.flush_tx_map_to_store();
+
+    let root = full.tx_map().root();
+    let sparse_root = shamap::nodes::tree_node::SHAMapTreeNode::make_from_wire(
+        &root.serialize_for_wire().expect("root should serialize"),
+    )
+    .expect("root should decode from wire shape")
+    .expect("root wire must contain a node");
+    sparse_root.set_hash(root.get_hash());
+    let mut ledger = ledger::Ledger::from_maps(
+        header,
+        SyncTree::new_with_type(SHAMapType::State, true, seq),
+        SyncTree::from_root_with_type(
+            sparse_root,
+            SHAMapType::Transaction,
+            true,
+            seq,
+            SyncState::Immutable,
+        ),
+    );
+    ledger.set_immutable(true);
+    ledger
+}
+
+/// rippled `computeBookChanges` walks every transaction of the ledger. An
+/// older ledger's transaction map is mostly on disk; quaxar walked only the
+/// in-memory nodes, saw no transactions and answered with empty `changes`
+/// (mainnet ledger 108548865, 2026-11-24). It must read through the node
+/// store.
+#[test]
+fn book_changes_reads_transactions_through_the_node_store() {
+    let node_store = memory_node_store("store-backed");
+    let ledger = std::sync::Arc::new(store_backed_offer_ledger(&node_store));
+    assert!(
+        ledger.tx_snapshot().is_err(),
+        "fixture: the transaction map must not be readable from memory alone"
+    );
+    let mut app = app::ApplicationRoot::with_options(app::ApplicationRootOptions {
+        standalone: true,
+        ..app::ApplicationRootOptions::default()
+    })
+    .expect("standalone root should build");
+    app.attach_node_store(Some(node_store));
+    app.note_validated_ledger_for_sync(std::sync::Arc::clone(&ledger));
+
+    let source = rpc::ApplicationServerInfo::new(&app);
+    let snapshot = source
+        .book_changes_ledger(LedgerLookupLedger {
+            hash: *ledger.header().hash.as_uint256(),
+            seq: ledger.header().seq,
+            open: false,
+        })
+        .expect("the ledger's transactions should be readable");
+    assert_eq!(snapshot.ledger_time, 666);
+    assert_eq!(
+        snapshot.transactions.len(),
+        1,
+        "the offer change must be seen"
+    );
+}

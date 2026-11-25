@@ -472,14 +472,17 @@ fn format_refresh_time(time: SystemTime) -> String {
         }
     };
 
+    // rippled `to_string(std::chrono::system_clock::time_point)`:
+    // "%Y-%b-%d %T %Z", where %T carries the clock's nanoseconds.
     format!(
-        "{:04}-{}-{:02} {:02}:{:02}:{:02}",
+        "{:04}-{}-{:02} {:02}:{:02}:{:02}.{:09} UTC",
         date_time.year(),
         short_month(date_time.month()),
         date_time.day(),
         date_time.hour(),
         date_time.minute(),
-        date_time.second()
+        date_time.second(),
+        date_time.nanosecond()
     )
 }
 

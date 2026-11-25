@@ -1307,7 +1307,10 @@ fn chrono_reference_cases() {
 
     let network_time = NetClockTimePoint::new(20);
     assert_eq!(network_time.time_since_epoch(), Duration::seconds(20));
-    assert_eq!(chrono_to_string(network_time), "2000-Jan-01 00:00:20 UTC");
+    assert_eq!(
+        chrono_to_string(network_time),
+        "2000-Jan-01 00:00:20.000000000 UTC"
+    );
     assert_eq!(chrono_to_string_iso(network_time), "2000-01-01T00:00:20Z");
 
     let system_time = NetClockTimePoint::new(10).to_datetime();

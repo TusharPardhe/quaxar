@@ -1302,6 +1302,14 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
     ) {
         let next_seq = prev_ledger.seq() + 1;
         let base_fee = prev_ledger.ledger().fees().base;
+        // rippled server_info `last_close` reads Consensus::prevProposers()
+        // and prevRoundTime(), which the round sets just before onAccept.
+        let _ = self.app_root.set_status_rpc_last_close(Some(
+            crate::state::status_rpc_state::StatusRpcLastClose {
+                proposers: u32::try_from(result.proposers).unwrap_or(u32::MAX),
+                converge_time: result.round_time.read(),
+            },
+        ));
 
         // Consensus transaction-set bytes originate from peers. rippled catches
         // STTx construction failures here, marks that entry failed, and keeps

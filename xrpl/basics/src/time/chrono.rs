@@ -115,6 +115,21 @@ where
     value.to_xrpl_string()
 }
 
+/// rippled `to_string(floor<microseconds>(system_clock::now()))`, used for
+/// `server_info.time`: `%T` prints the microseconds, `HH:MM:SS.uuuuuu`.
+pub fn to_string_micros(datetime: OffsetDateTime) -> String {
+    format!(
+        "{:04}-{}-{:02} {:02}:{:02}:{:02}.{:06} UTC",
+        datetime.year(),
+        short_month(datetime.month()),
+        datetime.day(),
+        datetime.hour(),
+        datetime.minute(),
+        datetime.second(),
+        datetime.microsecond()
+    )
+}
+
 pub fn to_string_iso<T>(value: T) -> String
 where
     T: TimeFormat,
@@ -133,8 +148,11 @@ impl TimeFormat for OffsetDateTime {
 }
 
 impl TimeFormat for NetClockTimePoint {
+    /// rippled `to_string(NetClock::time_point)` converts to
+    /// `system_clock::time_point`, whose nanosecond duration (libstdc++)
+    /// makes `%T` print `HH:MM:SS.000000000`.
     fn to_xrpl_string(self) -> String {
-        format_human_utc(self.to_datetime())
+        format_human_utc_nanos(self.to_datetime())
     }
 
     fn to_xrpl_iso_string(self) -> String {
@@ -223,6 +241,19 @@ fn format_human_utc(datetime: OffsetDateTime) -> String {
     )
 }
 
+fn format_human_utc_nanos(datetime: OffsetDateTime) -> String {
+    format!(
+        "{:04}-{}-{:02} {:02}:{:02}:{:02}.{:09} UTC",
+        datetime.year(),
+        short_month(datetime.month()),
+        datetime.day(),
+        datetime.hour(),
+        datetime.minute(),
+        datetime.second(),
+        datetime.nanosecond()
+    )
+}
+
 fn format_iso_utc(datetime: OffsetDateTime) -> String {
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
@@ -256,7 +287,7 @@ fn short_month(month: Month) -> &'static str {
 mod tests {
     use super::{
         EPOCH_OFFSET_SECONDS, ManualStopwatch, NetClockTimePoint, TimeFormat, days, epoch_offset,
-        stopwatch, to_string, to_string_iso, weeks,
+        stopwatch, to_string, to_string_iso, to_string_micros, weeks,
     };
     use std::time::{Duration as StdDuration, Instant};
     use time::Duration;
@@ -274,7 +305,10 @@ mod tests {
 
         assert_eq!(network_time.as_seconds(), 20);
         assert_eq!(network_time.time_since_epoch(), Duration::seconds(20));
-        assert_eq!(network_time.to_xrpl_string(), "2000-Jan-01 00:00:20 UTC");
+        assert_eq!(
+            network_time.to_xrpl_string(),
+            "2000-Jan-01 00:00:20.000000000 UTC"
+        );
         assert_eq!(network_time.to_xrpl_iso_string(), "2000-01-01T00:00:20Z");
     }
 
@@ -289,6 +323,17 @@ mod tests {
     }
 
     #[test]
+    fn server_time_keeps_microseconds() {
+        let datetime =
+            NetClockTimePoint::new(10).to_datetime() + Duration::nanoseconds(123_456_789);
+
+        assert_eq!(
+            to_string_micros(datetime),
+            "2000-Jan-01 00:00:10.123456 UTC"
+        );
+    }
+
+    #[test]
     fn formatting_supports_offset_date_time_and_net_clock() {
         let datetime = NetClockTimePoint::new(10).to_datetime();
 
@@ -296,7 +341,7 @@ mod tests {
         assert_eq!(to_string_iso(datetime), "2000-01-01T00:00:10Z");
         assert_eq!(
             to_string(NetClockTimePoint::new(10)),
-            "2000-Jan-01 00:00:10 UTC"
+            "2000-Jan-01 00:00:10.000000000 UTC"
         );
         assert_eq!(
             to_string_iso(NetClockTimePoint::new(10)),

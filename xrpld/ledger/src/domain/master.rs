@@ -377,6 +377,56 @@ where
         self.valid_ledger_seq.load(Ordering::SeqCst)
     }
 
+    /// rippled `LedgerMaster::isValidated` for a closed ledger: true when the
+    /// ledger is at or below the validated ledger and its hash is the one the
+    /// validated chain records for its sequence (`walkHashBySeq`). An older
+    /// validated ledger is validated, not only the newest one.
+    pub fn is_validated(&self, ledger: &Ledger) -> bool {
+        if !ledger.is_immutable() {
+            return false;
+        }
+        if ledger.header().validated {
+            return true;
+        }
+        self.is_validated_hash(ledger.header().seq, ledger.header().hash)
+    }
+
+    /// The hash form of [`Self::is_validated`], for callers that hold only a
+    /// (sequence, hash) pair.
+    pub fn is_validated_hash(&self, seq: u32, hash: SHAMapHash) -> bool {
+        self.walk_hash_by_seq(seq)
+            .is_some_and(|validated_hash| validated_hash == hash)
+    }
+
+    /// rippled `LedgerMaster::walkHashBySeq(index, reason)`: the hash of
+    /// ledger `index` in the chain of the current validated ledger. Looks in
+    /// the validated ledger's skip lists first, then in the flag ledger that
+    /// covers `index` (`getCandidateLedger`). rippled then acquires the flag
+    /// ledger from peers when it is missing; this lookup does not, so a
+    /// ledger older than the cached history reads as not validated.
+    pub fn walk_hash_by_seq(&self, index: u32) -> Option<SHAMapHash> {
+        let reference = self.valid_ledger.get()?;
+        self.walk_hash_by_seq_from(&reference, index)
+    }
+
+    /// [`Self::walk_hash_by_seq`] against an explicit validated `reference`
+    /// ledger, for callers whose validated ledger is tracked outside this
+    /// master (the application's validated-ledger pointer).
+    pub fn walk_hash_by_seq_from(&self, reference: &Ledger, index: u32) -> Option<SHAMapHash> {
+        if reference.header().seq < index {
+            return None;
+        }
+        if let Some(hash) = reference.hash_of_seq(index, &NullLedgerJournal) {
+            return Some(hash);
+        }
+        let candidate = index.saturating_add(255) & !255;
+        let candidate_hash = reference.hash_of_seq(candidate, &NullLedgerJournal)?;
+        let candidate_ledger = self
+            .ledger_history
+            .get_ledger_by_hash_or_load(candidate_hash, self.store_loader())?;
+        candidate_ledger.hash_of_seq(index, &NullLedgerJournal)
+    }
+
     pub fn have_validated(&self) -> bool {
         !self.valid_ledger.empty()
     }
@@ -1642,6 +1692,42 @@ mod tests {
             2,
             acceptable.header().parent_close_time + 301
         ));
+    }
+
+    /// rippled `LedgerMaster::isValidated`: an older ledger in the validated
+    /// chain is validated, not only the newest validated ledger. Before the
+    /// fix the RPC layer compared against the newest ledger only, so every
+    /// request pinned to an older validated ledger reported `validated:
+    /// false` (mainnet, 2026-11-24).
+    #[test]
+    fn is_validated_accepts_older_ledgers_in_the_validated_chain() {
+        let master = LedgerMaster::new(MonotonicClock::default(), LedgerMasterConfig::default());
+        let parent = immutable_ledger(31, 0x33);
+        let child = linked_ledger(&parent, 111);
+        let grandchild = linked_ledger(&child, 222);
+        master
+            .set_valid_ledger(Arc::clone(&child), None, None)
+            .expect("valid ledger should update");
+
+        assert!(master.is_validated(&child), "the validated ledger");
+        assert!(
+            master.is_validated(&parent),
+            "its parent is in the validated chain"
+        );
+        assert!(
+            master.is_validated_hash(parent.header().seq, parent.header().hash),
+            "hash form"
+        );
+        assert!(
+            !master.is_validated(&grandchild),
+            "a ledger after the validated one is not validated"
+        );
+        let fork = immutable_ledger(31, 0x55);
+        assert!(
+            !master.is_validated(&fork),
+            "another ledger at a validated sequence is not validated"
+        );
+        assert!(!master.is_validated_hash(5, parent.header().hash));
     }
 
     #[test]

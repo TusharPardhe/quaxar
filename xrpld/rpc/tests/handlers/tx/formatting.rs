@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use app::SqliteSHAMapStoreRelational;
 use quaxar_core::{DatabaseCon, LEDGER_DB_INIT, TRANSACTION_DB_INIT};
 
-fn attach_test_relational(app: &mut ApplicationRoot, label: &str) -> Arc<DatabaseCon> {
+pub(super) fn attach_test_relational(app: &mut ApplicationRoot, label: &str) -> Arc<DatabaseCon> {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be after epoch")
@@ -35,7 +35,7 @@ fn attach_test_relational(app: &mut ApplicationRoot, label: &str) -> Arc<Databas
     transaction_db
 }
 
-fn insert_sql_transaction(
+pub(super) fn insert_sql_transaction(
     transaction_db: &DatabaseCon,
     tx: &STTx,
     meta: &TxMeta,
@@ -238,6 +238,15 @@ fn tx_prefers_sql_metadata_for_validated_cached_transactions() {
         Some(&JsonValue::String("tesSUCCESS".to_owned()))
     );
     assert!(object.contains_key("ctid"));
+    // rippled Tx.cpp: a validated result carries ledger_hash and, from the
+    // ledger's close time, close_time_iso and tx_json.date (quaxar left them
+    // out for ledgers that were no longer the newest, mainnet 2026-11-24).
+    assert!(object.contains_key("ledger_hash"), "{object:?}");
+    assert!(object.contains_key("close_time_iso"), "{object:?}");
+    let Some(JsonValue::Object(tx_json)) = object.get("tx_json") else {
+        panic!("v2 tx must carry tx_json");
+    };
+    assert!(tx_json.contains_key("date"), "{tx_json:?}");
 }
 
 #[test]

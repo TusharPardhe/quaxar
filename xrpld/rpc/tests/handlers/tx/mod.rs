@@ -218,5 +218,6 @@ pub(super) fn found_record_with_network(
     record
 }
 
+mod account_tx_sql;
 mod formatting;
 mod lookup;

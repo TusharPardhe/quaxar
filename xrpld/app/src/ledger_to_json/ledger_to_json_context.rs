@@ -16,6 +16,12 @@ pub trait LedgerToJsonContext {
 
     fn get_close_time_by_seq(&self, ledger_seq: u32) -> Option<NetClockTimePoint>;
 
+    /// The server's network ID, for `ctid` on expanded transactions
+    /// (rippled `getNetworkIDService().getNetworkID()`). `None` omits it.
+    fn network_id(&self) -> Option<u32> {
+        None
+    }
+
     fn account_funds(
         &self,
         _ledger: &Ledger,

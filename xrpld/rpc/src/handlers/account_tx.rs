@@ -272,71 +272,87 @@ fn make_owner(record: &TxRecord) -> Transaction {
     owner
 }
 
-fn insert_v1_transaction(target: &mut JsonValue, record: &TxRecord, binary: bool) {
-    let txn = record.txn.as_ref();
-    let owner = make_owner(record);
-    *target = owner.get_json_with_close_time(
+/// rippled AccountTx `populateJsonResponse`, binary branch (all versions):
+/// `tx_blob`, `meta` (v1) or `meta_blob` (v2) as hex, `ledger_index`,
+/// `validated`. Nothing else.
+fn insert_binary_transaction(target: &mut JsonValue, record: &TxRecord, api_version: u32) {
+    let object = ensure_object(target);
+    object.insert(
+        "tx_blob".to_owned(),
+        JsonValue::String(str_hex(record.txn.get_serializer().data())),
+    );
+    if let Some(meta) = &record.meta {
+        let key = if api_version > 1 { "meta_blob" } else { "meta" };
+        object.insert(
+            key.to_owned(),
+            JsonValue::String(str_hex(meta.get_as_object().get_serializer().data())),
+        );
+    }
+    object.insert(
+        "ledger_index".to_owned(),
+        JsonValue::Unsigned(u64::from(record.ledger_index)),
+    );
+    object.insert("validated".to_owned(), JsonValue::Bool(true));
+}
+
+fn meta_json(record: &TxRecord) -> Option<JsonValue> {
+    let meta = record.meta.as_ref()?;
+    let mut meta_json = meta.get_json(JsonOptions::INCLUDE_DATE);
+    insert_all_synthetic_in_json(
+        &mut meta_json,
+        record.ledger_index,
+        record.close_time.map(|close_time| close_time.as_seconds()),
+        record.txn.as_ref(),
+        meta,
+    );
+    Some(meta_json)
+}
+
+/// rippled AccountTx `populateJsonResponse`, API v1 JSON: the transaction
+/// under `tx`, then `meta` and `validated`.
+fn insert_v1_transaction(target: &mut JsonValue, record: &TxRecord) {
+    let mut tx_json = make_owner(record).get_json_with_close_time(
         JsonOptions::INCLUDE_DATE,
-        binary,
+        false,
         record
             .close_time
             .map(|close_time| i64::from(close_time.as_seconds())),
     );
-    if !binary {
-        insert_deliver_max(target, txn.get_txn_type(), 1);
+    insert_deliver_max(&mut tx_json, record.txn.get_txn_type(), 1);
+    let object = ensure_object(target);
+    object.insert("validated".to_owned(), JsonValue::Bool(true));
+    object.insert("tx".to_owned(), tx_json);
+    if let Some(meta) = meta_json(record) {
+        object.insert("meta".to_owned(), meta);
     }
-    if let Some(meta) = &record.meta {
-        let mut meta_json = meta.get_json(JsonOptions::INCLUDE_DATE);
-        insert_all_synthetic_in_json(
-            &mut meta_json,
-            record.ledger_index,
-            record.close_time.map(|close_time| close_time.as_seconds()),
-            txn,
-            meta,
-        );
-        ensure_object(target).insert("meta".to_owned(), meta_json);
-    }
-    ensure_object(target).insert("validated".to_owned(), JsonValue::Bool(record.validated));
 }
 
-fn insert_v2_transaction(target: &mut JsonValue, record: &TxRecord, binary: bool) {
+/// rippled AccountTx `populateJsonResponse`, API v2 JSON: `tx_json`,
+/// `hash`, `ledger_index`, `ledger_hash` (always; getHashBySeq gives zero
+/// when unknown), `close_time_iso` when the close time is known, `meta`,
+/// `validated`.
+fn insert_v2_transaction<S: AccountTxSource>(
+    target: &mut JsonValue,
+    record: &TxRecord,
+    source: &S,
+) {
     let txn = record.txn.as_ref();
-    let owner = make_owner(record);
+    let close_time = record
+        .close_time
+        .or_else(|| source.get_close_time_by_seq(record.ledger_index));
+    let mut tx_json = make_owner(record).get_json_with_close_time(
+        JsonOptions::INCLUDE_DATE | JsonOptions::DISABLE_API_PRIOR_V2,
+        false,
+        close_time.map(|close_time| i64::from(close_time.as_seconds())),
+    );
+    insert_deliver_max(&mut tx_json, txn.get_txn_type(), 2);
+    let ledger_hash = record
+        .ledger_hash
+        .or_else(|| source.get_hash_by_seq(record.ledger_index))
+        .unwrap_or_default();
     let object = ensure_object(target);
-    if binary {
-        object.insert(
-            "tx_blob".to_owned(),
-            JsonValue::String(str_hex(txn.get_serializer().data())),
-        );
-        if let Some(meta) = &record.meta {
-            object.insert(
-                "meta_blob".to_owned(),
-                JsonValue::String(str_hex(meta.get_as_object().get_serializer().data())),
-            );
-        }
-    } else {
-        let mut tx_json = owner.get_json_with_close_time(
-            JsonOptions::INCLUDE_DATE | JsonOptions::DISABLE_API_PRIOR_V2,
-            false,
-            record
-                .close_time
-                .map(|close_time| i64::from(close_time.as_seconds())),
-        );
-        insert_deliver_max(&mut tx_json, txn.get_txn_type(), 2);
-        object.insert("tx_json".to_owned(), tx_json);
-        if let Some(meta) = &record.meta {
-            let mut meta_json = meta.get_json(JsonOptions::INCLUDE_DATE);
-            insert_all_synthetic_in_json(
-                &mut meta_json,
-                record.ledger_index,
-                record.close_time.map(|close_time| close_time.as_seconds()),
-                txn,
-                meta,
-            );
-            object.insert("meta".to_owned(), meta_json);
-        }
-    }
-
+    object.insert("validated".to_owned(), JsonValue::Bool(true));
+    object.insert("tx_json".to_owned(), tx_json);
     object.insert(
         "hash".to_owned(),
         JsonValue::String(txn.get_transaction_id().to_string()),
@@ -345,19 +361,19 @@ fn insert_v2_transaction(target: &mut JsonValue, record: &TxRecord, binary: bool
         "ledger_index".to_owned(),
         JsonValue::Unsigned(u64::from(record.ledger_index)),
     );
-    if let Some(ledger_hash) = record.ledger_hash {
-        object.insert(
-            "ledger_hash".to_owned(),
-            JsonValue::String(ledger_hash.to_string()),
-        );
-    }
-    if let Some(close_time) = record.close_time {
+    object.insert(
+        "ledger_hash".to_owned(),
+        JsonValue::String(ledger_hash.to_string()),
+    );
+    if let Some(close_time) = close_time {
         object.insert(
             "close_time_iso".to_owned(),
             JsonValue::String(to_string_iso(close_time)),
         );
     }
-    object.insert("validated".to_owned(), JsonValue::Bool(record.validated));
+    if let Some(meta) = meta_json(record) {
+        object.insert("meta".to_owned(), meta);
+    }
 }
 
 pub fn do_account_tx<S: AccountTxSource>(
@@ -431,31 +447,12 @@ pub fn do_account_tx<S: AccountTxSource>(
         };
         for record in &page.transactions {
             let mut tx = JsonValue::Object(BTreeMap::new());
-            if api_version > 1 {
-                insert_v2_transaction(&mut tx, record, binary);
+            if binary {
+                insert_binary_transaction(&mut tx, record, api_version);
+            } else if api_version > 1 {
+                insert_v2_transaction(&mut tx, record, source);
             } else {
-                insert_v1_transaction(&mut tx, record, binary);
-            }
-            if api_version > 1
-                && binary
-                && let Some(ledger_hash) = record
-                    .ledger_hash
-                    .or_else(|| source.get_hash_by_seq(record.ledger_index))
-            {
-                ensure_object(&mut tx).insert(
-                    "ledger_hash".to_owned(),
-                    JsonValue::String(ledger_hash.to_string()),
-                );
-            }
-            if api_version > 1
-                && let Some(close_time) = record
-                    .close_time
-                    .or_else(|| source.get_close_time_by_seq(record.ledger_index))
-            {
-                ensure_object(&mut tx).insert(
-                    "close_time_iso".to_owned(),
-                    JsonValue::String(to_string_iso(close_time)),
-                );
+                insert_v1_transaction(&mut tx, record);
             }
             transactions.push(tx);
         }

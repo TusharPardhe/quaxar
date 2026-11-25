@@ -46,3 +46,38 @@ fn validator_list_sites_returns_source_json() {
     assert_eq!(result.get("active"), Some(&JsonValue::Bool(true)));
     assert_eq!(*source.calls.borrow(), 1);
 }
+
+/// rippled `doValidatorListSites` returns `getValidatorSites().getJson()`.
+/// Before the fix quaxar's application source always answered with an empty
+/// `validator_sites` list, even with `[validator_list_sites]` configured.
+#[test]
+fn validator_list_sites_reports_the_configured_sites() {
+    let app = app::ApplicationRoot::with_options(app::ApplicationRootOptions {
+        standalone: true,
+        ..app::ApplicationRootOptions::default()
+    })
+    .expect("standalone root should build");
+    let uri = "https://vl.example.com".to_owned();
+    assert!(app.validator_sites().load(std::slice::from_ref(&uri)));
+
+    let JsonValue::Object(result) =
+        rpc::ApplicationServerInfo::new(&app).get_validator_list_sites()
+    else {
+        panic!("result must be an object");
+    };
+    let Some(JsonValue::Array(sites)) = result.get("validator_sites") else {
+        panic!("validator_sites must be an array: {result:?}");
+    };
+    assert_eq!(sites.len(), 1);
+    let JsonValue::Object(site) = &sites[0] else {
+        panic!("site must be an object");
+    };
+    assert_eq!(site.get("uri"), Some(&JsonValue::String(uri)));
+    let Some(JsonValue::String(next)) = site.get("next_refresh_time") else {
+        panic!("next_refresh_time must be a string: {site:?}");
+    };
+    // rippled to_string(system_clock::time_point): "%Y-%b-%d %T %Z".
+    assert!(next.ends_with(" UTC"), "{next}");
+    let time = next.rsplit(' ').nth(1).expect("time part");
+    assert_eq!(time.len(), "HH:MM:SS.nnnnnnnnn".len(), "{next}");
+}

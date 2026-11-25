@@ -518,13 +518,11 @@ pub fn do_no_ripple_check<S: NoRippleCheckSource>(
         },
     );
 
-    let object = ensure_object(&mut result);
-    object.insert(
-        "account".to_owned(),
-        JsonValue::String(to_base58(account_id)),
-    );
+    // rippled NoRippleCheck.cpp adds `problems` and, when requested,
+    // `transactions` to the lookupLedger result; there is no top-level
+    // `account`.
     if transactions {
-        object.insert("transactions".to_owned(), JsonValue::Array(txs));
+        ensure_object(&mut result).insert("transactions".to_owned(), JsonValue::Array(txs));
     }
     result
 }
