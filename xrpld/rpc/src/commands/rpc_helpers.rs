@@ -101,6 +101,451 @@ pub fn invalid_field_error(name: impl AsRef<str>) -> JsonValue {
     )
 }
 
+/// rippled `Tuning::kDefaultAutoFillFeeMultiplier` and `...Divisor`.
+const DEFAULT_AUTO_FILL_FEE_MULTIPLIER: i64 = 10;
+const DEFAULT_AUTO_FILL_FEE_DIVISOR: i64 = 1;
+
+/// jsoncpp `Value::isInt`: an integer the JSON reader stores as `Int`,
+/// i.e. one within the `i32` range.
+fn json_int(value: &JsonValue) -> Option<i64> {
+    match value {
+        JsonValue::Unsigned(value) if *value <= i32::MAX as u64 => Some(*value as i64),
+        JsonValue::Signed(value) if i32::try_from(*value).is_ok() => Some(*value),
+        _ => None,
+    }
+}
+
+/// jsoncpp `operator==`: `Int` and `UInt` compare by value.
+fn json_equal(left: &JsonValue, right: &JsonValue) -> bool {
+    match (left, right) {
+        (JsonValue::Signed(signed), JsonValue::Unsigned(unsigned))
+        | (JsonValue::Unsigned(unsigned), JsonValue::Signed(signed)) => {
+            i128::from(*signed) == i128::from(*unsigned)
+        }
+        _ => left == right,
+    }
+}
+
+/// jsoncpp `Value::asString` for the scalars a tx_json field may hold.
+fn json_as_string(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::Null => Some(String::new()),
+        JsonValue::Bool(value) => Some(value.to_string()),
+        JsonValue::Unsigned(value) => Some(value.to_string()),
+        JsonValue::Signed(value) => Some(value.to_string()),
+        JsonValue::String(value) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// The account root rippled reads from `OpenLedger::current()`; the closed
+/// ledger before the first open view exists.
+fn open_ledger_account_root(
+    app: &app::ApplicationRoot,
+    account: &protocol::AccountID,
+) -> Option<protocol::STLedgerEntry> {
+    let keylet = protocol::account_keylet(basics::base_uint::Uint160::from_void(account.data()));
+    match app.current_open_ledger_entry(keylet) {
+        Some(read) => read.ok().flatten(),
+        None => app.closed_ledger()?.read(keylet).ok().flatten(),
+    }
+}
+
+/// rippled `acctMatchesPubKey`: the key must be the account's enabled master
+/// key or its regular key. Without an account root, only the master key.
+fn acct_matches_pub_key(
+    account_root: Option<&protocol::STLedgerEntry>,
+    account: protocol::AccountID,
+    public_key: &PublicKey,
+) -> Result<(), Status> {
+    let key_account = protocol::calc_account_id(public_key.as_bytes());
+    let is_master_key = key_account == account;
+    let Some(sle) = account_root else {
+        return if is_master_key {
+            Ok(())
+        } else {
+            Err(Status::new(RpcErrorCode::BadSecret))
+        };
+    };
+    if is_master_key {
+        let flags = sle.get_field_u32(get_field_by_symbol("sfFlags"));
+        return if flags & protocol::lsfDisableMaster != 0 {
+            Err(Status::new(RpcErrorCode::MasterDisabled))
+        } else {
+            Ok(())
+        };
+    }
+    let regular_key = get_field_by_symbol("sfRegularKey");
+    if sle.is_field_present(regular_key) && sle.get_account_id(regular_key) == key_account {
+        return Ok(());
+    }
+    Err(Status::new(RpcErrorCode::BadSecret))
+}
+
+/// rippled `checkTxJsonFields`: validates without adding fields and returns
+/// the source account.
+fn check_tx_json_fields<Runtime: RpcRuntime, Source>(
+    ctx: &RpcRequestContext<'_, Source, Runtime>,
+    tx_json: &BTreeMap<String, JsonValue>,
+    verify: bool,
+) -> Result<protocol::AccountID, Status> {
+    if !tx_json.contains_key(jss::TransactionType) {
+        return Err(Status::missing_field_error("tx_json.TransactionType"));
+    }
+    let Some(account) = tx_json.get(jss::Account) else {
+        return Err(Status::with_message(
+            RpcErrorCode::SrcActMissing,
+            missing_field_message("tx_json.Account"),
+        ));
+    };
+    let account = json_as_string(account)
+        .and_then(|account| parse_base58_account_id(&account))
+        .ok_or_else(|| {
+            Status::with_message(
+                RpcErrorCode::SrcActMalformed,
+                invalid_field_message("tx_json.Account"),
+            )
+        })?;
+    if verify
+        && !ctx.runtime.standalone()
+        && ctx.runtime.validated_ledger_age()
+            > crate::state::tuning::Tuning::MAX_VALIDATED_LEDGER_AGE
+    {
+        return Err(Status::new(if ctx.api_version == 1 {
+            RpcErrorCode::NoCurrent
+        } else {
+            RpcErrorCode::NotSynced
+        }));
+    }
+    if let Some(app) = ctx.runtime.app()
+        && app.load_fee_track().is_loaded_cluster()
+        && !is_unlimited(ctx.role)
+    {
+        return Err(Status::new(RpcErrorCode::TooBusy));
+    }
+    Ok(account)
+}
+
+/// rippled `getTxFee`: the base fee of the transaction as written, parsed
+/// with placeholder Fee, Sequence and signature fields; the reference fee
+/// when it does not parse or fails the local checks.
+fn tx_fee_default(app: &app::ApplicationRoot, tx_json: &BTreeMap<String, JsonValue>) -> u64 {
+    let reference = app.reference_fee_drops();
+    let mut tx = tx_json.clone();
+    for (field, placeholder) in [
+        (jss::Fee, "0"),
+        (jss::Sequence, "0"),
+        (jss::SigningPubKey, ""),
+        (jss::TxnSignature, ""),
+    ] {
+        tx.entry(field.to_owned())
+            .or_insert_with(|| JsonValue::String(placeholder.to_owned()));
+    }
+    if let Some(signers) = tx.get_mut(jss::Signers) {
+        let JsonValue::Array(signers) = signers else {
+            return reference;
+        };
+        if signers.len() > protocol::STTx::MAX_MULTI_SIGNERS {
+            return reference;
+        }
+        for signer in signers {
+            let Some(JsonValue::Object(signer)) = (match signer {
+                JsonValue::Object(outer) => outer.get_mut(jss::Signer),
+                _ => None,
+            }) else {
+                return reference;
+            };
+            for field in [jss::SigningPubKey, jss::TxnSignature] {
+                signer
+                    .entry(field.to_owned())
+                    .or_insert_with(|| JsonValue::String(String::new()));
+            }
+        }
+    }
+    let Some(object) = STParsedJSONObject::new("tx_json", &JsonValue::Object(tx)).object else {
+        return reference;
+    };
+    let st_tx = STTx::from_stobject(object);
+    if protocol::passes_local_checks(&st_tx).is_err() {
+        return reference;
+    }
+    app.tx_base_fee_drops(&st_tx).unwrap_or(reference)
+}
+
+/// rippled `checkFee`: keep a given Fee, otherwise fill
+/// `getCurrentNetworkFee`, limited to `fee_mult_max / fee_div_max` times the
+/// transaction's base fee.
+fn check_fee<Runtime: RpcRuntime, Source>(
+    ctx: &RpcRequestContext<'_, Source, Runtime>,
+    params: &BTreeMap<String, JsonValue>,
+    tx_json: &mut BTreeMap<String, JsonValue>,
+    auto_fill: bool,
+) -> Result<(), Status> {
+    if tx_json.contains_key(jss::Fee) {
+        return Ok(());
+    }
+    if !auto_fill {
+        return Err(Status::missing_field_error("tx_json.Fee"));
+    }
+    let limit_param = |name: &str, default: i64, min: i64| -> Result<i64, Status> {
+        let Some(value) = params.get(name) else {
+            return Ok(default);
+        };
+        let message = expected_field_message(name, "a positive integer");
+        match json_int(value) {
+            Some(value) if value >= min => Ok(value),
+            Some(_) => Err(Status::with_message(RpcErrorCode::InvalidParams, message)),
+            None => Err(Status::with_message(RpcErrorCode::HighFee, message)),
+        }
+    };
+    let mult = limit_param(jss::fee_mult_max, DEFAULT_AUTO_FILL_FEE_MULTIPLIER, 0)?;
+    let div = limit_param(jss::fee_div_max, DEFAULT_AUTO_FILL_FEE_DIVISOR, 1)?;
+
+    let Some(app) = ctx.runtime.app() else {
+        return Err(Status::new(RpcErrorCode::NotSynced));
+    };
+    let fee_default = tx_fee_default(app, tx_json);
+    let fee = app.current_network_fee_for(fee_default, is_unlimited(ctx.role));
+    let limit = u64::try_from(u128::from(fee_default) * mult as u128 / div as u128)
+        .map_err(|_| Status::new(RpcErrorCode::Internal))?;
+    if fee > limit {
+        return Err(Status::with_message(
+            RpcErrorCode::HighFee,
+            format!("Fee of {fee} exceeds the requested tx limit of {limit}"),
+        ));
+    }
+    // rippled writes `fee.jsonClipped()`, an integer; quaxar's amount parser
+    // takes drops as a string.
+    tx_json.insert(jss::Fee.to_owned(), JsonValue::String(fee.to_string()));
+    Ok(())
+}
+
+/// rippled `checkPayment`, except the `build_path` search itself: the
+/// request checks and errors match, but no paths are added (path finding is
+/// not wired into signing yet).
+fn check_payment<Runtime: RpcRuntime, Source>(
+    ctx: &RpcRequestContext<'_, Source, Runtime>,
+    params: &BTreeMap<String, JsonValue>,
+    tx_json: &mut BTreeMap<String, JsonValue>,
+    do_path: bool,
+) -> Result<(), Status> {
+    if tx_json
+        .get(jss::TransactionType)
+        .and_then(json_as_string)
+        .as_deref()
+        != Some("Payment")
+    {
+        return Ok(());
+    }
+    if let Some(deliver_max) = tx_json.remove(jss::DeliverMax) {
+        match tx_json.get(jss::Amount) {
+            Some(amount) if !json_equal(amount, &deliver_max) => {
+                return Err(Status::make_param_error(
+                    "Cannot specify differing 'Amount' and 'DeliverMax'",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                tx_json.insert(jss::Amount.to_owned(), deliver_max);
+            }
+        }
+    }
+    let parse_amount = |value: &JsonValue| {
+        let field = get_field_by_symbol("sfAmount");
+        protocol::get_or_throw::<protocol::STAmount>(
+            &JsonValue::Object(BTreeMap::from([(field.name().to_owned(), value.clone())])),
+            field,
+        )
+        .ok()
+    };
+    let amount = tx_json
+        .get(jss::Amount)
+        .ok_or_else(|| Status::missing_field_error("tx_json.Amount"))?;
+    let amount =
+        parse_amount(amount).ok_or_else(|| Status::invalid_field_error("tx_json.Amount"))?;
+    let destination = tx_json
+        .get(jss::Destination)
+        .ok_or_else(|| Status::missing_field_error("tx_json.Destination"))?;
+    json_as_string(destination)
+        .and_then(|destination| parse_base58_account_id(&destination))
+        .ok_or_else(|| Status::invalid_field_error("tx_json.Destination"))?;
+
+    let build_path = params.contains_key(jss::build_path);
+    let mpt_v2 = ctx.runtime.app().is_some_and(|app| {
+        app.current_open_ledger_rules()
+            .enabled(&protocol::feature_id("MPTokensV2"))
+    });
+    if build_path && (!do_path || (!mpt_v2 && amount.holds_mpt_issue())) {
+        return Err(Status::make_param_error(
+            "Field 'build_path' not allowed in this context.",
+        ));
+    }
+    if build_path && tx_json.contains_key(jss::Paths) {
+        return Err(Status::make_param_error(
+            "Cannot specify both 'tx_json.Paths' and 'build_path'",
+        ));
+    }
+    if let Some(domain) = tx_json.get("DomainID") {
+        let valid = matches!(domain, JsonValue::String(text) if Uint256::from_hex(text).is_ok());
+        if !valid {
+            return Err(Status::with_message(
+                RpcErrorCode::DomainMalformed,
+                "Unable to parse 'DomainID'.",
+            ));
+        }
+    }
+    if build_path && !tx_json.contains_key(jss::Paths) {
+        let send_max_native = match tx_json.get(jss::SendMax) {
+            Some(send_max) => parse_amount(send_max)
+                .ok_or_else(|| Status::invalid_field_error("tx_json.SendMax"))?
+                .native(),
+            None => amount.native(),
+        };
+        if send_max_native && amount.native() {
+            return Err(Status::make_param_error("Cannot build XRP to XRP paths."));
+        }
+    }
+    Ok(())
+}
+
+/// rippled `transactionPreProcessImpl` for single signing (`sign`, and
+/// `submit` with a secret): check and fill tx_json, check that the key may
+/// sign for the account, then build and sign the transaction.
+fn transaction_pre_process<Runtime: RpcRuntime, Source>(
+    ctx: &RpcRequestContext<'_, Source, Runtime>,
+    params: &BTreeMap<String, JsonValue>,
+) -> Result<STTx, Status> {
+    let (public_key, secret_key) = keypair_for_signature(params, ctx.api_version)?;
+    let verify = !params.get(jss::offline).is_some_and(json_as_bool);
+    let signature_target = parse_signature_target(params)?;
+    let signature_role = signature_target.unwrap_or(SignatureRole::Transaction);
+
+    let Some(tx_json) = params.get(jss::tx_json) else {
+        return Err(Status::missing_field_error(jss::tx_json));
+    };
+    let JsonValue::Object(tx_json) = tx_json else {
+        return Err(Status::expected_field_error(jss::tx_json, "object"));
+    };
+    let mut tx_json = tx_json.clone();
+    let source = check_tx_json_fields(ctx, &tx_json, verify)?;
+
+    // Offline, the Sequence cannot be read locally.
+    if !verify && !tx_json.contains_key(jss::Sequence) {
+        return Err(Status::missing_field_error("tx_json.Sequence"));
+    }
+    let app = ctx.runtime.app();
+    let account_root = if verify {
+        let root = app.and_then(|app| open_ledger_account_root(app, &source));
+        if root.is_none() {
+            return Err(Status::new(RpcErrorCode::SrcActNotFound));
+        }
+        root
+    } else {
+        None
+    };
+
+    if !tx_json.contains_key(jss::Sequence) {
+        let seq = if tx_json.contains_key("TicketSequence") {
+            0
+        } else {
+            // TxQ::nextQueuableSeq on the open ledger.
+            let probe = STTx::new(protocol::TxType::PAYMENT, |tx| {
+                tx.set_account_id(get_field_by_symbol("sfAccount"), source);
+            });
+            app.and_then(|app| app.network_ops_next_account_seq_for_tx(&probe))
+                .ok_or_else(|| Status::new(RpcErrorCode::SrcActNotFound))?
+        };
+        tx_json.insert(
+            jss::Sequence.to_owned(),
+            JsonValue::Unsigned(u64::from(seq)),
+        );
+    }
+    if !tx_json.contains_key(jss::NetworkID) {
+        let network_id = app.map(|app| app.network_id()).unwrap_or(0);
+        if network_id > 1024 {
+            tx_json.insert(
+                jss::NetworkID.to_owned(),
+                JsonValue::String(network_id.to_string()),
+            );
+        }
+    }
+    check_fee(ctx, params, &mut tx_json, verify)?;
+    check_payment(ctx, params, &mut tx_json, verify)?;
+
+    if tx_json.contains_key(jss::Signers) {
+        return Err(Status::new(RpcErrorCode::AlreadyMultisig));
+    }
+    // With a signature target the account and secret need not belong together.
+    if verify && signature_target.is_none() {
+        if let Some(delegate) = tx_json.get("Delegate") {
+            let delegate = match delegate {
+                JsonValue::String(text) => parse_base58_account_id(text),
+                _ => None,
+            }
+            .ok_or_else(|| {
+                Status::with_message(
+                    RpcErrorCode::SrcActMalformed,
+                    invalid_field_message("tx_json.Delegate"),
+                )
+            })?;
+            let delegate_root = app.and_then(|app| open_ledger_account_root(app, &delegate));
+            let Some(delegate_root) = delegate_root else {
+                return Err(Status::new(RpcErrorCode::DelegateActNotFound));
+            };
+            acct_matches_pub_key(Some(&delegate_root), delegate, &public_key)?;
+        } else {
+            acct_matches_pub_key(account_root.as_ref(), source, &public_key)?;
+        }
+    }
+
+    let parsed = STParsedJSONObject::new("tx_json", &JsonValue::Object(tx_json));
+    let Some(object) = parsed.object else {
+        let mut status = Status::new(RpcErrorCode::InvalidParams);
+        if let JsonValue::Object(mut error) = parsed.error
+            && let Some(JsonValue::String(message)) = error.remove("error_message")
+        {
+            status = Status::with_message(RpcErrorCode::InvalidParams, message);
+        }
+        return Err(status);
+    };
+    let mut st_tx = STTx::from_stobject(object);
+    let target_field = signature_field(signature_role);
+    if let Some(field) = target_field
+        && !st_tx.is_field_present(field)
+    {
+        st_tx.set_field_object(field, STObject::make_inner_object(field));
+    }
+    signer_target_object(&mut st_tx, target_field).set_field_vl(
+        get_field_by_symbol("sfSigningPubKey"),
+        public_key.as_bytes(),
+    );
+    protocol::passes_local_checks(&st_tx).map_err(Status::make_param_error)?;
+    st_tx
+        .sign_with_role(
+            &public_key,
+            &secret_key,
+            signature_role,
+            &signing_rules(ctx),
+        )
+        .map_err(|_| Status::new(RpcErrorCode::Internal))?;
+    Ok(st_tx)
+}
+
+/// rippled `doSign`, `doSignFor` and `doSubmit` with a secret: only admin
+/// callers may sign unless `[signing_support]` is set (`Config::canSign`).
+pub fn check_signing_supported<Runtime: RpcRuntime, Source>(
+    ctx: &RpcRequestContext<'_, Source, Runtime>,
+) -> Result<(), Status> {
+    if ctx.role != Role::Admin && !ctx.runtime.app().is_some_and(|app| app.can_sign()) {
+        return Err(Status::with_message(
+            RpcErrorCode::NotSupported,
+            "Signing is not supported by this server.",
+        ));
+    }
+    Ok(())
+}
+
+/// rippled `transactionSign`.
 pub fn transaction_sign<Runtime: RpcRuntime, Source>(
     ctx: &RpcRequestContext<'_, Source, Runtime>,
 ) -> Result<JsonValue, Status> {
@@ -108,65 +553,11 @@ pub fn transaction_sign<Runtime: RpcRuntime, Source>(
     let JsonValue::Object(params) = &ctx.params else {
         return Err(Status::new(RpcErrorCode::InvalidParams));
     };
-
-    let tx_json = params.get(jss::tx_json).cloned().ok_or_else(|| {
-        Status::with_message(
-            RpcErrorCode::InvalidParams,
-            missing_field_message(jss::tx_json),
-        )
-    })?;
-    let mut st_tx = parse_sttx_from_json_value(&tx_json)?;
-    // Match rippled's autofill: always set tfFullyCanonicalSig
-    st_tx.set_flag(0x8000_0000);
-    // Auto-fill NetworkID for private networks (ID > 1024)
-    let app_network_id = ctx.runtime.app().map(|app| app.network_id()).unwrap_or(0);
-    if app_network_id > 1024 && !st_tx.is_field_present(get_field_by_symbol("sfNetworkID")) {
-        st_tx.set_field_u32(get_field_by_symbol("sfNetworkID"), app_network_id);
-    }
-    // TransactionSign.cpp reads the account root from OpenLedger::current()
-    // then calls TxQ::nextQueuableSeq. Keep that exact ordering: the persistent
-    // submit sandbox includes rebuilt LocalTx effects, while TxQ fills any
-    // contiguous queued sequence gap. The legacy sequence cache is not an
-    // authoritative signing source because it is intentionally cleared at an
-    // LCL transition and is not reconstructed during LocalTx replay.
-    if st_tx.get_seq_value() == 0 {
-        if let Some(app) = ctx.runtime.app() {
-            let seq = app.network_ops_next_account_seq_for_tx(&st_tx).unwrap_or(1);
-            st_tx.set_field_u32(get_field_by_symbol("sfSequence"), seq);
-        }
-    }
-    // Auto-fill Fee if not set (default to base fee)
-    if !st_tx.is_field_present(get_field_by_symbol("sfFee"))
-        || st_tx
-            .get_field_amount(get_field_by_symbol("sfFee"))
-            .xrp()
-            .drops()
-            == 0
-    {
-        st_tx.set_field_amount(
-            get_field_by_symbol("sfFee"),
-            protocol::STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(12)),
-        );
-    }
-    let (public_key, secret_key) = keypair_for_signature(params)?;
-    let signing_rules = signing_rules(ctx);
-    let signature_role = parse_signature_target(params)?.unwrap_or(SignatureRole::Transaction);
-    signer_target_object(&mut st_tx, signature_field(signature_role)).set_field_vl(
-        get_field_by_symbol("sfSigningPubKey"),
-        public_key.as_bytes(),
-    );
-    st_tx
-        .sign_with_role(&public_key, &secret_key, signature_role, &signing_rules)
-        .map_err(|_| Status::new(RpcErrorCode::Internal))?;
-
-    let mut result = transaction_format_result(&st_tx, ctx.api_version);
-    result.insert(
-        jss::deprecated.to_string(),
-        JsonValue::String(
-            "This command has been deprecated and will be removed in a future version of the server. Please migrate to a standalone signing tool.".to_owned(),
-        ),
-    );
-    Ok(JsonValue::Object(result))
+    let st_tx = transaction_pre_process(ctx, params)?;
+    Ok(JsonValue::Object(transaction_format_result(
+        &st_tx,
+        ctx.api_version,
+    )))
 }
 
 pub fn transaction_sign_for<Runtime: RpcRuntime, Source>(
@@ -238,7 +629,7 @@ pub fn transaction_sign_for<Runtime: RpcRuntime, Source>(
     }
 
     let mut st_tx = parse_sttx_from_json_value(&tx_json)?;
-    let (public_key, secret_key) = keypair_for_signature(params)?;
+    let (public_key, secret_key) = keypair_for_signature(params, ctx.api_version)?;
     let signing_rules = signing_rules(ctx);
     let signature_role = parse_signature_target(params)?.unwrap_or(SignatureRole::Transaction);
 
@@ -455,7 +846,7 @@ pub fn channel_authorize<Runtime: RpcRuntime, Source>(
         .and_then(JsonValue::as_str)
         .ok_or_else(|| Status::new(RpcErrorCode::ChannelAmtMalformed))?;
 
-    let (public_key, secret_key) = keypair_for_signature(params)?;
+    let (public_key, secret_key) = keypair_for_signature(params, ctx.api_version)?;
     let channel_id =
         Uint256::from_hex(channel_id).map_err(|_| Status::new(RpcErrorCode::ChannelMalformed))?;
     let amount = to_uint64(amount).ok_or_else(|| Status::new(RpcErrorCode::ChannelAmtMalformed))?;
@@ -841,26 +1232,37 @@ pub fn parse_xrpl_lib_seed(s: &str) -> Option<Seed> {
         .and_then(|bytes| Seed::from_slice(&bytes).ok())
 }
 
+/// rippled `getSeedFromRPC`: exactly one of `passphrase`, `seed` (a Base58
+/// family seed) or `seed_hex` (32 hex digits).
 pub fn get_seed_from_rpc(params: &JsonValue) -> Result<Seed, Status> {
     let JsonValue::Object(map) = params else {
         return Err(Status::new(RpcErrorCode::InvalidParams));
     };
-
-    if let Some(JsonValue::String(passphrase)) = map.get(jss::passphrase) {
-        return Ok(protocol::generate_seed(passphrase));
-    }
-
-    if let Some(JsonValue::String(seed)) = map.get(jss::seed) {
-        return protocol::parse_generic_seed(seed, false)
-            .ok_or_else(|| Status::new(RpcErrorCode::InvalidParams));
-    }
-
-    if let Some(JsonValue::String(seed_hex)) = map.get(jss::seed_hex) {
-        let bytes = hex::decode(seed_hex).map_err(|_| Status::new(RpcErrorCode::InvalidParams))?;
-        return Seed::from_slice(&bytes).map_err(|_| Status::new(RpcErrorCode::InvalidParams));
-    }
-
-    Err(Status::new(RpcErrorCode::InvalidParams))
+    let present: Vec<&str> = [jss::passphrase, jss::seed, jss::seed_hex]
+        .into_iter()
+        .filter(|name| map.contains_key(*name))
+        .collect();
+    let [seed_type] = present[..] else {
+        return Err(Status::make_param_error(
+            "Exactly one of the following must be specified: passphrase, seed or seed_hex",
+        ));
+    };
+    let Some(JsonValue::String(text)) = map.get(seed_type) else {
+        return Err(Status::expected_field_error(seed_type, "string"));
+    };
+    let seed = if seed_type == jss::passphrase {
+        protocol::parse_generic_seed(text, true)
+    } else if seed_type == jss::seed {
+        protocol::decode_base58_token(text, protocol::TokenType::FamilySeed)
+            .and_then(|bytes| Seed::from_slice(&bytes).ok())
+    } else if text.len() == 32 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        hex::decode(text)
+            .ok()
+            .and_then(|bytes| Seed::from_slice(&bytes).ok())
+    } else {
+        None
+    };
+    seed.ok_or_else(|| Status::new(RpcErrorCode::BadSeed))
 }
 
 /// rippled `json::Value::asBool`: rpc-spec reads boolean options this way,
@@ -1002,57 +1404,74 @@ fn parse_sttx_from_json_value(tx_json: &JsonValue) -> Result<STTx, Status> {
     Err(status)
 }
 
+/// rippled `keypairForSignature` (RPCHelpers.cpp).
 fn keypair_for_signature(
     params: &BTreeMap<String, JsonValue>,
+    api_version: u32,
 ) -> Result<(PublicKey, SecretKey), Status> {
-    let mut key_type = match params.get(jss::key_type) {
-        Some(JsonValue::String(value)) => Some(
-            key_type_from_string(value).ok_or_else(|| Status::new(RpcErrorCode::InvalidParams))?,
-        ),
-        Some(_) => {
-            return Err(Status::with_message(
-                RpcErrorCode::InvalidParams,
-                expected_field_message(jss::key_type, "string"),
-            ));
-        }
-        None => None,
+    let has_key_type = params.contains_key(jss::key_type);
+    let present: Vec<&str> = [jss::passphrase, jss::secret, jss::seed, jss::seed_hex]
+        .into_iter()
+        .filter(|name| params.contains_key(*name))
+        .collect();
+    let Some(&secret_type) = present.last() else {
+        return Err(Status::missing_field_error(jss::secret));
     };
-
-    // Reject conflicting key sources: only one of secret, seed, seed_hex, or
-    // passphrase may be provided.
-    let has_secret = params.contains_key(jss::secret);
-    let has_seed = params.contains_key(jss::seed);
-    let has_seed_hex = params.contains_key(jss::seed_hex);
-    let has_passphrase = params.contains_key(jss::passphrase);
-    let source_count =
-        has_secret as u8 + has_seed as u8 + has_seed_hex as u8 + has_passphrase as u8;
-    if source_count > 1 {
-        return Err(Status::with_message(
-            RpcErrorCode::InvalidParams,
-            "Exactly one of the following must be specified: secret, seed, seed_hex, passphrase.",
+    if present.len() > 1 {
+        return Err(Status::make_param_error(
+            "Exactly one of the following must be specified: passphrase, secret, seed or seed_hex",
         ));
     }
 
-    let seed = if let Some(JsonValue::String(secret)) = params.get(jss::secret) {
-        if key_type.is_none() && secret.starts_with("sEd") {
-            key_type = Some(KeyType::Ed25519);
-        }
-        protocol::parse_generic_seed(secret, false)
-            .ok_or_else(|| Status::new(RpcErrorCode::InvalidParams))?
-    } else {
-        if key_type.is_none() {
-            if let Some(JsonValue::String(seed_val)) = params.get(jss::seed) {
-                if seed_val.starts_with("sEd") {
-                    key_type = Some(KeyType::Ed25519);
-                }
+    let mut key_type = None;
+    if let Some(value) = params.get(jss::key_type) {
+        let JsonValue::String(value) = value else {
+            return Err(Status::expected_field_error(jss::key_type, "string"));
+        };
+        key_type = Some(key_type_from_string(value).ok_or_else(|| {
+            if api_version > 1 {
+                Status::new(RpcErrorCode::BadKeyType)
+            } else {
+                Status::invalid_field_error(jss::key_type)
             }
+        })?);
+        if secret_type == jss::secret {
+            return Err(Status::make_param_error(
+                "The secret field is not allowed if key_type is used.",
+            ));
         }
-        get_seed_from_rpc(&JsonValue::Object(params.clone()))?
-    };
+    }
 
+    // xrpl.js encodes Ed25519 seeds in its own way; detect them.
+    let mut seed = None;
+    if secret_type != jss::seed_hex
+        && let Some(JsonValue::String(text)) = params.get(secret_type)
+        && let Some(lib_seed) = parse_xrpl_lib_seed(text)
+    {
+        if key_type.unwrap_or(KeyType::Ed25519) != KeyType::Ed25519 {
+            return Err(Status::with_message(
+                RpcErrorCode::BadSeed,
+                "Specified seed is for an Ed25519 wallet.",
+            ));
+        }
+        key_type = Some(KeyType::Ed25519);
+        seed = Some(lib_seed);
+    }
     let key_type = key_type.unwrap_or(KeyType::Secp256k1);
 
-    // rippled RPCHelpers keypairForSignature: generateKeyPair.
+    let seed = match seed {
+        Some(seed) => seed,
+        None if has_key_type => get_seed_from_rpc(&JsonValue::Object(params.clone()))?,
+        None => {
+            // Without key_type rippled reads `secret` whatever was given.
+            let Some(JsonValue::String(secret)) = params.get(jss::secret) else {
+                return Err(Status::expected_field_error(jss::secret, "string"));
+            };
+            protocol::parse_generic_seed(secret, true).ok_or_else(|| {
+                Status::with_message(RpcErrorCode::BadSeed, invalid_field_message(secret_type))
+            })?
+        }
+    };
     protocol::generate_key_pair(key_type, &seed).map_err(|_| Status::new(RpcErrorCode::Internal))
 }
 

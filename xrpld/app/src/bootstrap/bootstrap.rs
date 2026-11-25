@@ -852,6 +852,11 @@ pub fn build_bootstrap_root(
     root.set_path_search_levels(path_search_old, path_search, path_search_fast);
     root.set_max_transactions(config_max_transactions(config)?);
     let _ = root.set_path_search_max(path_search_max);
+    let _ = root.set_signing_support(
+        config_single_legacy(config, "signing_support")?
+            .and_then(|raw| config_bool(&raw))
+            .unwrap_or(false),
+    );
     for (section, is_validation) in [("relay_validations", true), ("relay_proposals", false)] {
         if config.exists(section) {
             let value = config.section(section).legacy().unwrap_or_default();
@@ -4733,7 +4738,12 @@ fn validate_rippled_config_values(config: &BasicConfig) -> Result<(), String> {
             Some(_) => {}
         }
     }
-    for section in ["compression", "ledger_replay", "beta_rpc_api"] {
+    for section in [
+        "compression",
+        "ledger_replay",
+        "beta_rpc_api",
+        "signing_support",
+    ] {
         if let Some(raw) = config_single_legacy(config, section)?
             && config_bool(&raw).is_none()
         {

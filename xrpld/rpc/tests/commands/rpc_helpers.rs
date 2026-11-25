@@ -148,6 +148,8 @@ fn transaction_sign_result_shape_for_single_signing() {
     let destination = AccountID::from_array([0x22; 20]);
     let params = object([
         ("secret", JsonValue::String(secret_text)),
+        // No ledger here: sign offline.
+        ("offline", JsonValue::Bool(true)),
         (
             "tx_json",
             object([
@@ -186,7 +188,8 @@ fn transaction_sign_result_shape_for_single_signing() {
 
     assert!(matches!(result.get("tx_blob"), Some(JsonValue::String(blob)) if !blob.is_empty()));
     assert!(matches!(result.get("hash"), Some(JsonValue::String(hash)) if !hash.is_empty()));
-    assert!(result.contains_key("deprecated"));
+    // `do_sign` adds the deprecation notice, as rippled `doSign` does.
+    assert!(!result.contains_key("deprecated"));
     let JsonValue::Object(tx_json) = result.get("tx_json").cloned().expect("tx_json") else {
         panic!("tx_json object");
     };
@@ -448,6 +451,7 @@ fn transaction_sign_accepts_every_supported_signature_role() {
         }
         let mut params = BTreeMap::from([
             ("secret".to_owned(), JsonValue::String(secret_text.clone())),
+            ("offline".to_owned(), JsonValue::Bool(true)),
             ("tx_json".to_owned(), JsonValue::Object(tx_json)),
         ]);
         if let Some(signature_target) = signature_target {

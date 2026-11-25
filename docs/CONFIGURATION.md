@@ -244,6 +244,12 @@ enable them.
 `api_version` 1 or 2; any other value is rejected with `invalid_API_version`
 (HTTP 400 for single JSON-RPC requests).
 
+### `[signing_support]`
+
+`1` lets non-admin callers use `sign`, `sign_for` and `submit` with a secret.
+Default `0`: they get `notSupported` ("Signing is not supported by this
+server."), as with rippled. Admin callers can always sign.
+
 ### `[validation_seed]`
 
 Secret family seed for this server's validator identity. Keep the containing

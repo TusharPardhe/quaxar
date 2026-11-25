@@ -61,6 +61,14 @@ pub enum RpcErrorCode {
     NotImplemented,
     TxSigned,
     HighFee,
+    NoCurrent,
+    MasterDisabled,
+    AlreadyMultisig,
+    AlreadySingleSig,
+    BadSecret,
+    DelegateActNotFound,
+    BadSeed,
+    BadKeyType,
 }
 
 impl RpcErrorCode {
@@ -119,6 +127,14 @@ impl RpcErrorCode {
             Self::NotImplemented => 74, // Same as NotImpl
             Self::TxSigned => 96,
             Self::HighFee => 11,
+            Self::NoCurrent => 16,
+            Self::MasterDisabled => 23,
+            Self::AlreadyMultisig => 36,
+            Self::AlreadySingleSig => 37,
+            Self::BadSecret => 43,
+            Self::DelegateActNotFound => 68,
+            Self::BadSeed => 44,
+            Self::BadKeyType => 76,
         }
     }
 
@@ -177,6 +193,14 @@ impl RpcErrorCode {
             Self::NotImplemented => "notImplemented",
             Self::TxSigned => "transactionSigned",
             Self::HighFee => "highFee",
+            Self::NoCurrent => "noCurrent",
+            Self::MasterDisabled => "masterDisabled",
+            Self::AlreadyMultisig => "alreadyMultisig",
+            Self::AlreadySingleSig => "alreadySingleSig",
+            Self::BadSecret => "badSecret",
+            Self::DelegateActNotFound => "delegateActNotFound",
+            Self::BadSeed => "badSeed",
+            Self::BadKeyType => "badKeyType",
         }
     }
 
@@ -234,6 +258,14 @@ impl RpcErrorCode {
             Self::NotImplemented => "Not implemented.",
             Self::TxSigned => "Transaction should not be signed.",
             Self::HighFee => "Current transaction fee exceeds your limit.",
+            Self::NoCurrent => "Current ledger is unavailable.",
+            Self::MasterDisabled => "Master key is disabled.",
+            Self::AlreadyMultisig => "Already multisigned.",
+            Self::AlreadySingleSig => "Already single-signed.",
+            Self::BadSecret => "Secret does not match account.",
+            Self::DelegateActNotFound => "Delegate account not found.",
+            Self::BadSeed => "Disallowed seed.",
+            Self::BadKeyType => "Bad key type.",
         }
     }
 }

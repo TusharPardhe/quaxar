@@ -6478,6 +6478,20 @@ impl ApplicationRoot {
         self.registry.config.path_search_fast = path_search_fast;
     }
 
+    /// rippled `Config::canSign` (`[signing_support]`).
+    pub fn can_sign(&self) -> bool {
+        self.registry.config.signing_support
+    }
+
+    pub fn set_signing_support(&mut self, signing_support: bool) -> bool {
+        std::mem::replace(&mut self.registry.config.signing_support, signing_support)
+    }
+
+    /// rippled `Config::FEES.reference_fee` (`[voting] reference_fee`).
+    pub fn reference_fee_drops(&self) -> u64 {
+        u64::try_from(self.fee_vote_setup.reference_fee.drops()).unwrap_or(0)
+    }
+
     pub fn set_path_search_max(&mut self, path_search_max: u32) -> u32 {
         std::mem::replace(&mut self.registry.config.path_search_max, path_search_max)
     }
@@ -9007,7 +9021,30 @@ impl ApplicationRoot {
                 .map(|ledger| base_fee(ledger.as_ref(), tx))
                 .unwrap_or_else(|| self.open_ledger().current().base_fee_drops),
         };
+        (
+            self.current_network_fee_for(fee_default, unlimited),
+            fee_default,
+        )
+    }
 
+    /// rippled `calculateBaseFee` of `tx` on the current open view (the
+    /// latest ledger before one exists); `None` when it fails.
+    pub fn tx_base_fee_drops(&self, tx: &STTx) -> Option<u64> {
+        match self.open_ledger_sandbox.lock() {
+            Ok(holder) if holder.is_some() => {
+                calculate_sttx_base_fee(holder.as_ref().expect("checked above"), tx).ok()
+            }
+            _ => self
+                .ledger_master_state
+                .latest_ledger()
+                .and_then(|ledger| calculate_sttx_base_fee(ledger.as_ref(), tx).ok()),
+        }
+    }
+
+    /// The fee part of rippled `getCurrentNetworkFee` for a transaction
+    /// whose base fee is `fee_default`: the larger of that fee scaled by the
+    /// local load and the open ledger's escalated fee.
+    pub fn current_network_fee_for(&self, fee_default: u64, unlimited: bool) -> u64 {
         let track = self.load_fee_track();
         let (fee_factor, remote_fee_factor) = track.scaling_factors();
         let load_fee = crate::state::invoke_preclaim::scale_fee_load(
@@ -9033,7 +9070,7 @@ impl ApplicationRoot {
             / u128::from(base_level))
         .saturating_add(1);
         let escalated = u64::try_from(escalated).unwrap_or(u64::MAX);
-        (load_fee.max(escalated), fee_default)
+        load_fee.max(escalated)
     }
 
     /// Get the account's current sequence from the network ops pending state.

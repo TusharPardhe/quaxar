@@ -2255,13 +2255,10 @@ pub fn do_submit<Runtime: RpcRuntime>(
         _ => None,
     };
 
-    // If tx_blob is not present, fall back to deprecated sign-and-submit mode
-    // (signing with secret + tx_json for legacy compatibility).
+    // Without tx_blob, rippled signs tx_json with the given key and submits
+    // it (deprecated sign-and-submit mode).
     if tx_blob.is_none() {
-        let has_secret = matches!(ctx.params, JsonValue::Object(obj) if obj.contains_key(jss::secret) || obj.contains_key(jss::key_type));
-        if has_secret {
-            return submit_with_sign(ctx);
-        }
+        return submit_with_sign(ctx);
     }
 
     let tx_blob_hex = tx_blob.ok_or_else(|| Status::new(RpcErrorCode::InvalidParams))?;
@@ -2290,7 +2287,17 @@ pub fn do_submit<Runtime: RpcRuntime>(
 fn submit_with_sign<Runtime: RpcRuntime>(
     ctx: &RpcRequestContext<'_, SubmitSource, Runtime>,
 ) -> Result<JsonValue, Status> {
-    use crate::commands::rpc_helpers::transaction_sign;
+    use crate::commands::rpc_helpers::{check_signing_supported, transaction_sign};
+
+    // rippled `getFailHard`, then `Config::canSign`.
+    if let JsonValue::Object(params) = ctx.params
+        && params
+            .get(jss::fail_hard)
+            .is_some_and(|value| !matches!(value, JsonValue::Bool(_)))
+    {
+        return Err(Status::expected_field_error(jss::fail_hard, "boolean"));
+    }
+    check_signing_supported(ctx)?;
 
     // `submit` with a server-side secret leaves Sequence unspecified. Match
     // rippled's synchronous NetworkOPs admission contract by holding the LCL
@@ -2318,7 +2325,15 @@ fn submit_with_sign<Runtime: RpcRuntime>(
         load_type: ctx.load_type,
     };
 
-    let sign_result = transaction_sign(&sign_ctx)?;
+    let sign_result = match transaction_sign(&sign_ctx) {
+        Ok(result) => result,
+        Err(status) => {
+            let mut result = JsonValue::Object(Default::default());
+            status.inject(&mut result);
+            insert_submit_sign_deprecated(&mut result);
+            return Ok(result);
+        }
+    };
 
     // Extract tx_blob from sign result
     let tx_blob_hex = match &sign_result {
@@ -2335,9 +2350,14 @@ fn submit_with_sign<Runtime: RpcRuntime>(
 
     let fail_hard = parse_fail_hard(ctx.params);
     let mut result = submit_sttx(ctx, st_tx, tx_blob_hex, fail_hard);
+    insert_submit_sign_deprecated(&mut result);
+    Ok(result)
+}
 
-    // Mark as deprecated — users should migrate to client-side signing
-    if let JsonValue::Object(ref mut obj) = result {
+/// rippled `doSubmit` adds this to every sign-and-submit response, errors
+/// included.
+fn insert_submit_sign_deprecated(result: &mut JsonValue) {
+    if let JsonValue::Object(obj) = result {
         obj.insert(
             jss::deprecated.to_string(),
             JsonValue::String(
@@ -2348,6 +2368,4 @@ fn submit_with_sign<Runtime: RpcRuntime>(
             ),
         );
     }
-
-    Ok(result)
 }

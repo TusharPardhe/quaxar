@@ -1143,6 +1143,9 @@ pub struct AppConfig {
     /// rippled `Config::maxTransactions`: `[max_transactions]` clamped to
     /// `kMinJobQueueTx..=kMaxJobQueueTx` (100..=1000), default 250.
     pub max_transactions: usize,
+    /// rippled `Config::canSign`: `[signing_support]`, default false. Lets
+    /// non-admin callers use `sign`, `sign_for` and `submit` with a secret.
+    pub signing_support: bool,
 }
 
 impl Default for AppConfig {
@@ -1165,6 +1168,7 @@ impl Default for AppConfig {
             max_transactions: DEFAULT_MAX_TRANSACTIONS,
             validation_seed: None,
             validator_token: None,
+            signing_support: false,
         }
     }
 }
@@ -1553,6 +1557,7 @@ impl ApplicationRegistryOwners {
                 max_transactions: DEFAULT_MAX_TRANSACTIONS,
                 validation_seed: None,
                 validator_token: None,
+                signing_support: false,
             },
         })
     }
