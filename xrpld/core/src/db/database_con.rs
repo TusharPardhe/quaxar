@@ -59,6 +59,11 @@ impl DatabaseConSetup {
 
 pub struct DatabaseCon {
     connection: Mutex<Connection>,
+    /// A second, read-only connection to a WAL database. WAL readers see the
+    /// last committed state and never wait on the writer, so RPC reads use
+    /// it instead of queueing behind a ledger save that holds `connection`.
+    /// `None` for in-memory or temporary databases and for non-WAL journals.
+    read_connection: Option<Mutex<Connection>>,
 }
 
 impl DatabaseCon {
@@ -94,6 +99,18 @@ impl DatabaseCon {
         self.connection
             .lock()
             .expect("database connection mutex must not be poisoned")
+    }
+
+    /// A session for read-only queries. On a WAL database this is a
+    /// separate read-only connection that does not wait for the writer;
+    /// otherwise it is the main session.
+    pub fn get_read_session(&self) -> MutexGuard<'_, Connection> {
+        match &self.read_connection {
+            Some(read_connection) => read_connection
+                .lock()
+                .expect("database read connection mutex must not be poisoned"),
+            None => self.get_session(),
+        }
     }
 
     pub fn checkout_db(&self) -> LockedConnection<'_> {
@@ -133,10 +150,31 @@ impl DatabaseCon {
                 .map_err(|error| error.to_string())?;
         }
 
+        let read_connection = open_wal_reader(&connection, path).map(Mutex::new);
         Ok(Self {
             connection: Mutex::new(connection),
+            read_connection,
         })
     }
+}
+
+/// A read-only connection to `path` when the database there is a file in
+/// WAL mode, so readers run beside the writer.
+fn open_wal_reader(connection: &Connection, path: &Path) -> Option<Connection> {
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .ok()?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        return None;
+    }
+    Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()
 }
 
 #[cfg(test)]
@@ -164,6 +202,57 @@ mod tests {
             )
             .expect("query");
         assert_eq!(exists, 1);
+    }
+
+    /// RPC reads must not queue behind a writer holding the main session (a
+    /// ledger save): on mainnet `tx_history` p99 was 14 ms against rippled's
+    /// 2.7 ms (2026-11-25). In WAL mode the read session runs beside it and
+    /// sees the last committed rows.
+    #[test]
+    fn wal_read_session_does_not_wait_for_the_writer() {
+        let dir = TempDir::new().expect("tempdir");
+        let db = DatabaseCon::new_at_path(
+            dir.path(),
+            "transaction.db",
+            &["PRAGMA journal_mode=WAL;".to_owned()],
+            TRANSACTION_DB_INIT,
+        )
+        .expect("database must initialize");
+        let count = |connection: &rusqlite::Connection| -> i64 {
+            connection
+                .query_row("SELECT COUNT(*) FROM Transactions", [], |row| row.get(0))
+                .expect("count")
+        };
+
+        let writer = db.get_session();
+        writer
+            .execute_batch(
+                "BEGIN; INSERT INTO Transactions (TransID, TransType) VALUES ('A', 'Payment');",
+            )
+            .expect("open write transaction");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let seen = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = sender.send(count(&db.get_read_session()));
+            });
+            let seen = receiver.recv_timeout(std::time::Duration::from_secs(5));
+            // Release the writer before the scope joins the reader, so a
+            // reader stuck on the main session finishes and the test fails
+            // instead of hanging.
+            writer.execute_batch("COMMIT;").expect("commit");
+            drop(writer);
+            seen
+        });
+        assert_eq!(
+            seen.expect("the read session must not wait for the writer"),
+            0,
+            "uncommitted rows are not visible"
+        );
+        assert_eq!(
+            count(&db.get_read_session()),
+            1,
+            "committed rows are visible"
+        );
     }
 
     #[test]

@@ -933,7 +933,7 @@ fn lookup_sql_transaction_by_hash<V: AppServerInfoView>(
         .app()
         .and_then(|app| app.relational_database().as_ref().cloned())
         .and_then(|relational| relational.transaction_db())?;
-    let connection = transaction_db.get_session();
+    let connection = transaction_db.get_read_session();
 
     let hash_text = hash.to_string();
     let row = connection
@@ -1298,7 +1298,7 @@ impl<V: AppServerInfoView> AccountTxSource for ApplicationServerInfo<V> {
             .and_then(|relational| relational.transaction_db());
 
         if let Some(transaction_db) = maybe_transaction_db {
-            let connection = transaction_db.get_session();
+            let connection = transaction_db.get_read_session();
             let sql = match (query.forward, query.marker) {
                 (true, Some(_)) => {
                     "SELECT a.LedgerSeq, a.TxnSeq, t.Status, t.RawTxn, t.TxnMeta \
