@@ -19,8 +19,10 @@ use std::time::{Duration, Instant};
 /// last ledger current at send time.
 pub type Item = (AccountID, u32, Box<dyn Fn(Common) -> Signed + Send + Sync>);
 
-/// Highest fee setup pays for one transaction (10 XRP).
-const SETUP_MAX_FEE: u64 = 10_000_000;
+/// Highest fee setup pays for one transaction (100 XRP). Setup runs with
+/// the default transaction queue, so fees escalate with ledger size and keep
+/// ledgers small enough for consensus; the funder can pay them.
+const SETUP_MAX_FEE: u64 = 100_000_000;
 
 pub const TEST_XRP: u64 = 200_000_000; // 200 XRP per test account
 const ISSUER_XRP: u64 = 1_000_000_000;

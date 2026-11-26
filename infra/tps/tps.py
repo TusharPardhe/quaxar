@@ -46,8 +46,9 @@ owner_reserve = 200000
 """
 
 
-# RippleX 2022 values that switch fee escalation off. Used only while the
-# test accounts and market are set up; measured runs use the default queue.
+# RippleX 2022 values that switch fee escalation off. Not used by default:
+# with escalation off, a setup flood built 46,000-transaction ledgers and
+# 15-36 s consensus rounds. Setup pays escalated fees instead.
 SETUP_TXQ = """[transaction_queue]
 minimum_txn_in_ledger = 4294967295
 target_txn_in_ledger = 4294967295
