@@ -3718,7 +3718,6 @@ fn serve_one_get_ledger_request(
             } else {
                 ledger.state_map()
             };
-            let fat_leaves = true; // rippled: fatLeaves{true} for both liTX_NODE and liAS_NODE
             let default_depth = if serving_peer
                 .as_ref()
                 .is_some_and(|peer| peer.is_high_latency())
@@ -3728,45 +3727,9 @@ fn serve_one_get_ledger_request(
                 1
             };
             let depth = req.message.query_depth.unwrap_or(default_depth); // rippled: kMaxQueryDepth=3
-
-            // rippled kSoftMaxReplyNodes = 8192: stop processing requested
-            // node IDs once we've accumulated this many output nodes.
-            const SOFT_MAX_REPLY_NODES: usize = 8192;
-
-            for node_id_bytes in &req.message.node_i_ds {
-                if nodes.len() >= SOFT_MAX_REPLY_NODES {
-                    break;
-                }
-                let Some(node_id) =
-                    shamap::nodes::node_id::deserialize_shamap_node_id(node_id_bytes)
-                else {
-                    continue;
-                };
-                let mut data: Vec<(shamap::nodes::node_id::SHAMapNodeId, Vec<u8>)> = Vec::new();
-                let mut fetch = |_h: basics::sha_map_hash::SHAMapHash| -> Option<
-                    basics::memory::intrusive_pointer::SharedIntrusive<
-                        shamap::nodes::tree_node::SHAMapTreeNode,
-                    >,
-                > { None };
-                if map
-                    .get_node_fat(node_id, &mut data, fat_leaves, depth, &mut fetch)
-                    .is_ok()
-                {
-                    for (nid, ndata) in &data {
-                        nodes.push(overlay::message::wire::TmLedgerNode {
-                            nodeid: Some(nid.get_raw_string()),
-                            nodedata: ndata.clone(),
-                            reference: None,
-                        });
-                        if nodes.len() >= HARD_MAX_REPLY_NODES {
-                            break;
-                        }
-                    }
-                }
-                if nodes.len() >= HARD_MAX_REPLY_NODES {
-                    break;
-                }
-            }
+            let store = root.node_fetcher_from_store();
+            let mut fetch = |hash| store.as_ref().and_then(|fetch| fetch(hash));
+            nodes = shamap_reply_nodes(map, &req.message.node_i_ds, depth, &mut fetch);
         }
         _ => return,
     }
@@ -3789,6 +3752,58 @@ fn serve_one_get_ledger_request(
     if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(req.peer_id) {
         peer.send(message);
     }
+}
+
+/// Nodes for one liTX_NODE / liAS_NODE reply, as rippled's
+/// `PeerImp::processLedgerRequest` builds them with `getNodeFat` (fat
+/// leaves, at most `HARD_MAX_REPLY_NODES`, no new requested node once
+/// 8192 are collected).
+///
+/// A ledger's backed maps can release child nodes and reload them from the
+/// node store. `fetch` must read the store, as rippled's `descendThrow`
+/// does; with no store, a request below a released node found nothing and
+/// the peer's request went unanswered.
+type SharedTreeNode =
+    basics::memory::intrusive_pointer::SharedIntrusive<shamap::nodes::tree_node::SHAMapTreeNode>;
+
+fn shamap_reply_nodes<F>(
+    map: &shamap::sync::SyncTree,
+    node_ids: &[Vec<u8>],
+    depth: u32,
+    fetch: &mut F,
+) -> Vec<overlay::message::wire::TmLedgerNode>
+where
+    F: FnMut(basics::sha_map_hash::SHAMapHash) -> Option<SharedTreeNode>,
+{
+    use shamap::nodes::node_id::deserialize_shamap_node_id;
+    const SOFT_MAX_REPLY_NODES: usize = 8192;
+    let mut nodes = Vec::new();
+    for node_id_bytes in node_ids {
+        if nodes.len() >= SOFT_MAX_REPLY_NODES {
+            break;
+        }
+        let Some(node_id) = deserialize_shamap_node_id(node_id_bytes) else {
+            continue;
+        };
+        let mut data = Vec::new();
+        let found = map.get_node_fat(node_id, &mut data, true, depth, fetch);
+        if found.is_ok() {
+            for (nid, ndata) in data {
+                nodes.push(overlay::message::wire::TmLedgerNode {
+                    nodeid: Some(nid.get_raw_string()),
+                    nodedata: ndata,
+                    reference: None,
+                });
+                if nodes.len() >= HARD_MAX_REPLY_NODES {
+                    break;
+                }
+            }
+        }
+        if nodes.len() >= HARD_MAX_REPLY_NODES {
+            break;
+        }
+    }
+    nodes
 }
 
 /// FetchPack requests use dedicated PeerImp/JtPack admission, rather than the
@@ -6156,6 +6171,64 @@ mod tests {
         assert!(check(&[("compression", "1")]).is_ok());
         assert!(check(&[("ledger_replay", "yes")]).is_err());
         assert!(check(&[("beta_rpc_api", "maybe")]).is_err());
+    }
+
+    /// A peer asks for state nodes of a ledger whose backed map has released
+    /// its children (they are in the node store only). The reply must read
+    /// them from the store. Before, a quaxar-only network could not serve
+    /// such ledgers: a validator that built a ledger alone left the others
+    /// unable to acquire it, and they never joined its chain.
+    #[test]
+    fn shamap_replies_read_released_nodes_from_the_store() {
+        use basics::base_uint::Uint256;
+        use basics::memory::intrusive_pointer::SharedIntrusive;
+        use basics::sha_map_hash::SHAMapHash;
+        use shamap::item::SHAMapItem;
+        use shamap::mutation::MutableTree;
+        use shamap::nodes::tree_node::SHAMapTreeNode;
+        use shamap::sync::{SHAMapType, SyncState, SyncTree};
+        use shamap::tree_node::SHAMapNodeType;
+        use std::collections::HashMap;
+
+        let mut tree = MutableTree::new(7);
+        for i in 0..64u64 {
+            let key = Uint256::from_array(*protocol::sha512_half(i.to_le_bytes()).data());
+            let item = SHAMapItem::new(key, vec![i as u8; 40]);
+            let added = tree.add_item(SHAMapNodeType::AccountState, item);
+            added.expect("leaf inserts");
+        }
+        tree.unshare();
+        // The node store: every node by hash, in prefix format.
+        let mut store: HashMap<SHAMapHash, Vec<u8>> = HashMap::new();
+        let mut stack = vec![tree.root()];
+        while let Some(node) = stack.pop() {
+            let raw = node.serialize_with_prefix().expect("serializes");
+            store.insert(node.get_hash(), raw);
+            if node.is_inner() {
+                for branch in 0..16 {
+                    if let Some(child) = node.get_child(branch) {
+                        stack.push(child);
+                    }
+                }
+            }
+        }
+        let root_hash = tree.root().get_hash();
+        // A root read back from the store has no children in memory.
+        let root = SHAMapTreeNode::make_from_prefix(&store[&root_hash], root_hash).expect("root");
+        let state = SyncState::Immutable;
+        let map = SyncTree::from_root_with_type(root, SHAMapType::State, true, 7, state);
+        let request = vec![shamap::nodes::node_id::SHAMapNodeId::default().get_raw_string()];
+
+        let mut no_store = |_: SHAMapHash| -> Option<SharedIntrusive<SHAMapTreeNode>> { None };
+        assert!(super::shamap_reply_nodes(&map, &request, 1, &mut no_store).is_empty());
+
+        let mut from_store = |hash: SHAMapHash| {
+            let raw = store.get(&hash)?;
+            SHAMapTreeNode::make_from_prefix(raw, hash).ok()
+        };
+        let nodes = super::shamap_reply_nodes(&map, &request, 1, &mut from_store);
+        assert!(nodes.len() > 1, "root and children, got {}", nodes.len());
+        assert!(nodes.iter().all(|n| n.nodeid.is_some()));
     }
 
     /// `[transaction_queue]` settings are `key = value` lines. They used to be
