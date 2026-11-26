@@ -1,0 +1,17 @@
+[package]
+name = "tps-loadgen"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone test tool, not a workspace member. Versions match the quaxar
+# Cargo.lock.
+[workspace]
+
+[dependencies]
+protocol = { path = "../../xrpl/protocol" }
+basics = { path = "../../xrpl/basics" }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time", "sync"] }
+tokio-tungstenite = "=0.28.0"
+futures = "0.3"
+serde_json = "1"

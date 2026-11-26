@@ -1,0 +1,16 @@
+[package]
+name = "tps-fork"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone test tool, not a workspace member. Versions match the quaxar
+# Cargo.lock (fjall as in tools/fjall-rebuild, rusqlite as in the rdb crate).
+[workspace]
+
+[dependencies]
+fjall = "=3.1.12"
+lsm-tree = "=3.1.10"
+rusqlite = { version = "0.31", features = ["bundled"] }
+protocol = { path = "../../xrpl/protocol" }
+basics = { path = "../../xrpl/basics" }
