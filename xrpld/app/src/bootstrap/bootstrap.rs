@@ -874,9 +874,9 @@ pub fn build_bootstrap_root(
         root.tx_q().set_standalone(true);
     }
     // Apply [transaction_queue] config overrides.
-    let txq_setup = parse_txq_setup(config);
     if config.exists("transaction_queue") {
-        root.tx_q().reconfigure_setup(txq_setup);
+        root.tx_q()
+            .reconfigure_setup(parse_txq_setup(config, options.standalone)?);
     }
     let _ = root.attach_default_resolver_runtime();
     // Construct LedgerMaster from the already-resolved node-size policy rather
@@ -5945,102 +5945,11 @@ fn configured_sweep_interval(config: &BasicConfig, default: u64) -> Result<u64, 
 
 /// Parse the `[transaction_queue]` config section.
 /// All fields are optional — unset fields use TxQSetup::default().
-fn parse_txq_setup(config: &BasicConfig) -> tx::TxQSetup {
-    use tx::TxQSetup;
-    let mut setup = TxQSetup::default();
-
-    if !config.exists("transaction_queue") {
-        return setup;
-    }
-
-    let section_values: Vec<(String, String)> = config
-        .section("transaction_queue")
-        .values()
-        .iter()
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.splitn(2, '=').collect();
-            if parts.len() == 2 {
-                Some((parts[0].trim().to_string(), parts[1].trim().to_string()))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    for (key, value) in &section_values {
-        match key.as_str() {
-            "ledgers_in_queue" => {
-                if let Ok(v) = value.parse::<usize>() {
-                    setup.ledgers_in_queue = v;
-                }
-            }
-            "minimum_queue_size" => {
-                if let Ok(v) = value.parse::<usize>() {
-                    setup.queue_size_min = v;
-                }
-            }
-            "retry_sequence_percent" => {
-                if let Ok(v) = value.parse::<u32>() {
-                    setup.retry_sequence_percent = v;
-                }
-            }
-            "minimum_txn_in_ledger" => {
-                if let Ok(v) = value.parse::<usize>() {
-                    setup.minimum_txn_in_ledger = v;
-                }
-            }
-            "minimum_txn_in_ledger_standalone" => {
-                if let Ok(v) = value.parse::<usize>() {
-                    setup.minimum_txn_in_ledger_standalone = v;
-                }
-            }
-            "target_txn_in_ledger" => {
-                if let Ok(v) = value.parse::<usize>() {
-                    setup.target_txn_in_ledger = v;
-                }
-            }
-            "maximum_txn_in_ledger" => {
-                if let Ok(v) = value.parse::<usize>() {
-                    setup.maximum_txn_in_ledger = Some(v);
-                }
-            }
-            "normal_consensus_increase_percent" => {
-                if let Ok(v) = value.parse::<u32>() {
-                    setup.normal_consensus_increase_percent = v.clamp(0, 1000);
-                }
-            }
-            "slow_consensus_decrease_percent" => {
-                if let Ok(v) = value.parse::<u32>() {
-                    setup.slow_consensus_decrease_percent = v.clamp(0, 100);
-                }
-            }
-            "maximum_txn_per_account" => {
-                if let Ok(v) = value.parse::<u32>() {
-                    setup.maximum_txn_per_account = v;
-                }
-            }
-            "minimum_last_ledger_buffer" => {
-                if let Ok(v) = value.parse::<u32>() {
-                    setup.minimum_last_ledger_buffer = v;
-                }
-            }
-            _ => {
-                tracing::warn!(target: "bootstrap", key, "Unknown [transaction_queue] config key");
-            }
-        }
-    }
-
-    // Validation: maximum must not be less than minimum
-    if let Some(max) = setup.maximum_txn_in_ledger {
-        if max < setup.minimum_txn_in_ledger {
-            panic!(
-                "The minimum number of low-fee transactions allowed per ledger \
-                 (minimum_txn_in_ledger={}) exceeds the maximum (maximum_txn_in_ledger={})",
-                setup.minimum_txn_in_ledger, max
-            );
-        }
-    }
-
+/// rippled `setup_TxQ`: the `[transaction_queue]` keys are `key = value`
+/// lines, so they are read through the section's key lookup by
+/// `tx::setup_txq`. A maximum below a minimum fails startup, as in rippled.
+fn parse_txq_setup(config: &BasicConfig, standalone: bool) -> Result<tx::TxQSetup, String> {
+    let setup = tx::setup_txq(config, standalone).map_err(|error| error.to_string())?;
     tracing::info!(target: "bootstrap",
         ledgers_in_queue = setup.ledgers_in_queue,
         queue_size_min = setup.queue_size_min,
@@ -6049,8 +5958,7 @@ fn parse_txq_setup(config: &BasicConfig) -> tx::TxQSetup {
         maximum_txn_per_account = setup.maximum_txn_per_account,
         "Loaded [transaction_queue] config"
     );
-
-    setup
+    Ok(setup)
 }
 
 fn config_path_search_max(config: &BasicConfig) -> u32 {
@@ -6248,6 +6156,32 @@ mod tests {
         assert!(check(&[("compression", "1")]).is_ok());
         assert!(check(&[("ledger_replay", "yes")]).is_err());
         assert!(check(&[("beta_rpc_api", "maybe")]).is_err());
+    }
+
+    /// `[transaction_queue]` settings are `key = value` lines. They used to be
+    /// read from the section's bare values, where such lines never appear,
+    /// so every setting was silently left at its default.
+    #[test]
+    fn transaction_queue_key_value_lines_are_applied() {
+        const Q: &str = "transaction_queue";
+        let config = legacy_config(&[
+            (Q, "minimum_txn_in_ledger = 4294967295"),
+            (Q, "target_txn_in_ledger = 4294967295"),
+            (Q, "normal_consensus_increase_percent = 5000"),
+            (Q, "maximum_txn_per_account = 21"),
+        ]);
+        let setup = super::parse_txq_setup(&config, false).expect("valid queue config");
+        assert_eq!(setup.minimum_txn_in_ledger, 4_294_967_295);
+        assert_eq!(setup.target_txn_in_ledger, 4_294_967_295);
+        // Clamped to 1000, as in rippled.
+        assert_eq!(setup.normal_consensus_increase_percent, 1000);
+        assert_eq!(setup.maximum_txn_per_account, 21);
+
+        let bad = legacy_config(&[
+            (Q, "minimum_txn_in_ledger = 50"),
+            (Q, "maximum_txn_in_ledger = 40"),
+        ]);
+        assert!(super::parse_txq_setup(&bad, false).is_err());
     }
 
     /// A token whose last base64 line ends in `=` padding must reach
