@@ -506,9 +506,13 @@ sudo systemctl start quaxar
 ```
 
 The tool's nodes options must match `keyspace_options` in
-`xrpld/nodestore/src/backends/fjall_backend.rs` (including
-`compaction_base_mb`). Keep the old directory until the node has run cleanly.
-Needs free disk of about twice the store size during compaction.
+`xrpld/nodestore/src/backends/fjall_backend.rs`. It creates the new store with
+`compaction_base_mb` from `FJALL_REBUILD_BASE_MB` (default `2048`, the quaxar
+default); set the same value in `[node_db]`. Keep the old directory until the
+node has run cleanly.
+Needs free disk of about twice the store size during compaction. The copy
+writes each node once and no tombstones, so a plain rebuild also removes all
+deleted entries.
 
 ### Dropping untracked nodes (`--reachable`)
 

@@ -43,17 +43,17 @@ ask() {
 }
 
 # IMPORTANT: [node_db] compaction_base_mb is fixed when the fjall store is
-# created. On a pruned node it must be about half the node store's live data,
+# created. On a pruned node it must be about a quarter of the node store's live data,
 # or deleted entries pile up and stall writes (docs/CONFIGURATION.md,
 # "Sizing compaction_base_mb"):
 #   live_MB ≈ state_MB + online_delete × ledger_MB
-#   compaction_base_mb ≈ live_MB ÷ 2, rounded up to a power of two (16..65536)
+#   compaction_base_mb ≈ live_MB ÷ 4, rounded up to a power of two (16..65536)
 # Full history (online_delete = 0) deletes nothing and uses 256.
 # state_MB and ledger_KB were measured in 2026-11 (mainnet) and 2026-10
 # (testnet); devnet uses the testnet values. Override with
 # QUAXAR_COMPACTION_BASE_MB.
 compute_compaction_base_mb() {
-    local network="$1" online_delete="$2" state_mb ledger_kb live_mb half base
+    local network="$1" online_delete="$2" state_mb ledger_kb live_mb quarter base
     if [ "$online_delete" = "0" ]; then
         echo 256
         return
@@ -63,9 +63,9 @@ compute_compaction_base_mb() {
         *)       state_mb=4500; ledger_kb=300 ;;
     esac
     live_mb=$(( state_mb + online_delete * ledger_kb / 1024 ))
-    half=$(( (live_mb + 1) / 2 ))
+    quarter=$(( (live_mb + 3) / 4 ))
     base=16
-    while [ "$base" -lt "$half" ] && [ "$base" -lt 65536 ]; do
+    while [ "$base" -lt "$quarter" ] && [ "$base" -lt 65536 ]; do
         base=$(( base * 2 ))
     done
     echo "$base"
@@ -814,8 +814,8 @@ path = $DB_PATH
 online_delete = $ONLINE_DELETE
 advisory_delete = $ADVISORY_DELETE
 reserve_mb = $RESERVE_MB
-# IMPORTANT: fixed when the store is created. Pruned nodes: about half the
-# node store's live data (see docs/CONFIGURATION.md "Sizing compaction_base_mb");
+# IMPORTANT: fixed when the store is created. Pruned nodes: about a quarter of
+# the node store's live data (see docs/CONFIGURATION.md "Sizing compaction_base_mb");
 # full history (online_delete = 0): 256. Rebuild the store to change it.
 compaction_base_mb = $COMPACTION_BASE_MB
 

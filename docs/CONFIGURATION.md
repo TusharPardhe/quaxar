@@ -127,7 +127,8 @@ Configures persistent ledger object storage.
 | `advisory_delete` | When enabled, pruning pauses at the advisory `can_delete` boundary. |
 | `cache_mb` | Block-cache budget for the fjall store, in MB. Defaults from `node_size`. |
 | `reserve_mb` | Disk-full ballast reserved at open, in MB; default `1024`, `0` disables. Released under disk pressure so compaction and deletes have room. |
-| `compaction_base_mb` | Size of the first leveled-compaction level of the node keyspace, in MB (`16`–`65536`, default `4096`). **Fixed when the store is created.** Pruned nodes must size it from their live data; see [Sizing `compaction_base_mb`](#sizing-compaction_base_mb) below. |
+| `journal_mb` | Cap on fjall's write-ahead journals, in MB; default `128`, minimum `64`. Past the cap fjall flushes the memtables holding the oldest journal. Takes effect on restart. |
+| `compaction_base_mb` | Size of the first leveled-compaction level of the node keyspace, in MB (`16`–`65536`, default `2048`). **Fixed when the store is created.** Pruned nodes must size it from their live data; see [Sizing `compaction_base_mb`](#sizing-compaction_base_mb) below. |
 | `delete_batch` | Relational cleanup batch size; default `100`. |
 | `back_off_milliseconds` | Delay between relational cleanup batches; default `100`. Legacy key `backOff` is also accepted. |
 
@@ -141,7 +142,8 @@ Configures persistent ledger object storage.
 
 **Why it matters.** The node store is an LSM tree: new writes go to level 0
 and are merged downward into larger levels. A delete writes a tombstone, and
-fjall can drop a tombstone only when it is merged into the bottom level. A
+fjall can drop an ordinary tombstone only when it is merged into the bottom
+level. A
 pruned node deletes every node that leaves the `online_delete` window, millions
 per day. Level targets grow ×10 from `compaction_base_mb`. If the base is
 small, the live data needs many levels, the level above the bottom never
@@ -149,11 +151,25 @@ reaches its target, and tombstones never get there. Measured on the mainnet
 validator (2026-11-01, base 64 MB): 8 GB of live data in a 46 GB store with
 575 million tombstones, and level 0 hitting fjall's 20-table write limit.
 
-**Formula.** Set the first level to about half of the node store's live data:
+**Weak tombstones.** Nodes are content-addressed and written once: storing a
+node that is already present writes nothing. Node deletes are therefore weak
+tombstones, which fjall drops together with the node when a compaction merges
+the two, at any level. A node written and deleted before its memtable is
+flushed leaves nothing on disk. Ordinary tombstones remain for the other
+keyspaces, whose keys are rewritten. Measured on the mainnet validator
+(2026-11-26, base 4096 MB, ordinary tombstones): the level above the bottom
+held 4.17 GB, 87% of its 44.7M entries tombstones, because at 3.9 GiB it
+stayed under its 4 GiB target and never merged into the bottom level.
+Weak tombstones are still dropped only when they meet their node, so a node
+from the bottom level keeps its tombstone in the level above until that level
+merges down. A smaller base merges sooner.
+
+**Formula.** Set the first level to about a quarter of the node store's live
+data:
 
 ```
 live_MB            ≈ state_MB + online_delete × ledger_MB
-compaction_base_mb ≈ live_MB ÷ 2, rounded up to a power of two
+compaction_base_mb ≈ live_MB ÷ 4, rounded up to a power of two
 ```
 
 | Input | Mainnet (2026-11) | How to measure on a running node |
@@ -163,19 +179,34 @@ compaction_base_mb ≈ live_MB ÷ 2, rounded up to a power of two
 
 | Network, `online_delete` | live data | `compaction_base_mb` |
 |---|---|---|
-| mainnet, 512 (default) | ≈ 7.9 GB | **4096** (the default) |
-| mainnet, 2,000 | ≈ 11.9 GB | 8192 |
-| mainnet, 10,000 | ≈ 33.5 GB | 32768 |
-| testnet or devnet, 256–512 | ≈ 4–6 GB | 2048–4096 (4096 above 4 GB) |
+| mainnet, 512 (default) | ≈ 7.9 GB | **2048** (the default) |
+| mainnet, 2,000 | ≈ 11.9 GB | 4096 |
+| mainnet, 10,000 | ≈ 33.5 GB | 16384 |
+| testnet or devnet, 256–512 | ≈ 4–6 GB | 1024–2048 (2048 above 4 GB) |
 | any network, `0` (full history) | grows without bound | **256** |
 
 **Healthy range.** A benchmark of the same write-once, delete-later pattern
 (250 MB live, values scaled) showed the store holding its size and level 0
 staying at 7 tables or fewer when the base was ¼ to 1× the live data. At 1/31
 the store kept growing and level 0 reached 26 tables; at 1/125 (the old 64 MB
-mainnet setting) writes halted. Halving or doubling the formula's value stays
-within the healthy range. A larger base means larger merges out of level 0
-(more disk writes), so do not set it far above the live data.
+mainnet setting) writes halted.
+
+With weak node tombstones, a second benchmark (2M keys, 290 MB live, 30,000
+steps of 370 deletes and 370 new keys, 3 MB memtable; 2026-11-26) measured
+the store's size against the base:
+
+| Base ÷ live | Mainnet equivalent | Tombstones | End size | Peak size | Peak L0 tables |
+|---|---|---|---|---|---|
+| 0.64 | 4096 | ordinary | 1.75× | 1.79× | 7 |
+| 0.64 | 4096 | weak | 1.69× | 1.76× | 5 |
+| 0.32 | 2048 | weak | 1.37× | 1.45× | 4 |
+| 0.16 | 1024 | weak | 1.26× | 1.28× | 4 |
+
+A smaller base keeps fewer stale entries because the levels above the bottom
+merge down sooner; the cost is more frequent merges into the bottom level.
+The quarter-of-live formula keeps the base at or above the ¼ ratio the
+watchdog checks. A larger base means larger merges out of level 0 (more disk
+writes), so do not set it far above the live data.
 
 **Installer.** `install.sh` computes the value from the chosen network and
 `online_delete` with this formula and writes it with an IMPORTANT comment.
@@ -186,7 +217,7 @@ build up and the ratio does not apply. Keep the base small (`256`): a large
 base would only make each merge rewrite more data.
 
 **Table size and the block cache.** fjall sizes each table at
-`compaction_base_mb ÷ 4` (1 GiB at the default). New stores write the node
+`compaction_base_mb ÷ 4` (512 MiB at the default). New stores write the node
 keyspace's index and filter blocks partitioned and pin only their small top
 levels, so a point read loads one 4 KiB index piece whatever the table size.
 Stores created before this change have one whole-table index per table, and

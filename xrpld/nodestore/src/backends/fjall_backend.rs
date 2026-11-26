@@ -56,11 +56,30 @@ fn read_reserve_bytes(section: &Section) -> u64 {
         .saturating_mul(1024 * 1024)
 }
 
+/// Default cap on fjall's write-ahead journals, in MB. fjall's own default
+/// is 512 MiB, which on the mainnet validator kept 360-560 MB of journals on
+/// disk. Past the cap fjall flushes the memtables that pin the oldest
+/// journal, so a smaller cap costs only earlier, smaller flushes.
+const DEFAULT_JOURNAL_MB: u64 = 128;
+/// fjall rejects journal caps under 64 MiB.
+const MIN_JOURNAL_MB: u64 = 64;
+
+/// Resolve `journal_mb` into bytes; values under 64 are raised to 64.
+fn read_journal_bytes(section: &Section) -> u64 {
+    section
+        .get::<u64>("journal_mb")
+        .ok()
+        .flatten()
+        .unwrap_or(DEFAULT_JOURNAL_MB)
+        .max(MIN_JOURNAL_MB)
+        .saturating_mul(1024 * 1024)
+}
+
 /// Default size of the first leveled-compaction level of the `nodes`
 /// keyspace, in MB. Sized for a pruned mainnet store (`online_delete = 512`,
-/// live node set ~8 GB in 2026-11): half the live data. See
+/// live node set ~8 GB in 2026-11): a quarter of the live data. See
 /// docs/CONFIGURATION.md for the formula; full-history stores should use 256.
-const DEFAULT_COMPACTION_BASE_MB: u64 = 4096;
+const DEFAULT_COMPACTION_BASE_MB: u64 = 2048;
 const COMPACTION_BASE_MB_RANGE: std::ops::RangeInclusive<u64> = 16..=65536;
 /// Pruned stores (`online_delete > 0`) delete every node that leaves the
 /// window, and fjall drops those tombstones only when they are merged into
@@ -100,7 +119,7 @@ fn read_table_target_bytes(section: &Section) -> Result<u64, String> {
 fn keyspace_options(keyspace: Keyspace, table_target_bytes: u64) -> KeyspaceCreateOptions {
     let options = KeyspaceCreateOptions::default();
     match keyspace {
-        // Tables are `compaction_base_mb / 4` (1 GiB at the 4096 default),
+        // Tables are `compaction_base_mb / 4` (512 MiB at the 2048 default),
         // so one whole-table index block is 10-20 MB. fjall partitions
         // indexes and filters only from canonical level 3, and the levelled
         // strategy writes our tables at canonical L1-L2, so without this
@@ -382,11 +401,12 @@ fn sizing_warning_applies(pruned: bool, base_bytes: u64, live_bytes: u64) -> boo
     pruned && base_undersized(base_bytes, live_bytes)
 }
 
-/// `compaction_base_mb` the docs recommend for `live_bytes`: half the live
-/// node set, rounded up to a power of two, within the accepted range.
+/// `compaction_base_mb` the docs recommend for `live_bytes`: a quarter of
+/// the live node set, rounded up to a power of two, within the accepted
+/// range. Rounding up keeps it at or above `MIN_BASE_TO_LIVE_RATIO`.
 fn recommended_base_mb(live_bytes: u64) -> u64 {
-    let half_mb = (live_bytes / 2).div_ceil(1024 * 1024).max(1);
-    half_mb
+    let quarter_mb = (live_bytes / 4).div_ceil(1024 * 1024).max(1);
+    quarter_mb
         .next_power_of_two()
         .clamp(*COMPACTION_BASE_MB_RANGE.start(), *COMPACTION_BASE_MB_RANGE.end())
 }
@@ -425,6 +445,8 @@ pub struct FjallBackend {
     reserve_bytes: u64,
     /// Target table size for the `nodes` keyspace (`compaction_base_mb / 4`).
     table_target_bytes: u64,
+    /// Cap on the write-ahead journals (`journal_mb`).
+    journal_bytes: u64,
     /// `online_delete > 0`: the store deletes nodes, so tombstones must reach
     /// the bottom level and the base-to-live ratio matters.
     pruned: bool,
@@ -457,6 +479,7 @@ impl FjallBackend {
             cache_bytes: read_cache_bytes(key_values),
             reserve_bytes: read_reserve_bytes(key_values),
             table_target_bytes: read_table_target_bytes(key_values)?,
+            journal_bytes: read_journal_bytes(key_values),
             pruned: key_values
                 .get::<u64>("online_delete")
                 .ok()
@@ -569,6 +592,7 @@ impl Backend for FjallBackend {
         let db = Database::builder(&self.path)
             .cache_size(self.cache_bytes)
             .worker_threads(fjall_worker_threads())
+            .max_journaling_size(self.journal_bytes)
             .open()
             .map_err(|error| Self::fjall_err("open", error))?;
         // Each keyspace is its own LSM-tree with bloom filters and LZ4 on.
@@ -675,14 +699,17 @@ impl Backend for FjallBackend {
     fn store(&self, object: Arc<NodeObject>) -> Result<(), String> {
         let open = self.open_db()?;
         let encoded = EncodedBlob::new(&object);
-        let tracking = self.fresh_write_tracking();
-        let fresh = tracking && self.node_absent(&open, object.hash())?;
         self.restore_watch
             .before_write(object.hash(), || encoded.get_data().to_vec());
+        // Nodes are written once (see `kv_write_batch`). The restore watch is
+        // marked first, so a prune racing this write still keeps the node.
+        if !self.node_absent(&open, object.hash())? {
+            return Ok(());
+        }
         open.nodes
             .insert(object.hash().as_slice(), encoded.get_data())
             .map_err(|error| Self::fjall_err("store", error))?;
-        if fresh {
+        if self.fresh_write_tracking() {
             self.record_fresh_writes(std::iter::once(*object.hash()));
         }
         Ok(())
@@ -707,14 +734,19 @@ impl Backend for FjallBackend {
         let open = self.open_db()?;
         let tracking = self.fresh_write_tracking();
         let mut fresh = Vec::new();
+        let mut written = std::collections::HashSet::new();
         let mut write = open.db.batch();
         for object in batch {
-            if tracking && self.node_absent(&open, object.hash())? {
-                fresh.push(*object.hash());
-            }
             let encoded = EncodedBlob::new(object);
             self.restore_watch
                 .before_write(object.hash(), || encoded.get_data().to_vec());
+            // Write-once, as in `store`; also within this batch.
+            if !self.node_absent(&open, object.hash())? || !written.insert(*object.hash()) {
+                continue;
+            }
+            if tracking {
+                fresh.push(*object.hash());
+            }
             write.insert(&open.nodes, object.hash().as_slice(), encoded.get_data());
         }
         write
@@ -819,6 +851,17 @@ impl Backend for FjallBackend {
                     value,
                 } => {
                     write.insert(open.handle(*keyspace), key.as_slice(), value.as_slice());
+                }
+                // Nodes are written once (see `store`), so their deletes are
+                // weak tombstones: a compaction that meets the node drops
+                // both, instead of carrying the tombstone down to the bottom
+                // level. Mainnet 2026-11-26: 87% of the level above the
+                // bottom (38.8M of 44.7M entries, 4.2 GB) were tombstones.
+                KvOp::Delete {
+                    keyspace: Keyspace::Nodes,
+                    key,
+                } => {
+                    write.remove_weak(open.handle(Keyspace::Nodes), key.as_slice());
                 }
                 KvOp::Delete { keyspace, key } => {
                     write.remove(open.handle(*keyspace), key.as_slice());
@@ -982,6 +1025,129 @@ mod tests {
         backend
     }
 
+    /// Every entry of `nodes` currently on disk or in the memtables,
+    /// counting each version and tombstone (fjall's approximate length).
+    fn node_versions(backend: &FjallBackend) -> usize {
+        backend.open_db().expect("open").nodes.approximate_len()
+    }
+
+    fn node_object(fill: u8) -> Arc<NodeObject> {
+        NodeObject::create_object(
+            NodeObjectType::AccountNode,
+            vec![fill; 40],
+            Uint256::from_array([fill; 32]),
+        )
+    }
+
+    /// Nodes are content-addressed and written once. Writing a node that is
+    /// already stored adds no second version, so a weak delete can never
+    /// uncover an older copy (`kv_write_batch`).
+    #[test]
+    fn storing_a_present_node_adds_no_version() {
+        use crate::backends::kv::{Keyspace, KvBatch};
+        let path = temp_path("write-once");
+        let mut cfg = section(&path);
+        cfg.set("reserve_mb", "0");
+        let backend = FjallBackend::new(&cfg, Arc::new(NullJournal)).expect("construct");
+        backend.open(true).expect("open");
+        let node = node_object(0x31);
+
+        backend.store(Arc::clone(&node)).expect("store");
+        let open = backend.open_db().expect("open");
+        open.nodes.rotate_memtable_and_wait().expect("flush");
+        backend.store(Arc::clone(&node)).expect("store again");
+        backend
+            .store_batch_result(&vec![Arc::clone(&node), Arc::clone(&node)])
+            .expect("batch with the same node twice");
+        assert_eq!(node_versions(&backend), 1, "one version of the node");
+
+        // A batch writes a new node once even when it appears twice.
+        let other = node_object(0x32);
+        backend
+            .store_batch_result(&vec![Arc::clone(&other), Arc::clone(&other)])
+            .expect("batch");
+        assert_eq!(node_versions(&backend), 2);
+
+        // The node deleted and stored again is readable.
+        let mut delete = KvBatch::new();
+        delete.delete(Keyspace::Nodes, node.hash().as_slice().to_vec());
+        backend.kv_write_batch(&delete).expect("delete");
+        assert!(backend.fetch(node.hash()).0.is_none());
+        backend.store(Arc::clone(&node)).expect("store again");
+        assert!(backend.fetch(node.hash()).0.is_some());
+        let _ = backend.close();
+    }
+
+    /// Node deletes are weak tombstones, which a compaction drops together
+    /// with the node. Other keyspaces keep ordinary tombstones: their keys
+    /// are rewritten.
+    #[test]
+    fn node_deletes_are_weak_tombstones() {
+        use crate::backends::kv::{Keyspace, KvBatch};
+        use fjall::AbstractTree;
+        let path = temp_path("weak-delete");
+        let mut cfg = section(&path);
+        cfg.set("reserve_mb", "0");
+        let backend = FjallBackend::new(&cfg, Arc::new(NullJournal)).expect("construct");
+        backend.open(true).expect("open");
+        let open = backend.open_db().expect("open");
+
+        // Written and deleted before a flush: the flush drops both.
+        let short_lived = node_object(0x40);
+        backend.store(Arc::clone(&short_lived)).expect("store");
+        let mut batch = KvBatch::new();
+        batch.delete(Keyspace::Nodes, short_lived.hash().as_slice().to_vec());
+        backend.kv_write_batch(&batch).expect("delete");
+        open.nodes.rotate_memtable_and_wait().expect("flush");
+        assert_eq!(node_versions(&backend), 0, "nothing is left");
+
+        // Deleted after it reached a table: the delete is a weak tombstone.
+        let node = node_object(0x41);
+        backend.store(Arc::clone(&node)).expect("store");
+        open.nodes.rotate_memtable_and_wait().expect("flush");
+        let mut batch = KvBatch::new();
+        batch.delete(Keyspace::Nodes, node.hash().as_slice().to_vec());
+        batch.put(Keyspace::Counts, vec![1; 32], vec![0; 4]);
+        batch.delete(Keyspace::Counts, vec![1; 32]);
+        backend.kv_write_batch(&batch).expect("delete");
+        open.nodes.rotate_memtable_and_wait().expect("flush nodes");
+        open.counts.rotate_memtable_and_wait().expect("flush");
+        let weak = |ks: &super::FjallKeyspace| -> (u64, u64) {
+            let version = ks.tree.current_version();
+            let mut tables = Vec::new();
+            for level in version.iter_levels() {
+                for run in level.iter() {
+                    tables.extend(run.iter().cloned());
+                }
+            }
+            (
+                tables.iter().map(|t| t.weak_tombstone_count()).sum(),
+                tables.iter().map(|t| t.tombstone_count()).sum(),
+            )
+        };
+        assert_eq!(weak(&open.nodes).0, 1, "the node delete is weak");
+        assert_eq!(weak(&open.counts).0, 0, "counts keeps ordinary tombstones");
+        assert!(backend.fetch(node.hash()).0.is_none());
+        let _ = backend.close();
+    }
+
+    /// `journal_mb` caps fjall's journals at 128 MiB by default (fjall's own
+    /// default is 512 MiB) and is raised to fjall's 64 MiB minimum.
+    #[test]
+    fn journal_mb_defaults_to_128_and_is_raised_to_64() {
+        use super::read_journal_bytes;
+        const MIB: u64 = 1024 * 1024;
+        let path = temp_path("journal-parse");
+        assert_eq!(read_journal_bytes(&section(&path)), 128 * MIB);
+        let mut cfg = section(&path);
+        cfg.set("journal_mb", "256");
+        assert_eq!(read_journal_bytes(&cfg), 256 * MIB);
+        cfg.set("journal_mb", "8");
+        assert_eq!(read_journal_bytes(&cfg), 64 * MIB);
+        cfg.set("journal_mb", "not a number");
+        assert_eq!(read_journal_bytes(&cfg), 128 * MIB);
+    }
+
     #[test]
     fn fjall_backend_requires_path() {
         let result = FjallBackend::new(&Section::new("node_db"), Arc::new(NullJournal));
@@ -1006,7 +1172,7 @@ mod tests {
         let path = temp_path("base-parse");
         assert_eq!(
             read_table_target_bytes(&section(&path)).expect("default"),
-            1024 * 1024 * 1024
+            512 * 1024 * 1024
         );
         let mut cfg = section(&path);
         cfg.set("compaction_base_mb", "64");
@@ -1102,8 +1268,8 @@ mod tests {
         const MB: u64 = 1024 * 1024;
         // Mainnet validator 2026-10-31: base 64 MB, live ~7.5 GB -> undersized.
         assert!(base_undersized(64 * MB, 7_500 * MB));
-        // The documented fix: base 4096 MB for that store is healthy.
-        assert!(!base_undersized(4096 * MB, 7_500 * MB));
+        // The documented fix: base 2048 MB for that store is healthy.
+        assert!(!base_undersized(2048 * MB, 7_500 * MB));
         // Boundary: exactly a quarter of the live data is still healthy.
         assert!(!base_undersized(2000 * MB, 8000 * MB));
         assert!(base_undersized(1999 * MB, 8000 * MB));
@@ -1112,10 +1278,12 @@ mod tests {
     }
 
     #[test]
-    fn recommended_base_is_half_live_rounded_to_a_power_of_two() {
+    fn recommended_base_is_a_quarter_of_live_rounded_to_a_power_of_two() {
         const MB: u64 = 1024 * 1024;
-        assert_eq!(recommended_base_mb(7_700 * MB), 4096); // mainnet, window 512
-        assert_eq!(recommended_base_mb(11_100 * MB), 8192); // window 2000
+        assert_eq!(recommended_base_mb(7_700 * MB), 2048); // mainnet, window 512
+        assert_eq!(recommended_base_mb(11_100 * MB), 4096); // window 2000
+        let mainnet = recommended_base_mb(7_700 * MB) * MB;
+        assert!(!base_undersized(mainnet, 7_700 * MB));
         assert_eq!(recommended_base_mb(0), 16); // floor of the accepted range
         assert_eq!(recommended_base_mb(500_000 * MB), 65536); // ceiling
     }

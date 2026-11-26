@@ -1,6 +1,7 @@
 //! Offline store rebuild: copy every live key of a stopped quaxar fjall store
 //! into a NEW store created with quaxar's current keyspace options
-//! (fjall_backend.rs `keyspace_options`, compaction_base_mb = 4096), so the
+//! (fjall_backend.rs `keyspace_options`, `compaction_base_mb` from
+//! `FJALL_REBUILD_BASE_MB`, default 2048), so the
 //! nodes keyspace gets partitioned, pinned indexes and filters (#135).
 //! Keys are read in order and written with fjall's bulk ingestion; deleted
 //! keys (tombstones) are not copied. Prints progress every 5 s.
@@ -32,16 +33,22 @@ fn env_or(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// The store's `compaction_base_mb` (`FJALL_REBUILD_BASE_MB`, default 2048,
+/// quaxar's default); fjall's table target is a quarter of it.
+fn table_target_bytes() -> u64 {
+    env_or("FJALL_REBUILD_BASE_MB", 2048) as u64 * 1024 * 1024 / 4
+}
+
 fn options(name: &str) -> KeyspaceCreateOptions {
     let o = KeyspaceCreateOptions::default();
     if name != "nodes" {
         return o;
     }
-    // Must match quaxar keyspace_options(Keyspace::Nodes, 4096 MB / 4).
+    // Must match quaxar keyspace_options(Keyspace::Nodes, base / 4).
     o.compaction_strategy(Arc::new(
         fjall::compaction::Leveled::default()
             .with_l0_threshold(4)
-            .with_table_target_size(4096 * 1024 * 1024 / 4),
+            .with_table_target_size(table_target_bytes()),
     ))
     .index_block_partitioning_policy(PartitioningPolicy::all(true))
     .filter_block_partitioning_policy(PartitioningPolicy::all(true))
@@ -146,7 +153,7 @@ fn copy_all(old: &Database, new: &Database, t0: Instant) {
 fn compact(db: &Database, t0: Instant) {
     use fjall::AbstractTree;
     let nodes = db.keyspace("nodes", KeyspaceCreateOptions::default).expect("nodes");
-    nodes.tree.major_compact(4096 * 1024 * 1024 / 4, u64::MAX >> 1).expect("major compaction");
+    nodes.tree.major_compact(table_target_bytes(), u64::MAX >> 1).expect("major compaction");
     db.persist(fjall::PersistMode::SyncAll).expect("persist");
     println!("major compaction done, nodes disk {:.2} GB, total {:.0} s", nodes.disk_space() as f64 / 1e9, t0.elapsed().as_secs_f64());
 }
