@@ -83,13 +83,16 @@ impl Setup {
         Ok(())
     }
 
-    /// Run a phase until it submits nothing.
+    /// Run a phase until it submits nothing. Stops with an error after
+    /// `MAX_ROUNDS` rounds in a row that leave as much to do as before.
     async fn repeat<F, Fut>(&self, name: &str, mut phase: F) -> Result<(), String>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<Vec<Item>, String>>,
     {
-        for round in 1..=MAX_ROUNDS {
+        let mut best = usize::MAX;
+        let mut stalled = 0;
+        for round in 1.. {
             let t = Instant::now();
             let items = phase().await?;
             if items.is_empty() {
@@ -97,6 +100,15 @@ impl Setup {
                 return Ok(());
             }
             let count = items.len();
+            if count < best {
+                best = count;
+                stalled = 0;
+            } else {
+                stalled += 1;
+                if stalled >= MAX_ROUNDS {
+                    return Err(format!("{name}: {count} still missing after {MAX_ROUNDS} rounds without progress"));
+                }
+            }
             let results = self.submit(items).await;
             let v = node::validated_index(self.pool.any()).await?;
             node::wait_validated(self.pool.any(), v + 3).await?;
@@ -105,7 +117,7 @@ impl Setup {
                 t.elapsed().as_secs_f64()
             ));
         }
-        Err(format!("{name}: still incomplete after {MAX_ROUNDS} rounds"))
+        unreachable!()
     }
 
     /// Submit in order at `rate` per second; one account's transactions go
@@ -199,15 +211,27 @@ impl Setup {
         node::query_all(&self.pool, accounts, request).await
     }
 
+    /// Issuer, market maker and hubs: create each, or top it up when its
+    /// balance is below half its target (a rerun with more test accounts
+    /// needs bigger hubs).
     async fn fund_core(&self, k: &Keys) -> Result<Vec<Item>, String> {
         let per_hub = TEST_XRP * u64::from(self.layout.tests.div_ceil(HUBS)) + 100_000_000;
         let mut wanted: Vec<(AccountID, u64)> = vec![(k.issuer.account, ISSUER_XRP), (k.mm.account, MM_XRP)];
         wanted.extend(k.hubs.iter().map(|h| (h.account, per_hub)));
         let accounts: Vec<AccountID> = wanted.iter().map(|w| w.0).collect();
-        let have = self.existing(&accounts).await?;
+        let replies = self
+            .query_all_(&accounts, |a| json!({"command": "account_info", "account": to_base58(*a), "ledger_index": "validated"}))
+            .await?;
         let mut seq = self.sequence(&self.funder).await?;
         let mut out: Vec<Item> = Vec::new();
-        for (account, drops) in wanted.into_iter().filter(|w| !have.contains(&w.0)) {
+        for ((account, drops), reply) in wanted.into_iter().zip(replies) {
+            let balance = reply
+                .pointer("/result/account_data/Balance")
+                .and_then(Value::as_str)
+                .and_then(|b| b.parse::<u64>().ok());
+            if balance.is_some_and(|b| b >= drops / 2) {
+                continue;
+            }
             let (funder, key) = (self.funder, Arc::clone(&k.funder_key));
             out.push((funder, seq, Box::new(move |c| tx::payment(funder, &key, account, xrp(drops), None, None, c))));
             seq += 1;
