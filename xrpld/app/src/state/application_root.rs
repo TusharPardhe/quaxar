@@ -107,6 +107,30 @@ use xrpl_core::{
 #[path = "application_root/replay_callback_impl.rs"]
 mod replay_callback_impl;
 
+/// rippled `OpenLedger::create`: the open view reads its parent through the
+/// application's `CachedSLEs`, so a ledger entry is parsed once and shared by
+/// every open-ledger apply until the cache sweeps it.
+///
+/// The cache is keyed by state-map leaf hash, which is final only in an
+/// immutable ledger. A ledger still being modified (a flag ledger's base after
+/// updateNegativeUNL) gets a private cache, so none of its entries is shared.
+fn cached_ledger(
+    ledger: Arc<Ledger>,
+    cached_sles: &Arc<ledger::CachedSles>,
+) -> Arc<ledger::CachedLedger> {
+    let cache = if ledger.is_immutable() {
+        Arc::clone(cached_sles)
+    } else {
+        Arc::new(ledger::CachedSles::new(
+            "MutableLedger",
+            0,
+            Duration::minutes(1),
+            basics::tagged_cache::MonotonicClock::default(),
+        ))
+    };
+    Arc::new(ledger::CachedView::with_cache(ledger, cache))
+}
+
 fn shared_transaction_id(transaction: &SharedTransaction) -> Uint256 {
     transaction
         .lock()
@@ -677,7 +701,8 @@ pub struct ApplicationRoot {
         Arc<std::sync::Mutex<std::collections::HashMap<protocol::AccountID, u32>>>,
     /// Persistent submit sandbox matching rippled's OpenView. Accumulates state changes
     /// across submit calls within the same open ledger period. Reset on ledger_accept.
-    open_ledger_sandbox: Arc<std::sync::Mutex<Option<Sandbox<ledger::OpenView<Ledger>>>>>,
+    open_ledger_sandbox:
+        Arc<std::sync::Mutex<Option<Sandbox<ledger::OpenView<ledger::CachedLedger>>>>>,
     /// Close gate: serializes on_close's apply+capture with NetworkOPs batch
     /// application. rippled protects this work with its application and ledger
     /// locks; the Rust runtime uses this narrow gate around the same mutable
@@ -1384,14 +1409,15 @@ fn batch_preclaim_ter(view: &impl ReadView, tx: &STTx, _flags: ApplyFlags) -> Te
 
 #[derive(Debug)]
 struct PersistentSubmitSandbox {
-    holder: Arc<std::sync::Mutex<Option<Sandbox<ledger::OpenView<Ledger>>>>>,
-    sandbox: Option<Sandbox<ledger::OpenView<Ledger>>>,
+    holder: Arc<std::sync::Mutex<Option<Sandbox<ledger::OpenView<ledger::CachedLedger>>>>>,
+    sandbox: Option<Sandbox<ledger::OpenView<ledger::CachedLedger>>>,
 }
 
 impl PersistentSubmitSandbox {
     fn take_or_new(
-        holder: Arc<std::sync::Mutex<Option<Sandbox<ledger::OpenView<Ledger>>>>>,
+        holder: Arc<std::sync::Mutex<Option<Sandbox<ledger::OpenView<ledger::CachedLedger>>>>>,
         base: Arc<Ledger>,
+        cached_sles: &Arc<ledger::CachedSles>,
     ) -> Self {
         let base_header = base.header();
         let sandbox = holder
@@ -1413,7 +1439,10 @@ impl PersistentSubmitSandbox {
             .unwrap_or_else(|| {
                 let rules = base.rules().clone();
                 Sandbox::new(
-                    Arc::new(ledger::OpenView::new_open(base, rules)),
+                    Arc::new(ledger::OpenView::new_open(
+                        cached_ledger(base, cached_sles),
+                        rules,
+                    )),
                     ApplyFlags::NONE,
                 )
             });
@@ -1423,7 +1452,7 @@ impl PersistentSubmitSandbox {
         }
     }
 
-    fn view_mut(&mut self) -> &mut Sandbox<ledger::OpenView<Ledger>> {
+    fn view_mut(&mut self) -> &mut Sandbox<ledger::OpenView<ledger::CachedLedger>> {
         self.sandbox
             .as_mut()
             .expect("persistent submit sandbox must be present while applying")
@@ -1453,16 +1482,26 @@ mod persistent_submit_sandbox_tests {
 
     #[test]
     fn rebases_parent_close_time_when_submit_lcl_advances() {
-        let holder: Arc<Mutex<Option<Sandbox<OpenView<Ledger>>>>> = Arc::new(Mutex::new(None));
+        let holder: Arc<Mutex<Option<Sandbox<OpenView<ledger::CachedLedger>>>>> =
+            Arc::new(Mutex::new(None));
+        let cache = Arc::new(ledger::CachedSles::new(
+            "test",
+            0,
+            time::Duration::minutes(1),
+            basics::tagged_cache::MonotonicClock::default(),
+        ));
         let initial = Arc::new(Ledger::from_ledger_seq_and_close_time(1, 0, false));
         {
-            let mut sandbox =
-                PersistentSubmitSandbox::take_or_new(Arc::clone(&holder), Arc::clone(&initial));
+            let mut sandbox = PersistentSubmitSandbox::take_or_new(
+                Arc::clone(&holder),
+                Arc::clone(&initial),
+                &cache,
+            );
             assert_eq!(sandbox.view_mut().header().parent_close_time, 0);
         }
 
         let lcl = Arc::new(Ledger::from_ledger_seq_and_close_time(2, 1_000, false));
-        let mut sandbox = PersistentSubmitSandbox::take_or_new(holder, Arc::clone(&lcl));
+        let mut sandbox = PersistentSubmitSandbox::take_or_new(holder, Arc::clone(&lcl), &cache);
         let header = sandbox.view_mut().header();
         assert_eq!(header.parent_hash, lcl.header().hash);
         assert_eq!(header.parent_close_time, lcl.header().close_time);
@@ -5396,6 +5435,12 @@ impl ApplicationRoot {
         was_notified
     }
 
+    /// rippled `Application::cachedSLEs`: parsed ledger entries shared by
+    /// every open-ledger view, keyed by their state-map leaf hash.
+    pub fn cached_sles(&self) -> &Arc<ledger::CachedSles> {
+        &self.registry.cached_sles
+    }
+
     pub fn job_queue(&self) -> &JobQueue {
         &self.job_queue
     }
@@ -5541,7 +5586,7 @@ impl ApplicationRoot {
             .unwrap_or_else(|| {
                 Sandbox::new(
                     Arc::new(ledger::OpenView::new_open(
-                        Arc::clone(&ledger),
+                        cached_ledger(Arc::clone(&ledger), &self.registry.cached_sles),
                         ledger.rules().clone(),
                     )),
                     ApplyFlags::DRY_RUN,
@@ -5714,7 +5759,7 @@ impl ApplicationRoot {
         let mut retries = Vec::<AppOpenLedgerTxRecord>::new();
         let rebase_view = std::cell::RefCell::new(Sandbox::new(
             Arc::new(ledger::OpenView::new_open(
-                Arc::clone(&parent),
+                cached_ledger(Arc::clone(&parent), &self.registry.cached_sles),
                 parent.rules().clone(),
             )),
             ApplyFlags::NONE,
@@ -6024,7 +6069,7 @@ impl ApplicationRoot {
         );
         let rebase_view = std::cell::RefCell::new(Sandbox::new(
             Arc::new(ledger::OpenView::new_open(
-                Arc::clone(&parent),
+                cached_ledger(Arc::clone(&parent), &self.registry.cached_sles),
                 parent.rules().clone(),
             )),
             ApplyFlags::NONE,
@@ -7854,6 +7899,7 @@ impl ApplicationRoot {
         let state_ledger = Arc::clone(&base_ledger);
         let account_seqs = Arc::clone(&self.open_ledger_account_seqs);
         let sandbox_holder = Arc::clone(&self.open_ledger_sandbox);
+        let cached_sles = Arc::clone(&self.registry.cached_sles);
 
         self.apply_network_ops_pending_batch_with(
             current_ledger_index,
@@ -7871,6 +7917,7 @@ impl ApplicationRoot {
                 let mut submit_view = PersistentSubmitSandbox::take_or_new(
                     Arc::clone(&sandbox_holder),
                     Arc::clone(&base_ledger),
+                    &cached_sles,
                 );
                 let _ = open_ledger.modify(|view| {
                     for entry in transactions.iter_mut() {
@@ -11375,8 +11422,13 @@ impl ApplicationRoot {
             .unwrap_or_else(|| {
                 Ledger::from_ledger_seq_and_close_time(closed_seq, close_time, false).header()
             });
+        // rippled's buildLedger reads the parent directly. Reading it through
+        // the open ledger's CachedSLEs gives the same entries (the cache is
+        // keyed by leaf hash, so a hit is byte-identical to a fresh parse) and
+        // reuses the parses made while these transactions entered the open
+        // ledger on the same parent.
         let state_view = std::sync::Mutex::new(ledger::ApplyViewImpl::new_with_header(
-            Arc::clone(&state_view_base),
+            cached_ledger(Arc::clone(&state_view_base), &self.registry.cached_sles),
             application_header,
             protocol::ApplyFlags::NONE,
         ));

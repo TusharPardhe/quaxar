@@ -1480,9 +1480,12 @@ impl ApplicationRegistryOwners {
             MonotonicClock::default(),
         ));
 
+        // rippled Application.cpp: `cachedSLEs_("Cached SLEs", 0,
+        // std::chrono::minutes(1), ...)` -- no size target, one-minute age,
+        // swept by doSweep.
         let cached_sles = Arc::new(CachedSles::new(
             "CachedSLEs",
-            16384,
+            0,
             TimeDuration::minutes(1),
             MonotonicClock::default(),
         ));

@@ -90,6 +90,7 @@ trait ApplicationSweepActions {
     fn sweep_ledger_master(&self);
     fn sweep_transaction_master(&self);
     fn expire_validations(&self);
+    fn sweep_cached_sles(&self);
     fn trim_allocator(&self);
 }
 
@@ -105,6 +106,8 @@ fn run_application_sweep<C>(
     actions.sweep_ledger_master();
     actions.sweep_transaction_master();
     actions.expire_validations();
+    // rippled doSweep sweeps `cachedSLEs_` last, just before mallocTrim.
+    actions.sweep_cached_sles();
     // Keep allocator purging after every cache/lifecycle sweep, as rippled's
     // ApplicationImp::doSweep does.
     actions.trim_allocator();
@@ -168,6 +171,12 @@ impl ApplicationSweepActions for ProductionApplicationSweep<'_> {
         // Application::doSweep expires validation maps on the same configured
         // SweepInterval; without it, historical validation sets never age out.
         self.root.expire_validations();
+    }
+
+    fn sweep_cached_sles(&self) {
+        // The open ledger reads its parent through this cache
+        // (`OpenLedger::create`); doSweep expires it.
+        self.root.cached_sles().sweep();
     }
 
     fn trim_allocator(&self) {
@@ -6514,6 +6523,10 @@ mod tests {
             self.actions.borrow_mut().push("validations");
         }
 
+        fn sweep_cached_sles(&self) {
+            self.actions.borrow_mut().push("cached_sles");
+        }
+
         fn trim_allocator(&self) {
             self.actions.borrow_mut().push("allocator_trim");
         }
@@ -6550,6 +6563,7 @@ mod tests {
                 "ledger_master",
                 "transaction_master",
                 "validations",
+                "cached_sles",
                 "allocator_trim",
             ]
         );
