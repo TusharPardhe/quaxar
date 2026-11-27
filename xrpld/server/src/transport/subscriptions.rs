@@ -165,6 +165,24 @@ impl SubscriptionManager {
         }
     }
 
+    /// Whether any client currently receives `stream`, so a publisher can
+    /// skip building a payload nobody reads.
+    pub fn has_subscribers(&self, stream: StreamKind) -> bool {
+        let sender = match stream {
+            StreamKind::Ledger => &self.ledger,
+            StreamKind::LedgerDelta => &self.ledger_delta,
+            StreamKind::Transactions => &self.transactions,
+            StreamKind::TransactionsProposed => &self.transactions_proposed,
+            StreamKind::BookChanges => &self.book_changes,
+            StreamKind::Server => &self.server,
+            StreamKind::Manifests => &self.manifests,
+            StreamKind::Validations => &self.validations,
+            StreamKind::PeerStatus => &self.peer_status,
+            StreamKind::Consensus => &self.consensus,
+        };
+        sender.receiver_count() != 0
+    }
+
     pub fn publish(&self, event: SubscriptionEvent) -> usize {
         let stream = event.stream;
         let subscriber_count = match stream {

@@ -616,6 +616,10 @@ pub struct ApplicationRoot {
     published_server_ports: Option<Arc<dyn PublishedServerPortsSource>>,
     status_metrics: Option<Arc<dyn StatusMetricsSource>>,
     ledger_delta_publisher: Option<Arc<dyn Fn(protocol::JsonValue) + Send + Sync + 'static>>,
+    /// Whether the `ledger_delta` stream has a subscriber. The stream is
+    /// quaxar-only (rippled has none), so its per-transaction metadata JSON
+    /// is built only while someone reads it.
+    ledger_delta_wanted: Option<Arc<dyn Fn() -> bool + Send + Sync + 'static>>,
     /// Callback to notify WebSocket subscribers when a ledger closes.
     /// Wired to SubscriptionManager::publish_json(StreamKind::Ledger, ...).
     ledger_close_publisher: Option<Arc<dyn Fn(protocol::JsonValue) + Send + Sync + 'static>>,
@@ -2037,7 +2041,8 @@ struct StandaloneAcceptedTx {
     transaction_id: Uint256,
     txn: Arc<Serializer>,
     metadata: Arc<Serializer>,
-    delta_meta_nodes: protocol::JsonValue,
+    /// `ledger_delta` payload; `None` when the stream had no subscriber.
+    delta_meta_nodes: Option<protocol::JsonValue>,
 }
 
 /// An inner transaction that reached the applied (`tes*` or `tec*`) state in
@@ -4473,13 +4478,15 @@ fn stage_accepted_batch_inner_transactions(
     accepted_entries: &mut Vec<StandaloneAcceptedTx>,
     inner_transactions: Vec<AppliedBatchInnerTransaction>,
     closed_seq: u32,
+    delta_json: bool,
 ) {
     for inner in inner_transactions {
         let index = accepted_entries.len() as u32;
         let transaction_id = inner.transaction.get_transaction_id();
         let mut meta = inner.metadata;
         debug_assert_eq!(meta.get_lgr_seq(), closed_seq);
-        let delta_meta_nodes = meta.get_nodes().json(protocol::JsonOptions::NONE);
+        let delta_meta_nodes =
+            delta_json.then(|| meta.get_nodes().json(protocol::JsonOptions::NONE));
         let mut serializer = protocol::Serializer::default();
         meta.add_raw(&mut serializer, inner.result, index);
 
@@ -5168,6 +5175,7 @@ impl ApplicationRoot {
             published_server_ports: None,
             status_metrics: Some(Arc::clone(&perf_log) as Arc<dyn StatusMetricsSource>),
             ledger_delta_publisher: None,
+            ledger_delta_wanted: None,
             ledger_close_publisher: None,
             transaction_publisher: None,
             shared_subscription_manager,
@@ -7235,8 +7243,19 @@ impl ApplicationRoot {
     pub fn set_ledger_delta_publisher(
         &mut self,
         publisher: impl Fn(protocol::JsonValue) + Send + Sync + 'static,
+        wanted: impl Fn() -> bool + Send + Sync + 'static,
     ) {
         self.ledger_delta_publisher = Some(Arc::new(publisher));
+        self.ledger_delta_wanted = Some(Arc::new(wanted));
+    }
+
+    /// A ledger built now must carry `ledger_delta` metadata JSON.
+    fn ledger_delta_wanted(&self) -> bool {
+        self.ledger_delta_publisher.is_some()
+            && self
+                .ledger_delta_wanted
+                .as_ref()
+                .is_none_or(|wanted| wanted())
     }
 
     pub fn set_ledger_close_publisher(
@@ -10902,6 +10921,7 @@ impl ApplicationRoot {
         );
 
         let mut accepted_entries = Vec::new();
+        let delta_json = self.ledger_delta_wanted();
         for st_tx in &open_txs {
             let txn_type = st_tx.get_txn_type();
             // `../rippled/src/xrpld/app/ledger/detail/BuildLedger.cpp::buildLedger`
@@ -10977,7 +10997,8 @@ impl ApplicationRoot {
                             )
                         })?
                 };
-                let delta_meta_nodes = meta.get_nodes().json(protocol::JsonOptions::NONE);
+                let delta_meta_nodes =
+                    delta_json.then(|| meta.get_nodes().json(protocol::JsonOptions::NONE));
                 let mut serializer = protocol::Serializer::default();
                 meta.add_raw(&mut serializer, result, accepted_entries.len() as u32);
 
@@ -10993,6 +11014,7 @@ impl ApplicationRoot {
                     &mut accepted_entries,
                     applied_batch_inner_transactions,
                     closed_seq,
+                    delta_json,
                 );
             }
         }
@@ -11320,6 +11342,7 @@ impl ApplicationRoot {
 
         let _ = self.apply_held_transactions_to_network_ops(next_open_parent_hash, |_sync| {});
         let mut accepted_entries = Vec::new();
+        let delta_json = self.ledger_delta_wanted();
         // rippled BuildLedger retries once while progress is possible, then
         // performs a final non-retry pass that classifies remaining TERs as
         // failures. Use the shared OpenLedger/BuildLedger parity constants.
@@ -11646,7 +11669,8 @@ impl ApplicationRoot {
                 let mut meta = transaction_meta.expect(
                     "accepted consensus transaction must retain its pre-commit state delta",
                 );
-                let delta_meta_nodes = meta.get_nodes().json(protocol::JsonOptions::NONE);
+                let delta_meta_nodes =
+                    delta_json.then(|| meta.get_nodes().json(protocol::JsonOptions::NONE));
                 let mut serializer = protocol::Serializer::default();
                 meta.add_raw(&mut serializer, result, index as u32);
 
@@ -11662,6 +11686,7 @@ impl ApplicationRoot {
                     &mut accepted_entries,
                     applied_batch_inner_transactions,
                     closed_seq,
+                    delta_json,
                 );
             }
 
@@ -11779,14 +11804,16 @@ impl ApplicationRoot {
                 Some(self.registry.network_id_service.get_network_id()),
             );
 
-            if let Some(publisher) = &self.ledger_delta_publisher {
+            if let (Some(publisher), Some(delta_meta_nodes)) =
+                (&self.ledger_delta_publisher, &entry.delta_meta_nodes)
+            {
                 let mut tx_json = protocol::JsonValue::Object(std::collections::BTreeMap::new());
                 if let protocol::JsonValue::Object(map) = &mut tx_json {
                     map.insert(
                         "transaction".to_string(),
                         protocol::JsonValue::String(entry.transaction_id.to_string()),
                     );
-                    map.insert("meta".to_string(), entry.delta_meta_nodes.clone());
+                    map.insert("meta".to_string(), delta_meta_nodes.clone());
                 }
                 let mut delta_msg = protocol::JsonValue::Object(std::collections::BTreeMap::new());
                 if let protocol::JsonValue::Object(map) = &mut delta_msg {

@@ -1582,9 +1582,13 @@ fn build_composed_runtime_from_path(
         if let Some(overlay_runtime) = root.overlay_runtime() {
             let subscriptions = server_build.runtime.subscriptions();
             let subs_clone = subscriptions.clone();
-            root.set_ledger_delta_publisher(move |payload| {
-                subs_clone.publish_json(server::StreamKind::LedgerDelta, payload);
-            });
+            let subs_wanted = subscriptions.clone();
+            root.set_ledger_delta_publisher(
+                move |payload| {
+                    subs_clone.publish_json(server::StreamKind::LedgerDelta, payload);
+                },
+                move || subs_wanted.has_subscribers(server::StreamKind::LedgerDelta),
+            );
             overlay_runtime
                 .overlay()
                 .set_peer_status_publisher(move |payload| {

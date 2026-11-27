@@ -4447,6 +4447,54 @@ fn consensus_build_discards_transaction_with_consumed_parent_sequence() {
 }
 
 #[test]
+fn ledger_delta_metadata_is_built_only_for_subscribers() {
+    // `ledger_delta` is a quaxar-only stream. rippled's buildLedger builds no
+    // per-transaction JSON, so the consensus build must not either unless a
+    // client reads the stream.
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    for subscribed in [false, true] {
+        let mut app = ApplicationRoot::new(0).expect("root shell should build");
+        let published = Arc::new(AtomicUsize::new(0));
+        let wanted = Arc::new(AtomicBool::new(subscribed));
+        let (counter, flag) = (Arc::clone(&published), Arc::clone(&wanted));
+        app.set_ledger_delta_publisher(
+            move |payload| {
+                let protocol::JsonValue::Object(map) = payload else {
+                    panic!("ledger delta must be an object");
+                };
+                assert!(map.contains_key("transaction"));
+                counter.fetch_add(1, Ordering::Relaxed);
+            },
+            move || flag.load(Ordering::Relaxed),
+        );
+        let destination = account("00000000000000000000000000000000000000AE");
+        let (source, payment) = signed_payment_tx(0x16, destination, 1, 10);
+        let mut parent =
+            ledger_view_with_balance_and_owner_count(11, source, 1, 1_000_000_000, 0, &[]);
+        parent.set_total_drops(1_000_000_000);
+        let parent = Arc::new(parent);
+        let outcome = app
+            .accept_ledger_with_txns_outcome_from_consensus_parent(
+                Arc::clone(&parent),
+                12,
+                1_012,
+                LEDGER_DEFAULT_TIME_RESOLUTION,
+                true,
+                parent.fees().base,
+                vec![Arc::clone(&payment)],
+                false,
+            )
+            .expect("consensus build should complete");
+        assert!(outcome.closed.tx_exists(payment.get_transaction_id()));
+        assert_eq!(
+            published.load(Ordering::Relaxed),
+            usize::from(subscribed),
+            "subscribed={subscribed}"
+        );
+    }
+}
+
+#[test]
 fn consensus_build_rejects_invalid_signature_before_mutation() {
     let app = ApplicationRoot::new(0).expect("root shell should build");
     let source = account("00000000000000000000000000000000000000AC");
