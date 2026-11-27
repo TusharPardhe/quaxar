@@ -107,6 +107,13 @@ use xrpl_core::{
 #[path = "application_root/replay_callback_impl.rs"]
 mod replay_callback_impl;
 
+fn shared_transaction_id(transaction: &SharedTransaction) -> Uint256 {
+    transaction
+        .lock()
+        .expect("transaction mutex must not be poisoned")
+        .get_id()
+}
+
 fn to_nodestore_type(object_type: LedgerNodeObjectType) -> nodestore::NodeObjectType {
     match object_type {
         LedgerNodeObjectType::AccountNode => nodestore::NodeObjectType::AccountNode,
@@ -7912,8 +7919,24 @@ impl ApplicationRoot {
             |tx, result| {
                 let _ = self.publish_proposed_transaction(tx, result);
             },
-            |_tx| {},
-            |_tx| false,
+            // NetworkOPsImp::apply: `if (isTemMalformed(e.result))
+            // hashRouter.setFlags(id, HashRouterFlags::BAD)`.
+            |tx| {
+                let _ = self
+                    .registry
+                    .hash_router
+                    .set_flags(shared_transaction_id(tx), xrpl_core::HashRouterFlags::BAD);
+            },
+            // NetworkOPsImp::apply holds a retry-class network transaction
+            // once: `setFlags(id, HashRouterFlags::HELD)` returns true only
+            // when HELD was not already set. A relayed transaction that
+            // arrives ahead of its predecessor (terPRE_SEQ) is then retried
+            // when the predecessor applies, instead of being dropped.
+            |tx| {
+                self.registry
+                    .hash_router
+                    .set_flags(shared_transaction_id(tx), xrpl_core::HashRouterFlags::HELD)
+            },
             |tx| {
                 // reference: hashRouter.shouldRelay(txID) → Optional<set<PeerId>>
                 let tx_id = tx

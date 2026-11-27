@@ -2790,6 +2790,110 @@ fn application_root_applies_network_ops_pending_to_open_ledger_through_app_txq_r
 }
 
 #[test]
+fn network_transaction_ahead_of_its_predecessor_is_held_once() {
+    // rippled NetworkOPsImp::apply holds a network (non-local) retry-class
+    // result once, through HashRouter::setFlags(id, HELD). A relayed payment
+    // that arrives before the payment with the previous sequence must be
+    // retried when that predecessor applies, not dropped.
+    let mut app = ApplicationRoot::new(0).expect("root shell should build");
+    let runtime = app.attach_default_network_ops_runtime();
+    let destination = account("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC");
+    let (source, early) = signed_payment_tx(0x14, destination, 2, 11);
+
+    let mut parent = ledger_view_with_balance_and_owner_count(1, source, 1, 1_000_000_000, 0, &[]);
+    parent.set_accepted(1_111, ledger::LEDGER_DEFAULT_TIME_RESOLUTION, true);
+    let parent = Arc::new(parent);
+    app.on_closed_ledger(Arc::clone(&parent));
+    let _ = app.open_ledger().modify(|view| {
+        *view = AppOpenLedgerView::with_parent_hash(2, 10, *parent.header().hash.as_uint256());
+        true
+    });
+
+    let stage = |tx: &Arc<STTx>| {
+        let mut shared = Arc::new(Mutex::new(Transaction::new(Arc::clone(tx))));
+        app.canonicalize_transaction(&mut shared);
+        assert!(runtime.stage_transaction(shared, false, false, false));
+    };
+
+    stage(&early);
+    let report = app
+        .apply_network_ops_pending_to_open_ledger()
+        .expect("pending batch should apply to open ledger");
+    assert_eq!(report.entries[0].result, Ter::TER_PRE_SEQ, "{report:?}");
+    assert!(
+        matches!(
+            report.entries[0].retry_hold_branch,
+            Some(crate::network::network_ops::NetworkOpsRetryHoldBranch::Held { .. })
+        ),
+        "{report:?}"
+    );
+    assert_eq!(app.held_transaction_count(), Some(1));
+    assert!(xrpl_core::any(
+        app.registry
+            .hash_router
+            .get_flags(early.get_transaction_id())
+            & xrpl_core::HashRouterFlags::HELD
+    ));
+
+    // Held once only: the same network transaction failing again is dropped.
+    stage(&early);
+    let report = app
+        .apply_network_ops_pending_to_open_ledger()
+        .expect("pending batch should apply to open ledger");
+    assert!(
+        matches!(
+            report.entries[0].retry_hold_branch,
+            Some(crate::network::network_ops::NetworkOpsRetryHoldBranch::NotHeld { .. })
+        ),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn malformed_network_transaction_is_marked_bad() {
+    // rippled NetworkOPsImp::apply: `if (isTemMalformed(e.result))
+    // setFlags(id, HashRouterFlags::BAD)`, so a resubmission is rejected
+    // before it reaches the open ledger again.
+    let mut app = ApplicationRoot::new(0).expect("root shell should build");
+    let runtime = app.attach_default_network_ops_runtime();
+    let source = signed_payment_tx(
+        0x15,
+        account("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"),
+        1,
+        10,
+    )
+    .0;
+    // A payment to its own source with XRP is temREDUNDANT (tem malformed).
+    let (_, redundant) = signed_payment_tx(0x15, source, 1, 10);
+
+    let mut parent = ledger_view_with_balance_and_owner_count(1, source, 1, 1_000_000_000, 0, &[]);
+    parent.set_accepted(1_111, ledger::LEDGER_DEFAULT_TIME_RESOLUTION, true);
+    let parent = Arc::new(parent);
+    app.on_closed_ledger(Arc::clone(&parent));
+    let _ = app.open_ledger().modify(|view| {
+        *view = AppOpenLedgerView::with_parent_hash(2, 10, *parent.header().hash.as_uint256());
+        true
+    });
+    let mut shared = Arc::new(Mutex::new(Transaction::new(Arc::clone(&redundant))));
+    app.canonicalize_transaction(&mut shared);
+    assert!(runtime.stage_transaction(shared, false, false, false));
+
+    let report = app
+        .apply_network_ops_pending_to_open_ledger()
+        .expect("pending batch should apply to open ledger");
+    assert!(
+        protocol::is_tem_malformed(report.entries[0].result),
+        "{report:?}"
+    );
+    assert!(xrpl_core::any(
+        app.registry
+            .hash_router
+            .get_flags(redundant.get_transaction_id())
+            & xrpl_core::HashRouterFlags::BAD
+    ));
+}
+
+#[test]
 fn application_root_submit_batch_reuses_live_ticket_and_sequence_state() {
     let mut app = ApplicationRoot::new(0).expect("root shell should build");
     let runtime = app.attach_default_network_ops_runtime();
