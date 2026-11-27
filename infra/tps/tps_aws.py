@@ -595,11 +595,11 @@ def cmd_run(a):
     rd = f"/tmp/run-{label}"
 
     def sampler(n):
-        ssh(st, n, f"mkdir -p {rd} && nohup bash /opt/tps/sample.sh {rd}/sample-{n}.csv 10 {secs} >/dev/null 2>&1 &")
+        ssh(st, n, f"mkdir -p {rd}; nohup bash /opt/tps/sample.sh {rd}/sample-{n}.csv 10 {secs} >/dev/null 2>&1 </dev/null &")
         return "ok"
     parallel(list(st["hosts"]), sampler)
-    ssh(st, "l0", f"mkdir -p {rd} && nohup /opt/tps/tps-loadgen watch --validators {validators} --seconds {secs} "
-                  f"--out {rd}/ledgers.jsonl > {rd}/watch.log 2>&1 &")
+    ssh(st, "l0", f"mkdir -p {rd}; nohup /opt/tps/tps-loadgen watch --validators {validators} --seconds {secs} "
+                  f"--out {rd}/ledgers.jsonl > {rd}/watch.log 2>&1 </dev/null &")
 
     def load_host(i_n):
         i, n = i_n
