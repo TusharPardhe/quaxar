@@ -1156,6 +1156,63 @@ fn index_hash_with_bytes(namespace: u16, bytes: &[u8]) -> Uint256 {
 }
 
 fn index_hash_with_slices(namespace: u16, slices: &[&[u8]]) -> Uint256 {
+    // Payment paths derive the same account and trust-line keys many times
+    // per transaction. A per-thread direct-mapped memo of the exact hashed
+    // bytes returns the identical `sha512Half` without recomputing it; any
+    // input that does not match byte-for-byte is hashed normally.
+    const MAX_INPUT: usize = 128;
+    const SLOTS: usize = 1024;
+    struct Memo {
+        len: u8,
+        input: [u8; MAX_INPUT],
+        hash: Uint256,
+    }
+    thread_local! {
+        static MEMO: std::cell::RefCell<Vec<Memo>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    let mut input = [0u8; MAX_INPUT];
+    input[..2].copy_from_slice(&namespace.to_be_bytes());
+    let mut len = 2;
+    for slice in slices {
+        if len + slice.len() > MAX_INPUT {
+            return compute_index_hash(namespace, slices);
+        }
+        input[len..len + slice.len()].copy_from_slice(slice);
+        len += slice.len();
+    }
+    let input = &input[..len];
+    let mut slot_hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in input {
+        slot_hash ^= u64::from(*byte);
+        slot_hash = slot_hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    let slot = (slot_hash >> 32) as usize % SLOTS;
+    MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.is_empty() {
+            memo.reserve_exact(SLOTS);
+            for _ in 0..SLOTS {
+                memo.push(Memo {
+                    len: 0,
+                    input: [0; MAX_INPUT],
+                    hash: Uint256::zero(),
+                });
+            }
+        }
+        let entry = &mut memo[slot];
+        if usize::from(entry.len) == len && &entry.input[..len] == input {
+            return entry.hash;
+        }
+        let hash = compute_index_hash(namespace, slices);
+        entry.len = len as u8;
+        entry.input[..len].copy_from_slice(input);
+        entry.hash = hash;
+        hash
+    })
+}
+
+fn compute_index_hash(namespace: u16, slices: &[&[u8]]) -> Uint256 {
     let mut hasher = Sha512::new();
     hasher.update(namespace.to_be_bytes());
     for slice in slices {
@@ -1179,6 +1236,34 @@ fn index_hash_with_u256s(namespace: u16, head: &[u8], values: &[Uint256]) -> Uin
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn memoized_index_hash_equals_direct_sha512_half() {
+        // Many more distinct inputs than slots, repeated, so slots are
+        // reused and collide; and one input longer than the memo holds.
+        for round in 0..3 {
+            for n in 0u32..5_000 {
+                let a = n.to_be_bytes();
+                let b = [round as u8; 20];
+                let slices: [&[u8]; 2] = [&a, &b];
+                assert_eq!(
+                    super::index_hash_with_slices(0x0072, &slices),
+                    super::compute_index_hash(0x0072, &slices)
+                );
+            }
+        }
+        let long = [7u8; 200];
+        assert_eq!(
+            super::index_hash_with_slices(0x0061, &[&long]),
+            super::compute_index_hash(0x0061, &[&long])
+        );
+        // The same bytes under another namespace are a different key.
+        assert_ne!(
+            super::index_hash_with_slices(0x0061, &[&[1u8; 20]]),
+            super::index_hash_with_slices(0x0062, &[&[1u8; 20]])
+        );
+    }
+
     use super::{
         Keylet, LedgerEntryType, account_keylet, account_root_key, amendments_key,
         amendments_keylet, amm_keylet, check_keylet, check_keylet_from_key,

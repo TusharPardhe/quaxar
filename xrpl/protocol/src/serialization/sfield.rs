@@ -257,20 +257,50 @@ pub(crate) struct SFieldSpec {
     field_code_override: Option<i32>,
 }
 
+/// FNV-1a for the static field-name maps. Their keys are the compiled-in
+/// SField names, so the hash needs no collision resistance, and
+/// `get_field_by_symbol` runs on every field access in transaction code.
+#[derive(Default)]
+pub(crate) struct FieldNameHasher(u64);
+
+impl std::hash::Hasher for FieldNameHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = if self.0 == 0 {
+            0xcbf2_9ce4_8422_2325
+        } else {
+            self.0
+        };
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        self.0 = hash;
+    }
+}
+
+type FieldNameMap<K> = HashMap<K, usize, std::hash::BuildHasherDefault<FieldNameHasher>>;
+
 #[derive(Debug)]
 struct SFieldRegistry {
     fields: Box<[SField]>,
-    code_to_index: HashMap<i32, usize>,
-    name_to_index: HashMap<&'static str, usize>,
-    symbol_to_index: HashMap<&'static str, usize>,
+    code_to_index: FieldNameMap<i32>,
+    name_to_index: FieldNameMap<&'static str>,
+    symbol_to_index: FieldNameMap<&'static str>,
 }
 
 impl SFieldRegistry {
     fn build() -> Self {
         let mut fields = Vec::with_capacity(SFIELD_SPECS.len());
-        let mut code_to_index = HashMap::with_capacity(SFIELD_SPECS.len());
-        let mut name_to_index = HashMap::with_capacity(SFIELD_SPECS.len());
-        let mut symbol_to_index = HashMap::with_capacity(SFIELD_SPECS.len());
+        let mut code_to_index =
+            FieldNameMap::with_capacity_and_hasher(SFIELD_SPECS.len(), Default::default());
+        let mut name_to_index =
+            FieldNameMap::with_capacity_and_hasher(SFIELD_SPECS.len(), Default::default());
+        let mut symbol_to_index =
+            FieldNameMap::with_capacity_and_hasher(SFIELD_SPECS.len(), Default::default());
 
         for (index, spec) in SFIELD_SPECS.iter().enumerate() {
             let field = SField {
@@ -429,6 +459,40 @@ pub fn get_field_by_name(name: &str) -> &'static SField {
 }
 
 pub fn get_field_by_symbol(symbol_name: &str) -> &'static SField {
+    // Transaction code looks fields up by their literal names thousands of
+    // times per payment. A per-thread direct-mapped cache keyed by the
+    // name's address answers repeats from the same call site without
+    // hashing; a hit is confirmed by comparing the bytes, so a reused
+    // address can never return another field. Only registered fields are
+    // remembered, so a later runtime registration is still found.
+    const SLOTS: usize = 512;
+    type Slot = (usize, usize, Option<&'static SField>);
+    thread_local! {
+        static RECENT: std::cell::RefCell<[Slot; SLOTS]> =
+            const { std::cell::RefCell::new([(0, 0, None); SLOTS]) };
+    }
+    let address = symbol_name.as_ptr() as usize;
+    let slot = (address >> 3).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (usize::BITS - 9);
+    if let Some(field) = RECENT.with(|recent| {
+        let (cached_address, len, field) = recent.borrow()[slot];
+        field.filter(|field| {
+            cached_address == address
+                && len == symbol_name.len()
+                && field.symbol_name == symbol_name
+        })
+    }) {
+        return field;
+    }
+    let field = lookup_field_by_symbol(symbol_name);
+    if field.field_code != sf_invalid().field_code {
+        RECENT.with(|recent| {
+            recent.borrow_mut()[slot] = (address, symbol_name.len(), Some(field));
+        });
+    }
+    field
+}
+
+fn lookup_field_by_symbol(symbol_name: &str) -> &'static SField {
     registry()
         .by_symbol(symbol_name)
         .or_else(|| {

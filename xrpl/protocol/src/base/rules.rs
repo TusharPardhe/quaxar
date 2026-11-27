@@ -14,8 +14,16 @@ use crate::{
     fix_cleanup_3_3_0,
 };
 
+/// rippled `Rules` holds `std::shared_ptr<Impl const>`: a copy shares the
+/// amendment sets instead of duplicating them. Views return `Rules` by value
+/// on every `rules()` call, so the same sharing keeps that cheap here.
 #[derive(Debug, Clone, Default)]
 pub struct Rules {
+    inner: std::sync::Arc<RulesImpl>,
+}
+
+#[derive(Debug, Default)]
+struct RulesImpl {
     presets: HashSet<Uint256>,
     amendments: HardenedHashSet<Uint256>,
     digest: Option<Uint256>,
@@ -27,9 +35,11 @@ impl Rules {
         I: IntoIterator<Item = Uint256>,
     {
         Self {
-            presets: presets.into_iter().collect(),
-            amendments: HardenedHashSet::default(),
-            digest: None,
+            inner: std::sync::Arc::new(RulesImpl {
+                presets: presets.into_iter().collect(),
+                amendments: HardenedHashSet::default(),
+                digest: None,
+            }),
         }
     }
 
@@ -39,22 +49,24 @@ impl Rules {
         J: IntoIterator<Item = Uint256>,
     {
         Self {
-            presets: presets.into_iter().collect(),
-            amendments: amendments.into_iter().collect(),
-            digest: Some(digest),
+            inner: std::sync::Arc::new(RulesImpl {
+                presets: presets.into_iter().collect(),
+                amendments: amendments.into_iter().collect(),
+                digest: Some(digest),
+            }),
         }
     }
 
     pub fn enabled(&self, feature: &Uint256) -> bool {
-        self.presets.contains(feature) || self.amendments.contains(feature)
+        self.inner.presets.contains(feature) || self.inner.amendments.contains(feature)
     }
 
     pub fn digest(&self) -> Option<Uint256> {
-        self.digest
+        self.inner.digest
     }
 
     pub fn presets(&self) -> impl Iterator<Item = Uint256> + '_ {
-        self.presets.iter().copied()
+        self.inner.presets.iter().copied()
     }
 }
 
@@ -153,20 +165,21 @@ where
 
 impl PartialEq for Rules {
     fn eq(&self, other: &Self) -> bool {
-        if self.digest.is_none() && other.digest.is_none() {
+        let (left, right) = (&self.inner, &other.inner);
+        if left.digest.is_none() && right.digest.is_none() {
             return true;
         }
 
-        if self.digest.is_none() || other.digest.is_none() {
+        if left.digest.is_none() || right.digest.is_none() {
             return false;
         }
 
         debug_assert_eq!(
-            self.presets, other.presets,
+            left.presets, right.presets,
             "Rules equality assumes matching preset feature sets"
         );
 
-        self.digest == other.digest
+        left.digest == right.digest
     }
 }
 
@@ -193,6 +206,19 @@ mod tests {
     fn with_local_slot_owner<R>(owner: &LocalSlotOwner, f: impl FnOnce() -> R) -> R {
         let _guard = install_local_slot_owner(owner);
         f()
+    }
+
+    #[test]
+    fn copies_share_one_rule_set_like_rippleds_shared_impl() {
+        let rules = Rules::from_ledger(
+            [sample_uint256(0x12)],
+            sample_uint256(0x13),
+            [sample_uint256(0x14)],
+        );
+        let copy = rules.clone();
+        assert!(std::sync::Arc::ptr_eq(&rules.inner, &copy.inner));
+        assert_eq!(rules, copy);
+        assert!(copy.enabled(&sample_uint256(0x14)));
     }
 
     #[test]
