@@ -389,8 +389,8 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
         );
 
         if !is_delete && let Some(before) = before_sle {
-            let before_object = before.clone_as_object();
-            let after_object = entry.sle.clone_as_object();
+            let before_object: &protocol::STObject = before;
+            let after_object: &protocol::STObject = &entry.sle;
             let field_changed = |name: &str| {
                 let field = sf(name);
                 match (
@@ -572,7 +572,8 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
         }));
 
         if !is_delete && let Some(after) = visited_after_sle {
-            invalid_amount |= protocol::has_invalid_amount(&after.clone_as_object());
+            let after_object: &protocol::STObject = after;
+            invalid_amount |= protocol::has_invalid_amount(after_object);
         }
         if !is_delete
             && let Some(account) =
@@ -725,7 +726,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
                 record_mpt_transfer(&mut mpt_transfers, a, false, is_delete);
                 if !is_delete
                     && fix_cleanup_3_2_0
-                    && protocol::has_invalid_amount(&a.clone_as_object())
+                    && protocol::has_invalid_amount(&**a as &protocol::STObject)
                 {
                     return Err(());
                 }

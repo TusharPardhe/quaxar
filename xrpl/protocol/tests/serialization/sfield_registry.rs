@@ -135,3 +135,31 @@ fn pinned_sponsorship_sfield_wire_codes_are_exact() {
         assert_eq!(field.code(), field_code(ty, value), "{symbol} wire code");
     }
 }
+
+#[test]
+fn protocol_symbol_lookup_cache_never_hides_a_later_runtime_field() {
+    // The per-thread lookup cache remembers only registered fields: a name
+    // looked up before it is registered is found once it is.
+    let symbol = "sfRuntimeParityRegistryCached";
+    assert_eq!(get_field_by_symbol(symbol), protocol::sf_invalid());
+    assert_eq!(get_field_by_symbol(symbol), protocol::sf_invalid());
+    let field = register_runtime_sfield(
+        symbol,
+        SerializedTypeId::UInt32,
+        9020,
+        "RuntimeParityRegistryCached",
+        SField::S_MD_DEFAULT,
+        IsSigning::Yes,
+        None,
+    )
+    .expect("runtime SField should register");
+    assert_eq!(get_field_by_symbol(symbol), field);
+    // A different string with the same contents hits the same field, and
+    // the same literal repeatedly returns it.
+    let owned = String::from(symbol);
+    assert_eq!(get_field_by_symbol(&owned), field);
+    for _ in 0..3 {
+        assert_eq!(get_field_by_symbol("sfAccount").symbol_name(), "sfAccount");
+        assert_eq!(get_field_by_symbol(symbol), field);
+    }
+}

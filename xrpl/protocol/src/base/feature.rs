@@ -371,7 +371,35 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     RegisteredFeature::new("TrustSetAuth", true, RegisteredFeatureVote::Obsolete),
 ];
 
+/// rippled `feature`: the amendment ID is `sha512Half(name)`. Transaction
+/// code asks `rules.enabled(&fix_x())` many times per payment, so each thread
+/// remembers the IDs it has computed. Only the first `FEATURE_ID_CACHE_CAP`
+/// distinct names are kept, so arbitrary names (e.g. from RPC) cannot grow it.
 pub fn feature_id(name: &str) -> Uint256 {
+    const FEATURE_ID_CACHE_CAP: usize = 1024;
+    thread_local! {
+        static IDS: std::cell::RefCell<
+            std::collections::HashMap<
+                Box<str>,
+                Uint256,
+                std::hash::BuildHasherDefault<crate::serialization::sfield::FieldNameHasher>,
+            >,
+        > = std::cell::RefCell::default();
+    }
+    IDS.with(|ids| {
+        if let Some(id) = ids.borrow().get(name) {
+            return *id;
+        }
+        let id = compute_feature_id(name);
+        let mut ids = ids.borrow_mut();
+        if ids.len() < FEATURE_ID_CACHE_CAP {
+            ids.insert(name.into(), id);
+        }
+        id
+    })
+}
+
+fn compute_feature_id(name: &str) -> Uint256 {
     let mut hasher = Sha512::new();
     hasher.update(name.as_bytes());
     let digest = hasher.finalize();
@@ -601,6 +629,28 @@ mod tests {
 
         assert_eq!(feature_xrp_fees(), expected);
         assert_eq!(feature_name(&expected), Some(FEATURE_XRP_FEES_NAME));
+    }
+
+    #[test]
+    fn memoized_feature_ids_equal_sha512_half_of_the_name() {
+        // Past the per-thread cap, names are still hashed correctly, just
+        // not remembered.
+        for round in 0..2 {
+            for n in 0..1_100 {
+                let name = format!("Amendment{n}");
+                assert_eq!(
+                    feature_id(&name),
+                    super::compute_feature_id(&name),
+                    "{round} {name}"
+                );
+            }
+        }
+        let expected = {
+            let digest = <sha2::Sha512 as sha2::Digest>::digest(b"AMM");
+            Uint256::from_slice(&digest[..32]).expect("32 bytes")
+        };
+        assert_eq!(feature_id(FEATURE_AMM_NAME), expected);
+        assert_eq!(feature_id(FEATURE_AMM_NAME), expected);
     }
 
     #[test]
