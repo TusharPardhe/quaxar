@@ -370,6 +370,10 @@ fn produce(
             })
         })
         .collect();
+    // Only the workers may hold the receiver. If this function kept it, the
+    // workers' exit (when `run` drops the blob channel) would leave `send`
+    // below blocked on a full channel forever, and `run` hung in `join`.
+    drop(spec_rx);
 
     let (mut g, mut i, mut k, mut d) = (0usize, 0usize, 0usize, 0usize);
     while !stop.load(Ordering::Relaxed) {
