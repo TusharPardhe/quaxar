@@ -657,7 +657,7 @@ fn strand_loop(
 
     let scheduler = ConsensusJobScheduler::new(root.job_queue().clone(), ingress.clone());
     let mut consensus_started = false;
-    let mut last_timer_tick = Instant::now();
+    let mut heartbeat = HeartbeatCadence::new(Instant::now());
     let mut last_round_ledger_id: Option<Uint256> = None;
     // Edge-trigger the endConsensus/preferred-LCL reconciliation. While the
     // node sits in `Accepted` (e.g. an observer whose local child lost to the
@@ -727,7 +727,6 @@ fn strand_loop(
             consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
             consensus_started = true;
             last_round_ledger_id = Some(prev_id);
-            last_timer_tick = Instant::now();
             tracing::info!(
                 target: "consensus",
                 seq = closed.header().seq,
@@ -892,7 +891,7 @@ fn strand_loop(
                     }
                     consensus_rt.update_phase(runner.phase());
                     consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
-                    last_timer_tick = Instant::now();
+                    heartbeat.tick_processed(Instant::now());
                 }
                 ConsensusCommand::Accept(work) => {
                     // This command was emitted by a JtAccept job. Execute the
@@ -948,7 +947,6 @@ fn strand_loop(
                     consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
                     consensus_started = true;
                     last_round_ledger_id = Some(runner.prev_ledger_id());
-                    last_timer_tick = Instant::now();
                     tracing::info!(target: "consensus", "Consensus started via external command");
                 }
                 ConsensusCommand::Info(reply) => {
@@ -1129,7 +1127,7 @@ fn strand_loop(
             // ─── 2. Schedule the 1s heartbeat after older overflow ingress ──
             // `JtNetopTimer` has the reference priority/limit. The job only
             // hands off a command; `timer_tick` remains serialized on this strand.
-            if last_timer_tick.elapsed() >= Duration::from_secs(1) {
+            if heartbeat.is_due(Instant::now()) {
                 let _ = scheduler.schedule_heartbeat();
             }
 
@@ -1413,7 +1411,6 @@ fn strand_loop(
                     consensus_rt.update_phase(runner.phase());
                     consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
                     last_round_ledger_id = Some(closed_id);
-                    last_timer_tick = Instant::now();
                     tracing::info!(
                         target: "consensus",
                         seq = closed.header().seq,
@@ -1446,11 +1443,50 @@ fn strand_loop(
         // ─── 8. Wait for next event (proposal notify or 50ms timeout) ─────
         drop(turn);
         if !coordinator_work_remains {
-            root.wait_consensus_or_timeout(Duration::from_millis(50));
+            root.wait_consensus_or_timeout(
+                heartbeat.wait_timeout(Instant::now(), Duration::from_millis(50)),
+            );
         }
     }
 
     tracing::info!(target: "consensus", "NetworkOPs strand stopped");
+}
+
+/// When the next consensus heartbeat is due. rippled re-arms its heartbeat
+/// timer one `ledgerGranularity` after each `processHeartbeatTimer`
+/// (`setHeartbeatTimer`, NetworkOPs.cpp), and nothing else moves it:
+/// `beginConsensus`/`startRound` leave the timer alone. A round that starts
+/// shortly before a due tick is therefore evaluated on that tick, which is
+/// how rippled closes right after an accept when the other validators have
+/// already closed.
+#[derive(Debug)]
+struct HeartbeatCadence {
+    last_tick: Instant,
+}
+
+impl HeartbeatCadence {
+    const INTERVAL: Duration = Duration::from_secs(1);
+
+    fn new(now: Instant) -> Self {
+        Self { last_tick: now }
+    }
+
+    /// A heartbeat was processed; the next is due one interval later.
+    fn tick_processed(&mut self, now: Instant) {
+        self.last_tick = now;
+    }
+
+    fn is_due(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_tick) >= Self::INTERVAL
+    }
+
+    /// How long the strand may wait for an event before it must check the
+    /// heartbeat again: at most `max`, and no longer than until it is due.
+    fn wait_timeout(&self, now: Instant, max: Duration) -> Duration {
+        (self.last_tick + Self::INTERVAL)
+            .saturating_duration_since(now)
+            .clamp(Duration::from_millis(1), max)
+    }
 }
 
 /// Cadence for the strand's coordinator peer-availability report and
@@ -3665,6 +3701,45 @@ fn should_acquire_history(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn heartbeat_is_due_one_interval_after_the_last_tick() {
+        use std::time::Duration;
+        let start = std::time::Instant::now();
+        let mut heartbeat = super::HeartbeatCadence::new(start);
+        assert!(!heartbeat.is_due(start + Duration::from_millis(999)));
+        assert!(heartbeat.is_due(start + Duration::from_secs(1)));
+
+        // Only a processed tick re-arms it. A round that starts 900 ms after
+        // a tick (rippled beginConsensus) is evaluated 100 ms later, not a
+        // full interval after it started.
+        let round_start = start + Duration::from_millis(900);
+        assert_eq!(
+            heartbeat.wait_timeout(round_start, Duration::from_millis(500)),
+            Duration::from_millis(100)
+        );
+        heartbeat.tick_processed(start + Duration::from_secs(1));
+        assert!(!heartbeat.is_due(start + Duration::from_millis(1_999)));
+        assert!(heartbeat.is_due(start + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn strand_wait_never_sleeps_past_the_due_heartbeat() {
+        use std::time::Duration;
+        let start = std::time::Instant::now();
+        let heartbeat = super::HeartbeatCadence::new(start);
+        let max = Duration::from_millis(50);
+        assert_eq!(heartbeat.wait_timeout(start, max), max);
+        assert_eq!(
+            heartbeat.wait_timeout(start + Duration::from_millis(980), max),
+            Duration::from_millis(20)
+        );
+        // Overdue: poll again almost at once rather than spinning at zero.
+        assert_eq!(
+            heartbeat.wait_timeout(start + Duration::from_secs(3), max),
+            Duration::from_millis(1)
+        );
+    }
 
     #[test]
     fn coordinator_peer_report_runs_once_per_second_or_on_peer_change() {
