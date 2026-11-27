@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 basics = { path = "../basics" }
 generator = "0.8"
+hashlink = "0.9"
 protocol = { path = "../protocol" }
 serde_json = "1"
 quaxar-core = { path = "../../xrpld/core" }

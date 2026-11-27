@@ -14,7 +14,8 @@ use std::{
 };
 
 use basics::basic_config::{BasicConfig, Section, set};
-use basics::{base_uint::Uint256, unordered_containers::HardenedHashMap};
+use basics::{base_uint::Uint256, hardened_hash::HardenedHashBuilder};
+use hashlink::LinkedHashMap;
 
 use crate::{
     HashRouterEntry, HashRouterFlags, PeerShortId, any,
@@ -92,9 +93,13 @@ struct AgedEntry {
     touched_at: Duration,
 }
 
+/// rippled `beast::aged_unordered_map`: a hashed map that also keeps its
+/// entries in touch order, oldest first. The clock is monotonic and a touch
+/// moves the entry to the back, so expiry only walks the expired prefix
+/// instead of every entry.
 #[derive(Debug, Default)]
 struct HashRouterState {
-    suppression_map: HardenedHashMap<Uint256, AgedEntry>,
+    suppression_map: LinkedHashMap<Uint256, AgedEntry, HardenedHashBuilder>,
 }
 
 impl HashRouterState {
@@ -102,9 +107,15 @@ impl HashRouterState {
         self.suppression_map.len()
     }
 
+    /// `beast::expire`: erase entries from the oldest end while
+    /// `touched_at <= now - hold_time`.
     fn expire(&mut self, now: Duration, hold_time: Duration) {
-        self.suppression_map
-            .retain(|_, aged| aged.touched_at + hold_time > now);
+        while let Some((_, aged)) = self.suppression_map.front() {
+            if aged.touched_at + hold_time > now {
+                break;
+            }
+            self.suppression_map.pop_front();
+        }
     }
 
     fn emplace(
@@ -116,7 +127,7 @@ impl HashRouterState {
         if self.suppression_map.contains_key(&key) {
             let aged = self
                 .suppression_map
-                .get_mut(&key)
+                .to_back(&key)
                 .expect("entry should exist after contains_key");
             aged.touched_at = now;
             return (&mut aged.entry, false);
@@ -662,6 +673,95 @@ mod tests {
         let (third, third_flags) = router.should_process(key, 1, Duration::from_secs(1));
         assert!(third);
         assert_eq!(third_flags, HashRouterFlags::UNDEFINED);
+    }
+
+    /// The touch-ordered expiry must behave exactly like the full scan it
+    /// replaced (`retain(touched_at + hold_time > now)` before every insert).
+    #[test]
+    fn touch_ordered_expiry_matches_full_scan_model() {
+        use std::collections::HashMap;
+
+        let hold = Duration::from_secs(12);
+        let (router, clock) = router_with_clock(
+            HashRouterSetup {
+                hold_time: hold,
+                relay_time: Duration::from_secs(8),
+            },
+            Duration::from_secs(0),
+        );
+        // key -> (touched_at, flags)
+        let mut model: Model = HashMap::new();
+        let mut now = Duration::from_secs(0);
+        let flag_choices = [
+            HashRouterFlags::BAD,
+            HashRouterFlags::SAVED,
+            HashRouterFlags::TRUSTED,
+            HashRouterFlags::PRIVATE1,
+        ];
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |m: u64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % m
+        };
+        type Model = HashMap<u64, (Duration, HashRouterFlags)>;
+        fn model_emplace(model: &mut Model, k: u64, now: Duration, hold: Duration) -> bool {
+            if let Some(e) = model.get_mut(&k) {
+                e.0 = now;
+                return false;
+            }
+            model.retain(|_, e| e.0 + hold > now);
+            model.insert(k, (now, HashRouterFlags::UNDEFINED));
+            true
+        }
+
+        for _ in 0..20_000 {
+            let k = next(48);
+            match next(6) {
+                0 => {
+                    let ms = next(2_500);
+                    clock.advance(Duration::from_millis(ms));
+                    now += Duration::from_millis(ms);
+                }
+                1 => {
+                    let f = flag_choices[next(4) as usize];
+                    let changed = router.set_flags(key(k), f);
+                    model_emplace(&mut model, k, now, hold);
+                    let e = model.get_mut(&k).unwrap();
+                    let before = e.1;
+                    e.1 |= f;
+                    assert_eq!(changed, e.1 != before);
+                }
+                2 => {
+                    let got = router.get_flags(key(k));
+                    model_emplace(&mut model, k, now, hold);
+                    assert_eq!(got, model[&k].1);
+                }
+                3 => {
+                    let created = router.add_suppression_peer(key(k), next(5) as u32);
+                    assert_eq!(created, model_emplace(&mut model, k, now, hold));
+                }
+                4 => {
+                    let f = flag_choices[next(4) as usize];
+                    let changed = router.clear_flags(key(k), f);
+                    let want = match model.get_mut(&k) {
+                        Some(e) => {
+                            let before = e.1;
+                            e.1 &= !f;
+                            e.1 != before
+                        }
+                        None => false,
+                    };
+                    assert_eq!(changed, want);
+                }
+                _ => {
+                    router.add_suppression(key(k));
+                    model_emplace(&mut model, k, now, hold);
+                }
+            }
+            assert_eq!(router.entry_count(), model.len());
+        }
     }
 
     #[test]
