@@ -1053,7 +1053,10 @@ fn simulate_clones_persistent_open_view_sequence_and_balance() {
     let (_, second) = signed_payment_tx(0xC1, destination, 2, 10);
     let base = Arc::new(ledger_view(10, source, 1, &[]));
     let mut live = Sandbox::new(
-        Arc::new(OpenView::new_open(Arc::clone(&base), base.rules().clone())),
+        Arc::new(OpenView::new_open(
+            cached_open_base(&base),
+            base.rules().clone(),
+        )),
         ApplyFlags::NONE,
     );
     let mut open =
@@ -1148,7 +1151,10 @@ fn signing_sequence_uses_rebuilt_open_sandbox_not_legacy_cache() {
     let (_, next) = signed_payment_tx(0xC2, destination, 2, 10);
     let base = Arc::new(ledger_view(10, source, 1, &[]));
     let mut sandbox = Sandbox::new(
-        Arc::new(OpenView::new_open(Arc::clone(&base), base.rules().clone())),
+        Arc::new(OpenView::new_open(
+            cached_open_base(&base),
+            base.rules().clone(),
+        )),
         ApplyFlags::NONE,
     );
     let mut open =
@@ -1185,7 +1191,7 @@ fn closed_ledger_notification_preserves_rebuilt_same_parent_submit_sandbox() {
     let parent = Arc::new(ledger_view(10, source, 1, &[]));
     let mut sandbox = Sandbox::new(
         Arc::new(OpenView::new_open(
-            Arc::clone(&parent),
+            cached_open_base(&parent),
             parent.rules().clone(),
         )),
         ApplyFlags::NONE,
@@ -1488,7 +1494,7 @@ fn closed_ledger_transition_rebases_persistent_submit_state() {
     root.on_closed_ledger(Arc::clone(&first));
     *root.open_ledger_sandbox.lock().expect("sandbox mutex") = Some(Sandbox::new(
         Arc::new(OpenView::new_open(
-            Arc::clone(&first),
+            cached_open_base(&first),
             first.rules().clone(),
         )),
         ApplyFlags::NONE,
@@ -4495,6 +4501,77 @@ fn ledger_delta_metadata_is_built_only_for_subscribers() {
 }
 
 #[test]
+fn open_ledger_rebuild_reads_its_parent_through_cached_sles() {
+    // rippled `OpenLedger::create` bases the open view on
+    // `CachedLedger(ledger, cachedSLEs_)`, so an entry read while
+    // reapplying transactions is parsed once and shared with later
+    // open-ledger applies over the same parent.
+    let app = ApplicationRoot::new(0).expect("root shell should build");
+    let destination = account("00000000000000000000000000000000000000AF");
+    let (source, payment) = signed_payment_tx(0x17, destination, 1, 10);
+    let mut parent = ledger_view_with_balance_and_owner_count(11, source, 1, 1_000_000_000, 0, &[]);
+    parent.set_total_drops(1_000_000_000);
+    // A parent is an accepted ledger; only immutable ledgers share the cache.
+    parent.set_immutable(true);
+    let parent = Arc::new(parent);
+    let _ = app.open_ledger().modify(|view| {
+        *view = AppOpenLedgerView::with_parent_hash(
+            12,
+            parent.fees().base,
+            *parent.header().hash.as_uint256(),
+        );
+        view.push_transaction(Arc::clone(&payment));
+        true
+    });
+    assert_eq!(app.cached_sles().size(), 0);
+
+    app.rebuild_open_ledger_after_consensus(Arc::clone(&parent), &[], false);
+
+    assert!(
+        app.open_ledger()
+            .current()
+            .tx_ids()
+            .contains(&payment.get_transaction_id())
+    );
+    let source_key = account_keylet(raw_account_id(source));
+    let digest = parent
+        .digest(source_key.key)
+        .expect("digest")
+        .expect("source account exists");
+    let cached = app
+        .cached_sles()
+        .fetch(&digest)
+        .expect("the source account was read through the shared cache");
+    let view = super::cached_ledger(Arc::clone(&parent), app.cached_sles());
+    let again = ReadView::read(view.as_ref(), source_key)
+        .expect("read")
+        .expect("account");
+    assert!(
+        Arc::ptr_eq(&cached, &again),
+        "a later open view over the same parent reuses the parsed entry"
+    );
+
+    // A ledger still being modified never shares entries: its leaf hashes
+    // are not final.
+    let mutable = Arc::new(ledger_view_with_balance_and_owner_count(
+        11,
+        source,
+        1,
+        1_000_000_000,
+        0,
+        &[],
+    ));
+    let size = app.cached_sles().size();
+    let private = super::cached_ledger(Arc::clone(&mutable), app.cached_sles());
+    assert!(
+        ReadView::read(private.as_ref(), source_key)
+            .expect("read")
+            .is_some()
+    );
+    assert_eq!(app.cached_sles().size(), size);
+}
+
+#[test]
 fn consensus_build_rejects_invalid_signature_before_mutation() {
     let app = ApplicationRoot::new(0).expect("root shell should build");
     let source = account("00000000000000000000000000000000000000AC");
@@ -6389,8 +6466,17 @@ fn modern_network_change_preflight_is_preserved_through_apply() {
 fn persistent_submit_sandbox_is_restored_during_unwind() {
     let source = AccountID::from_array([0xC3; 20]);
     let base = Arc::new(ledger_view(10, source, 1, &[]));
+    let cache = Arc::new(ledger::CachedSles::new(
+        "test",
+        0,
+        time::Duration::minutes(1),
+        basics::tagged_cache::MonotonicClock::default(),
+    ));
     let holder = Arc::new(Mutex::new(Some(Sandbox::new(
-        Arc::new(OpenView::new_open(Arc::clone(&base), base.rules().clone())),
+        Arc::new(OpenView::new_open(
+            super::cached_ledger(Arc::clone(&base), &cache),
+            base.rules().clone(),
+        )),
         ApplyFlags::NONE,
     ))));
 
@@ -6398,7 +6484,7 @@ fn persistent_submit_sandbox_is_restored_during_unwind() {
         let holder = Arc::clone(&holder);
         let base = Arc::clone(&base);
         move || {
-            let _guard = PersistentSubmitSandbox::take_or_new(holder, base);
+            let _guard = PersistentSubmitSandbox::take_or_new(holder, base, &cache);
             panic!("forced submit batch panic");
         }
     }));
@@ -6650,4 +6736,18 @@ fn try_advance_runs_publication_on_the_advance_worker_not_the_caller() {
     assert!(root.ledger_advance_passes() >= 1, "the worker ran the pass");
     stop.store(true, std::sync::atomic::Ordering::Release);
     handle.join().expect("worker exits on stop");
+}
+
+/// The open ledger's base: the parent read through a `CachedSLEs`, as in
+/// rippled `OpenLedger::create`.
+fn cached_open_base(ledger: &Arc<Ledger>) -> Arc<ledger::CachedLedger> {
+    super::cached_ledger(
+        Arc::clone(ledger),
+        &Arc::new(ledger::CachedSles::new(
+            "test",
+            0,
+            time::Duration::minutes(1),
+            basics::tagged_cache::MonotonicClock::default(),
+        )),
+    )
 }

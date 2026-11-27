@@ -108,6 +108,10 @@ use basics::tagged_cache::CacheClock;
 pub use book_listeners::{BookListenerSubscriber, BookListeners};
 pub use cached_sles::CachedSles;
 pub use cached_view::CachedView;
+/// rippled `CachedLedger`: a ledger read through the application's shared
+/// `CachedSLEs`, which the open ledger uses as its base
+/// (`OpenLedger::create`).
+pub type CachedLedger = CachedView<Ledger>;
 pub use canonical_tx_set::CanonicalTXSet;
 pub use cleaner::{
     LEDGER_CLEANER_FAILURE_WAIT, LEDGER_CLEANER_LOAD_WAIT, LEDGER_CLEANER_SUCCESS_WAIT,
@@ -1744,9 +1748,16 @@ impl Ledger {
     }
 
     pub fn digest(&self, key: Uint256) -> Result<Option<Uint256>, TraversalError> {
+        // rippled `Ledger::digest` -> `SHAMap::peekItem(key, hash)`: a backed
+        // map loads released nodes from the store, exactly as `read` does.
+        let mut fetch_fn = |hash: basics::sha_map_hash::SHAMapHash| -> Option<
+            basics::memory::intrusive_pointer::SharedIntrusive<
+                shamap::nodes::tree_node::SHAMapTreeNode,
+            >,
+        > { self.node_fetcher.as_ref()?(hash) };
         Ok(self
             .state_map
-            .peek_item_with_hash(key, &mut |_| None)?
+            .peek_item_with_hash(key, &mut fetch_fn)?
             .map(|(_item, hash)| *hash.as_uint256()))
     }
 
