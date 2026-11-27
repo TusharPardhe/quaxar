@@ -555,9 +555,26 @@ def ws(st, n):
 def cmd_setup(a):
     st = load(a.run)
     p2p = ",".join(ws(st, n) for n in names(st, ["p2p"]))
+    # Detached, so a dropped SSH session does not stop it; setup is
+    # idempotent, so a rerun continues where the last one stopped.
     cmd = (f"/opt/tps/tps-loadgen setup --tag {shlex.quote(a.tag)} --funder {st['funder']} --nodes {p2p} "
-           f"--tests {a.tests} --iou-group {a.iou_group} --rate {a.rate} 2>&1 | tee /tmp/setup.log")
-    ssh(st, "l0", cmd, capture=False)
+           f"--tests {a.tests} --iou-group {a.iou_group} --rate {a.rate}")
+    ssh(st, "l0", f"pgrep -x tps-loadgen >/dev/null && exit 3; nohup {cmd} > /tmp/setup.log 2>&1 & echo $! > /tmp/setup.pid")
+    seen = 0
+    while True:
+        time.sleep(15)
+        try:
+            out = ssh(st, "l0", f"tail -n +{seen + 1} /tmp/setup.log; kill -0 $(cat /tmp/setup.pid) 2>/dev/null && echo __RUNNING__",
+                      check=False, timeout=60)
+        except Exception as e:  # noqa: BLE001 - transient SSH failure; keep polling
+            print(f"poll failed: {e}", flush=True)
+            continue
+        lines = [x for x in out.splitlines() if x != "__RUNNING__"]
+        seen += len(lines)
+        for x in lines:
+            print(x, flush=True)
+        if "__RUNNING__" not in out:
+            break
 
 
 def cmd_run(a):

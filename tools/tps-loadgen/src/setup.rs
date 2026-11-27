@@ -19,10 +19,12 @@ use std::time::{Duration, Instant};
 /// last ledger current at send time.
 pub type Item = (AccountID, u32, Box<dyn Fn(Common) -> Signed + Send + Sync>);
 
-/// Highest fee setup pays for one transaction (100 XRP). Setup runs with
-/// the default transaction queue, so fees escalate with ledger size and keep
-/// ledgers small enough for consensus; the funder can pay them.
-const SETUP_MAX_FEE: u64 = 100_000_000;
+/// Highest fee setup pays for one transaction (1 XRP). Setup runs with the
+/// default transaction queue, so fees escalate with ledger size and keep
+/// ledgers small enough for consensus. A transaction priced out of the open
+/// ledger waits for a later round; a higher cap drains the 200 XRP test
+/// accounts in a few transactions.
+const SETUP_MAX_FEE: u64 = 1_000_000;
 
 pub const TEST_XRP: u64 = 200_000_000; // 200 XRP per test account
 const ISSUER_XRP: u64 = 1_000_000_000;
@@ -74,6 +76,7 @@ impl Setup {
 
         self.repeat("core accounts", || self.fund_core(&keys)).await?;
         self.repeat("test accounts", || self.fund_tests(&keys)).await?;
+        self.repeat("IOU group balances", || self.top_up_iou_group(&keys)).await?;
         self.repeat("issuer DefaultRipple", || self.default_ripple(&keys)).await?;
         self.repeat("trust lines", || self.trust_lines(&keys)).await?;
         self.repeat("issued balances", || self.issue(&keys)).await?;
@@ -235,6 +238,35 @@ impl Setup {
             let (funder, key) = (self.funder, Arc::clone(&k.funder_key));
             out.push((funder, seq, Box::new(move |c| tx::payment(funder, &key, account, xrp(drops), None, None, c))));
             seq += 1;
+        }
+        Ok(out)
+    }
+
+    /// IOU-group accounts (they send the trust lines) below half of
+    /// `TEST_XRP` get `TEST_XRP` more from the funder. Hubs keep only about
+    /// 100 XRP after funding their test accounts, too little to top up.
+    async fn top_up_iou_group(&self, k: &Keys) -> Result<Vec<Item>, String> {
+        let group = &k.tests[..self.layout.iou_group as usize];
+        let accounts: Vec<AccountID> = group.iter().map(|t| t.account).collect();
+        let replies = self
+            .query_all_(&accounts, |a| json!({"command": "account_info", "account": to_base58(*a), "ledger_index": "validated"}))
+            .await?;
+        let mut seq = self.sequence(&self.funder).await?;
+        let mut out: Vec<Item> = Vec::new();
+        for (a, reply) in accounts.into_iter().zip(replies) {
+            let balance = reply
+                .pointer("/result/account_data/Balance")
+                .and_then(Value::as_str)
+                .and_then(|b| b.parse::<u64>().ok());
+            if balance.is_some_and(|b| b < TEST_XRP / 2) {
+                let (funder, key) = (self.funder, Arc::clone(&k.funder_key));
+                out.push((
+                    funder,
+                    seq,
+                    Box::new(move |c| tx::payment(funder, &key, a, xrp(TEST_XRP), None, None, c)),
+                ));
+                seq += 1;
+            }
         }
         Ok(out)
     }
