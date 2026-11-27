@@ -1461,29 +1461,58 @@ fn strand_loop(
 /// already closed.
 #[derive(Debug)]
 struct HeartbeatCadence {
-    last_tick: Instant,
+    next_due: Instant,
 }
 
 impl HeartbeatCadence {
     const INTERVAL: Duration = Duration::from_secs(1);
 
     fn new(now: Instant) -> Self {
-        Self { last_tick: now }
+        Self::new_at(now, Self::wall_subsec())
     }
 
-    /// A heartbeat was processed; the next is due one interval later.
+    fn new_at(now: Instant, wall_subsec: Duration) -> Self {
+        Self {
+            next_due: Self::next_boundary(now, wall_subsec),
+        }
+    }
+
+    /// Fraction of the current wall-clock second (UTC, NTP-disciplined).
+    fn wall_subsec() -> Duration {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| Duration::from_nanos(u64::from(since.subsec_nanos())))
+            .unwrap_or_default()
+    }
+
+    /// rippled ticks once per `ledgerGranularity` from whenever its timer was
+    /// armed, so validators evaluate consensus at unrelated phases up to a
+    /// second apart. Ticking on whole wall-clock seconds keeps the same one
+    /// tick per second and every rule unchanged, but lets validators with
+    /// synchronized clocks close and accept on the same instant, which
+    /// narrows the window in which their open ledgers differ.
+    fn next_boundary(now: Instant, wall_subsec: Duration) -> Instant {
+        now + Self::INTERVAL.saturating_sub(wall_subsec.min(Self::INTERVAL))
+    }
+
+    /// A heartbeat was processed; the next is due on the next wall-clock
+    /// second, at most one interval away.
     fn tick_processed(&mut self, now: Instant) {
-        self.last_tick = now;
+        self.tick_processed_at(now, Self::wall_subsec());
+    }
+
+    fn tick_processed_at(&mut self, now: Instant, wall_subsec: Duration) {
+        self.next_due = Self::next_boundary(now, wall_subsec);
     }
 
     fn is_due(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.last_tick) >= Self::INTERVAL
+        now >= self.next_due
     }
 
     /// How long the strand may wait for an event before it must check the
     /// heartbeat again: at most `max`, and no longer than until it is due.
     fn wait_timeout(&self, now: Instant, max: Duration) -> Duration {
-        (self.last_tick + Self::INTERVAL)
+        self.next_due
             .saturating_duration_since(now)
             .clamp(Duration::from_millis(1), max)
     }
@@ -3703,42 +3732,44 @@ fn should_acquire_history(
 mod tests {
 
     #[test]
-    fn heartbeat_is_due_one_interval_after_the_last_tick() {
+    fn heartbeat_ticks_on_whole_wall_clock_seconds() {
         use std::time::Duration;
+        let ms = Duration::from_millis;
         let start = std::time::Instant::now();
-        let mut heartbeat = super::HeartbeatCadence::new(start);
-        assert!(!heartbeat.is_due(start + Duration::from_millis(999)));
-        assert!(heartbeat.is_due(start + Duration::from_secs(1)));
+        // Started 300 ms into a wall-clock second: due 700 ms later, on the
+        // next whole second.
+        let mut heartbeat = super::HeartbeatCadence::new_at(start, ms(300));
+        assert!(!heartbeat.is_due(start + ms(699)));
+        assert!(heartbeat.is_due(start + ms(700)));
 
-        // Only a processed tick re-arms it. A round that starts 900 ms after
-        // a tick (rippled beginConsensus) is evaluated 100 ms later, not a
-        // full interval after it started.
-        let round_start = start + Duration::from_millis(900);
-        assert_eq!(
-            heartbeat.wait_timeout(round_start, Duration::from_millis(500)),
-            Duration::from_millis(100)
-        );
-        heartbeat.tick_processed(start + Duration::from_secs(1));
-        assert!(!heartbeat.is_due(start + Duration::from_millis(1_999)));
-        assert!(heartbeat.is_due(start + Duration::from_secs(2)));
+        // Starting a round does not move it (rippled beginConsensus leaves
+        // the timer alone): a round that starts 600 ms after the start is
+        // evaluated 100 ms later.
+        assert_eq!(heartbeat.wait_timeout(start + ms(600), ms(500)), ms(100));
+
+        // A tick processed 20 ms late (wall subsec 0.020) is next due 980 ms
+        // later, back on the second, so lateness does not accumulate.
+        heartbeat.tick_processed_at(start + ms(720), ms(20));
+        assert!(!heartbeat.is_due(start + ms(1_699)));
+        assert!(heartbeat.is_due(start + ms(1_700)));
+
+        // At most one interval between ticks, even at an exact boundary.
+        heartbeat.tick_processed_at(start + ms(1_700), ms(0));
+        assert!(!heartbeat.is_due(start + ms(2_699)));
+        assert!(heartbeat.is_due(start + ms(2_700)));
     }
 
     #[test]
     fn strand_wait_never_sleeps_past_the_due_heartbeat() {
         use std::time::Duration;
+        let ms = Duration::from_millis;
         let start = std::time::Instant::now();
-        let heartbeat = super::HeartbeatCadence::new(start);
-        let max = Duration::from_millis(50);
+        let heartbeat = super::HeartbeatCadence::new_at(start, ms(0));
+        let max = ms(50);
         assert_eq!(heartbeat.wait_timeout(start, max), max);
-        assert_eq!(
-            heartbeat.wait_timeout(start + Duration::from_millis(980), max),
-            Duration::from_millis(20)
-        );
+        assert_eq!(heartbeat.wait_timeout(start + ms(980), max), ms(20));
         // Overdue: poll again almost at once rather than spinning at zero.
-        assert_eq!(
-            heartbeat.wait_timeout(start + Duration::from_secs(3), max),
-            Duration::from_millis(1)
-        );
+        assert_eq!(heartbeat.wait_timeout(start + ms(3_000), max), ms(1));
     }
 
     #[test]
