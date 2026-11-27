@@ -4480,6 +4480,7 @@ version = "0.10.0"
 dependencies = [
  "basics",
  "generator",
+ "hashlink",
  "protocol",
  "quaxar-core",
  "serde_json",
