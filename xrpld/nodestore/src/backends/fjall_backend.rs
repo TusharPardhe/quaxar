@@ -91,6 +91,8 @@ const COMPACTION_BASE_MB_RANGE: std::ops::RangeInclusive<u64> = 16..=65536;
 /// at least a quarter of the live data, failing at 1/31 and below. The
 /// watchdog warns below this ratio so operators rebuild before stalls start.
 const MIN_BASE_TO_LIVE_RATIO: u64 = 4;
+/// Batches at least this large check node existence in parallel.
+const PARALLEL_ABSENT_CHECK_MIN: usize = 64;
 /// How often the watchdog re-checks the base-to-live ratio.
 const SIZING_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 /// L0 tables merged at once; the base level is `L0_THRESHOLD` target tables.
@@ -731,17 +733,39 @@ impl Backend for FjallBackend {
     }
 
     fn store_batch_result(&self, batch: &crate::Batch) -> Result<(), String> {
+        use rayon::prelude::*;
         let open = self.open_db()?;
         let tracking = self.fresh_write_tracking();
         let mut fresh = Vec::new();
         let mut written = std::collections::HashSet::new();
         let mut write = open.db.batch();
-        for object in batch {
-            let encoded = EncodedBlob::new(object);
-            self.restore_watch
-                .before_write(object.hash(), || encoded.get_data().to_vec());
-            // Write-once, as in `store`; also within this batch.
-            if !self.node_absent(&open, object.hash())? || !written.insert(*object.hash()) {
+        let encoded: Vec<EncodedBlob> = batch
+            .iter()
+            .map(|object| {
+                let encoded = EncodedBlob::new(object);
+                // Marked before the existence check, as in `store`.
+                self.restore_watch
+                    .before_write(object.hash(), || encoded.get_data().to_vec());
+                encoded
+            })
+            .collect();
+        // Write-once, as in `store`. The existence checks are independent
+        // point reads; a consensus ledger writes thousands of nodes, so they
+        // run in parallel and only the writes stay in batch order.
+        let absent: Vec<bool> = if batch.len() >= PARALLEL_ABSENT_CHECK_MIN {
+            batch
+                .par_iter()
+                .map(|object| self.node_absent(&open, object.hash()))
+                .collect::<Result<_, _>>()?
+        } else {
+            batch
+                .iter()
+                .map(|object| self.node_absent(&open, object.hash()))
+                .collect::<Result<_, _>>()?
+        };
+        for ((object, encoded), absent) in batch.iter().zip(&encoded).zip(absent) {
+            // Also write-once within this batch.
+            if !absent || !written.insert(*object.hash()) {
                 continue;
             }
             if tracking {
@@ -1075,6 +1099,44 @@ mod tests {
         assert!(backend.fetch(node.hash()).0.is_none());
         backend.store(Arc::clone(&node)).expect("store again");
         assert!(backend.fetch(node.hash()).0.is_some());
+        let _ = backend.close();
+    }
+
+    /// The write-once rule holds for a consensus-sized batch, whose
+    /// existence checks run in parallel: stored nodes and repeats within the
+    /// batch add no version, and every new node is written in batch order.
+    #[test]
+    fn large_batch_writes_each_absent_node_once() {
+        let path = temp_path("write-once-large");
+        let mut cfg = section(&path);
+        cfg.set("reserve_mb", "0");
+        let backend = FjallBackend::new(&cfg, Arc::new(NullJournal)).expect("construct");
+        backend.open(true).expect("open");
+        let stored: Vec<_> = (0..40u8).map(node_object).collect();
+        backend.store_batch_result(&stored).expect("seed");
+        backend
+            .open_db()
+            .expect("open")
+            .nodes
+            .rotate_memtable_and_wait()
+            .expect("flush");
+        assert_eq!(node_versions(&backend), 40);
+
+        let mut batch: Vec<_> = (20..120u8).map(node_object).collect();
+        batch.extend((100..110u8).map(node_object));
+        assert!(batch.len() >= super::PARALLEL_ABSENT_CHECK_MIN);
+        backend.store_batch_result(&batch).expect("large batch");
+        assert_eq!(
+            node_versions(&backend),
+            120,
+            "nodes 0..120, one version each"
+        );
+        for fill in 0..120u8 {
+            assert!(
+                backend.fetch(node_object(fill).hash()).0.is_some(),
+                "{fill}"
+            );
+        }
         let _ = backend.close();
     }
 

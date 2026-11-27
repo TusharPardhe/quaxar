@@ -762,6 +762,32 @@ where
         result
     }
 
+    /// The canonical value for `key` if one is cached, with the same effect
+    /// on an existing entry as `canonicalize_replace_client` (touched; a live
+    /// weak entry made strong) but without inserting a missing key or
+    /// counting a hit or miss. For a caller that inserts the key itself only
+    /// after a durable write.
+    pub fn fetch_existing<Q>(&self, key: &Q) -> Option<SP>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + PartitionKey + ?Sized,
+    {
+        let mut state = self
+            .state
+            .lock()
+            .expect("TaggedCache mutex must not be poisoned");
+        let now = self.clock.now();
+        let entry = state.cache.get_mut(key)?;
+        entry.touch(now);
+        if entry.ptr.is_strong() {
+            return entry.ptr.strong_clone();
+        }
+        let cached = entry.ptr.lock()?;
+        entry.ptr.set_strong(cached.clone());
+        state.cache_count += 1;
+        Some(cached)
+    }
+
     pub fn fetch_with(&self, key: &K, handler: impl FnOnce() -> Option<SP>) -> Option<SP> {
         // Like fetch(), use the primary recursively locked map so every
         // cached hit refreshes last_access, matching rippled behavior.

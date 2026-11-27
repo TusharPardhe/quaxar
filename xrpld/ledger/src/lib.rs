@@ -2208,10 +2208,24 @@ impl Ledger {
             return Err("missing node writer for backed consensus ledger".to_owned());
         }
 
+        // rippled `SHAMap::walkSubTree` hashes, canonicalizes and stores each
+        // dirty node in one pass. Persistence here is checked: the dirty
+        // trees and the cache stay untouched until the whole batch is
+        // stored. So the pass flushes a detached copy and, like
+        // `canonicalize`, takes an already cached node in place of its own;
+        // the nodes the cache lacks are inserted only after the write.
         let mut writes = Vec::new();
+        let mut uncached = Vec::new();
         let mut collect = |tree: &MutableTree, object_type: LedgerNodeObjectType| {
             tree.try_flush_dirty_detached(&mut |node| {
                 let hash = *node.get_hash().as_uint256();
+                let node = match tree_cache.and_then(|cache| cache.fetch_existing(&hash)) {
+                    Some(cached) => cached,
+                    None => {
+                        uncached.push((hash, node.clone()));
+                        node
+                    }
+                };
                 let data = node
                     .serialize_with_prefix()
                     .map_err(|error| format!("serialize dirty SHAMap node failed: {error:?}"))?;
@@ -2223,22 +2237,28 @@ impl Ledger {
                 });
                 Ok::<_, String>(node)
             })
-            .map(|_| ())
+            .map(|(flushed, _)| flushed)
         };
 
-        let mut state_tree = self.mutable_state.take().unwrap_or_else(|| {
+        let state_tree = self.mutable_state.take().unwrap_or_else(|| {
             MutableTree::from_loaded_root(self.state_map.root(), ledger_seq.max(1))
         });
-        if let Err(error) = collect(&state_tree, LedgerNodeObjectType::AccountNode) {
-            self.mutable_state = Some(state_tree);
-            return Err(error);
-        }
+        let flushed_state = match collect(&state_tree, LedgerNodeObjectType::AccountNode) {
+            Ok(flushed) => flushed,
+            Err(error) => {
+                self.mutable_state = Some(state_tree);
+                return Err(error);
+            }
+        };
 
-        let mut tx_tree = MutableTree::from_loaded_root(self.tx_map.root(), ledger_seq.max(1));
-        if let Err(error) = collect(&tx_tree, LedgerNodeObjectType::TransactionNode) {
-            self.mutable_state = Some(state_tree);
-            return Err(error);
-        }
+        let tx_tree = MutableTree::from_loaded_root(self.tx_map.root(), ledger_seq.max(1));
+        let flushed_tx = match collect(&tx_tree, LedgerNodeObjectType::TransactionNode) {
+            Ok(flushed) => flushed,
+            Err(error) => {
+                self.mutable_state = Some(state_tree);
+                return Err(error);
+            }
+        };
 
         let write_count = writes.len();
         let persistence_result = if let Some(batch_writer) = batch_writer {
@@ -2262,21 +2282,17 @@ impl Ledger {
             return Err(error);
         }
 
-        // Only after the complete checked batch succeeds, flush the original
-        // dirty trees and return the shared cache's canonical pointers into
-        // their parent paths. A failed batch leaves both tree ownership and
-        // cache visibility untouched.
-        let mut canonicalize = |mut node: basics::memory::intrusive_pointer::SharedIntrusive<
-            shamap::nodes::tree_node::SHAMapTreeNode,
-        >| {
-            if let Some(cache) = tree_cache {
-                let key = *node.get_hash().as_uint256();
-                cache.canonicalize_replace_client(&key, &mut node);
+        // Only after the complete checked batch succeeds, the flushed copies
+        // replace the dirty trees and their new nodes become visible in the
+        // shared cache. A failed batch leaves both tree ownership and cache
+        // visibility untouched.
+        if let Some(cache) = tree_cache {
+            for (hash, mut node) in uncached {
+                cache.canonicalize_replace_client(&hash, &mut node);
             }
-            node
-        };
-        state_tree.flush_dirty(&mut canonicalize);
-        tx_tree.flush_dirty(&mut canonicalize);
+        }
+        let state_tree = flushed_state;
+        let tx_tree = flushed_tx;
         let state_was_full = self.state_map.is_full();
         let next_state = SyncTree::from_root_with_type(
             state_tree.root(),
@@ -3566,6 +3582,107 @@ mod tests {
             0,
             "failed persistence must not publish unpersisted nodes to the shared cache"
         );
+    }
+
+    #[test]
+    fn checked_dirty_batch_matches_flush_dirty_and_canonicalizes_through_the_cache() {
+        let tree_cache = shamap::tree_node_cache::TreeNodeCache::new(
+            "persist",
+            64,
+            time::Duration::seconds(60),
+            basics::tagged_cache::MonotonicClock::default(),
+        );
+        let items = [
+            SHAMapItem::new(Uint256::from_array([0x44; 32]), vec![4; 12]),
+            SHAMapItem::new(Uint256::from_array([0x55; 32]), vec![5; 12]),
+        ];
+        let dirty_tree = || {
+            let mut tree = MutableTree::new(10);
+            for item in &items {
+                tree.add_item(SHAMapNodeType::AccountState, item.clone())
+                    .expect("state insert");
+            }
+            tree
+        };
+        // The reference result: rippled's single walkSubTree pass.
+        let mut reference = dirty_tree();
+        reference.flush_dirty(&mut |node| node);
+        // A node another map already flushed is in the cache.
+        let shared_leaf = reference
+            .find_key(items[0].key())
+            .expect("lookup")
+            .expect("leaf");
+        let mut cached = shared_leaf.clone();
+        tree_cache.canonicalize_replace_client(shared_leaf.get_hash().as_uint256(), &mut cached);
+
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(10, 1_000, true);
+        let tree = dirty_tree();
+        ledger.state_map = SyncTree::from_root_with_type(
+            tree.root(),
+            SHAMapType::State,
+            true,
+            10,
+            SyncState::Modifying,
+        );
+        ledger.mutable_state = Some(tree);
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&written);
+        ledger.set_node_batch_writer_result(Arc::new(move |writes| {
+            observed
+                .lock()
+                .expect("batch mutex")
+                .extend(writes.iter().map(|write| write.hash));
+            Ok(())
+        }));
+        ledger
+            .persist_dirty_nodes_to_store_result(Some(&tree_cache))
+            .expect("checked batch");
+
+        let root = ledger.state_map.root();
+        assert_eq!(root.get_hash(), reference.root().get_hash());
+        assert_eq!(root.cowid(), 0);
+        let leaf = ledger
+            .mutable_state
+            .as_ref()
+            .expect("flushed tree retained")
+            .find_key(items[0].key())
+            .expect("lookup")
+            .expect("leaf");
+        assert!(
+            std::ptr::eq(&*leaf, &*cached),
+            "an already cached node replaces the flushed copy, as canonicalize does"
+        );
+        // Every written node, cached or not, was stored, and every new node
+        // is now cached.
+        let written = written.lock().expect("batch mutex");
+        assert_eq!(written.len(), 3, "two leaves and the root");
+        for hash in written.iter() {
+            assert!(tree_cache.fetch(hash).is_some(), "{hash} must be cached");
+        }
+    }
+
+    #[test]
+    fn cache_lookup_for_a_later_insert_counts_no_hit_or_miss() {
+        let cache = shamap::tree_node_cache::TreeNodeCache::new(
+            "quiet",
+            64,
+            time::Duration::seconds(60),
+            basics::tagged_cache::MonotonicClock::default(),
+        );
+        let mut tree = MutableTree::new(10);
+        tree.add_item(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(Uint256::from_array([0x66; 32]), vec![6; 12]),
+        )
+        .expect("state insert");
+        tree.flush_dirty(&mut |node| node);
+        let mut node = tree.root();
+        let key = *node.get_hash().as_uint256();
+        assert!(cache.fetch_existing(&key).is_none());
+        cache.canonicalize_replace_client(&key, &mut node);
+        assert!(cache.fetch_existing(&key).is_some());
+        let metrics = cache.metrics_snapshot();
+        assert_eq!((metrics.hits(), metrics.misses()), (0, 0));
     }
 
     #[derive(Debug, Default)]
