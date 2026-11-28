@@ -958,6 +958,7 @@ fn strand_loop(
                 }
             }
         }
+        heartbeat.observe_phase(runner.phase() == ConsensusPhase::Establish, Instant::now());
 
         if !consensus_started {
             // Should not happen — consensus starts unconditionally above.
@@ -1442,6 +1443,7 @@ fn strand_loop(
 
         // ─── 8. Wait for next event (proposal notify or 50ms timeout) ─────
         drop(turn);
+        heartbeat.observe_phase(runner.phase() == ConsensusPhase::Establish, Instant::now());
         if !coordinator_work_remains {
             root.wait_consensus_or_timeout(
                 heartbeat.wait_timeout(Instant::now(), Duration::from_millis(50)),
@@ -1459,9 +1461,14 @@ fn strand_loop(
 /// shortly before a due tick is therefore evaluated on that tick, which is
 /// how rippled closes right after an accept when the other validators have
 /// already closed.
+///
+/// While the round is in establish, the ticks are phased from the local
+/// close instead (see `observe_phase`).
 #[derive(Debug)]
 struct HeartbeatCadence {
     next_due: Instant,
+    /// Local close instant of the round in establish, if any.
+    close_anchor: Option<Instant>,
 }
 
 impl HeartbeatCadence {
@@ -1474,6 +1481,41 @@ impl HeartbeatCadence {
     fn new_at(now: Instant, wall_subsec: Duration) -> Self {
         Self {
             next_due: Self::next_boundary(now, wall_subsec),
+            close_anchor: None,
+        }
+    }
+
+    /// Re-phase the heartbeat on entering and leaving establish.
+    ///
+    /// A validator whose accept finishes after the other validators have
+    /// closed closes at once on entering the next round (rippled
+    /// `startRoundInternal`, "we may be falling behind"), off the whole
+    /// second. With whole-second ticks its `ledgerMIN_CONSENSUS` (1.95 s)
+    /// then first elapses on the tick after the others accept, so it accepts
+    /// a full tick late, closes off-tick again, and stays a tick behind for
+    /// good. Two such validators out of five leave no 80% group and stall
+    /// consensus for seconds.
+    ///
+    /// rippled's timer phase is arbitrary, so ticking one interval after
+    /// the local close keeps one tick per second and every consensus rule.
+    /// The node then accepts at its own close + 2 s, finishes accepting
+    /// before the others next close, and is back on the whole second, where
+    /// it returns when the round leaves establish.
+    fn observe_phase(&mut self, establish: bool, now: Instant) {
+        self.observe_phase_at(establish, now, Self::wall_subsec());
+    }
+
+    fn observe_phase_at(&mut self, establish: bool, now: Instant, wall_subsec: Duration) {
+        match (establish, self.close_anchor) {
+            (true, None) => {
+                self.close_anchor = Some(now);
+                self.next_due = now + Self::INTERVAL;
+            }
+            (false, Some(_)) => {
+                self.close_anchor = None;
+                self.next_due = Self::next_boundary(now, wall_subsec);
+            }
+            _ => {}
         }
     }
 
@@ -1502,7 +1544,16 @@ impl HeartbeatCadence {
     }
 
     fn tick_processed_at(&mut self, now: Instant, wall_subsec: Duration) {
-        self.next_due = Self::next_boundary(now, wall_subsec);
+        self.next_due = match self.close_anchor {
+            // Next whole interval after the close that is still ahead.
+            Some(anchor) => {
+                let elapsed = now.saturating_duration_since(anchor).as_nanos();
+                let step = Self::INTERVAL.as_nanos();
+                let ticks = u32::try_from(elapsed / step + 1).unwrap_or(u32::MAX);
+                anchor + Self::INTERVAL * ticks
+            }
+            None => Self::next_boundary(now, wall_subsec),
+        };
     }
 
     fn is_due(&self, now: Instant) -> bool {
@@ -3757,6 +3808,78 @@ mod tests {
         heartbeat.tick_processed_at(start + ms(1_700), ms(0));
         assert!(!heartbeat.is_due(start + ms(2_699)));
         assert!(heartbeat.is_due(start + ms(2_700)));
+    }
+
+    /// A validator that closes 0.6 s after the others (its accept ran past
+    /// their close) must fall back onto their whole-second cadence instead
+    /// of staying a tick behind. Model: the others close on whole seconds K,
+    /// accept at K + 2 and close again at K + 3; the laggard's accept takes
+    /// 0.6 s, and it closes at once if the others already have.
+    #[test]
+    fn heartbeat_brings_a_late_closer_back_onto_the_others_cadence() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let start = std::time::Instant::now();
+        let subsec = |t: Duration| ms((t.as_millis() % 1_000) as u64);
+        let min_consensus = ms(1_950);
+        let execute = ms(600);
+
+        let mut heartbeat = super::HeartbeatCadence::new_at(start, ms(0));
+        let mut others_close = Duration::ZERO;
+        let mut close = ms(600);
+        let mut lag = Vec::new();
+        for _ in 0..6 {
+            lag.push(close - others_close);
+            // Establish: tick until ledgerMIN_CONSENSUS has elapsed.
+            heartbeat.observe_phase_at(true, start + close, subsec(close));
+            let accept = loop {
+                let due = heartbeat.next_due - start;
+                heartbeat.tick_processed_at(start + due, subsec(due));
+                if due - close >= min_consensus {
+                    break due;
+                }
+            };
+            heartbeat.observe_phase_at(false, start + accept, subsec(accept));
+            let ready = accept + execute;
+            others_close += Duration::from_secs(3);
+            close = if ready >= others_close {
+                ready
+            } else {
+                // Open: close on the next own tick, with the others.
+                let mut due = heartbeat.next_due - start;
+                while due < ready || due < others_close {
+                    heartbeat.tick_processed_at(start + due, subsec(due));
+                    due = heartbeat.next_due - start;
+                }
+                due
+            };
+        }
+        // Whole-second ticks alone keep it 0.6 s behind every round.
+        assert_eq!(lag, [ms(600), ms(200), ms(0), ms(0), ms(0), ms(0)]);
+    }
+
+    #[test]
+    fn heartbeat_in_establish_ticks_one_interval_after_the_close() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let start = std::time::Instant::now();
+        let mut heartbeat = super::HeartbeatCadence::new_at(start, ms(0));
+        // Closed 600 ms into a second: ticks at close + 1 s and + 2 s.
+        heartbeat.observe_phase_at(true, start + ms(600), ms(600));
+        assert!(!heartbeat.is_due(start + ms(1_599)));
+        assert!(heartbeat.is_due(start + ms(1_600)));
+        heartbeat.tick_processed_at(start + ms(1_605), ms(605));
+        assert!(!heartbeat.is_due(start + ms(2_599)));
+        assert!(heartbeat.is_due(start + ms(2_600)));
+        // Still in establish: no change.
+        heartbeat.observe_phase_at(true, start + ms(2_000), ms(0));
+        assert!(!heartbeat.is_due(start + ms(2_599)));
+        // Leaving establish returns to the whole second.
+        heartbeat.observe_phase_at(false, start + ms(2_650), ms(650));
+        assert!(!heartbeat.is_due(start + ms(2_999)));
+        assert!(heartbeat.is_due(start + ms(3_000)));
+        heartbeat.tick_processed_at(start + ms(3_000), ms(0));
+        assert!(heartbeat.is_due(start + ms(4_000)));
     }
 
     #[test]
